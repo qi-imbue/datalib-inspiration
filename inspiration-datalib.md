@@ -33,7 +33,7 @@ the original mind onto a clean default-workspace-template base):
 
 The `datalib` skill is self-contained: on first use it installs the
 `frankweiler` binaries (a fully-static musl build of `frankweiler-sync` and
-`frankweiler-http`, pinned to datalib v0.16.0) into `~/.local/bin`, so the base
+`frankweiler-http`, pinned to datalib v0.17.0) into `~/.local/bin`, so the base
 template needs no changes. `frankweiler-sync` reads a config at
 `$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`) that lists which
 sources to mirror, fetches each source through `latchkey curl` (so the user's
