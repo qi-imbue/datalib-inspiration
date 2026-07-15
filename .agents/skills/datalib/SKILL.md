@@ -27,8 +27,8 @@ mkdir -p "$DATA_ROOT"
 # Install the frankweiler binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v frankweiler-sync >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.16.0/scripts/install.sh" \
-    | FRANKWEILER_VERSION=v0.16.0 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.17.0/scripts/install.sh" \
+    | FRANKWEILER_VERSION=v0.17.0 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
