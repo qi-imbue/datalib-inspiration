@@ -32,13 +32,14 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`frankweiler` binaries (a fully-static musl build of `frankweiler-sync` and
-`frankweiler-http`, pinned to datalib v0.19.0) into `~/.local/bin`, so the base
-template needs no changes. `frankweiler-sync` reads a config at
-`$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`) that lists which
-sources to mirror, fetches each source through `latchkey curl` (so the user's
-credentials are injected by the Minds gateway, never stored in the config), and
-writes a local store under the data root (`/mngr/datalib`, on the persistent
+`frankweiler` binaries (a fully-static musl build of `datalib-dag`,
+`datalib-step`, and `frankweiler-http`, pinned to datalib v0.20.0) into
+`~/.local/bin`, so the base template needs no changes. `datalib-dag` runs the
+pipeline config at `$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`)
+that lists which sources to mirror as download/render step pairs, fetches each
+source through `latchkey curl` (so the user's credentials are injected by the
+Minds gateway, never stored in the config), and writes a local store under the
+data root (`/mngr/datalib`, on the persistent
 `/mngr` volume). Search is served by `frankweiler-http` on `127.0.0.1:8731`
 (`GET /api/search`, `GET /api/chat/{uuid}`), which the skill starts on demand;
 there is no supervisord service and no forwarded port -- it is a local tool the

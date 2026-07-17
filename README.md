@@ -107,10 +107,10 @@ Only for the sources you actually want mirrored:
 
 The whole capability is one self-contained skill, `.agents/skills/datalib/`. On
 first use it installs the `frankweiler` binaries (a static musl build, pinned to
-datalib v0.19.0) into `~/.local/bin`, so the base template needs no changes.
-`frankweiler-sync` reads a config listing the sources to mirror and writes the
-store under `/mngr/datalib`; search is served on demand by `frankweiler-http` at
-`127.0.0.1:8731`. There's no background service and no forwarded port -- it's a
+datalib v0.20.0) into `~/.local/bin`, so the base template needs no changes.
+`datalib-dag` runs a step-level pipeline config listing the sources to mirror
+and writes the store under `/mngr/datalib`; search is served on demand by
+`frankweiler-http` at `127.0.0.1:8731`. There's no background service and no forwarded port -- it's a
 local tool the agent runs when answering a question.
 
 `inspiration-datalib.md` is the manifest: the authoritative document an agent

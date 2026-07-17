@@ -26,16 +26,17 @@ mkdir -p "$DATA_ROOT"
 
 # Install the frankweiler binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
-if ! command -v frankweiler-sync >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.19.0/scripts/install.sh" \
-    | FRANKWEILER_VERSION=v0.19.0 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
+if ! command -v datalib-dag >/dev/null 2>&1; then
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.20.0/scripts/install.sh" \
+    | FRANKWEILER_VERSION=v0.20.0 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
 1. **Search the existing mirror first.** The user may already have data mirrored.
    Query the local API (see "Searching") before syncing anything new.
-2. **Sync to import or refresh data.** Run `frankweiler-sync` to mirror new
-   sources or pull recent updates. Syncs are incremental and resumable.
+2. **Sync to import or refresh data.** Run `datalib-dag` (the pipeline
+   runner) to mirror new sources or pull recent updates. Syncs are
+   incremental and resumable.
 3. **Credentials go through latchkey.** The web-API sources authenticate via
    `latchkey`, already wired to the user through the Minds app. If a sync
    reports missing credentials or "not permitted", use the `latchkey` skill to
@@ -86,33 +87,63 @@ The rendered data also lives on disk as a UUID-keyed markdown tree under
 
 ## Importing / refreshing data (sync)
 
-Maintain `$FRANKWEILER_CONFIG`, which declares the data root and one stanza per
-source. Create it if missing, then add the source the user wants. The
-`data_root` value **must equal `$DATA_ROOT`** (the parent of `$FRANKWEILER_CONFIG`):
+Maintain `$FRANKWEILER_CONFIG`, a step-level pipeline config: each source is a
+`<name>.download` + `<name>.render` step pair (sharing one params block via a
+YAML anchor), and two shared fan-in steps build the search indexes. Create it
+if missing, then add the source the user wants. The `data_root` value **must
+equal `$DATA_ROOT`** (the parent of `$FRANKWEILER_CONFIG`):
 
 ```yaml
 data_root: /mngr/datalib          # must equal $DATA_ROOT
-sources:
-  - name: slack
-    source:
-      type: slack_api
-      sync:
-        media: true
-        channels:
-          - "some-channel"        # omit `channels:` (or set all_channels: true) for everything
-  - name: gmail-takeout
-    source:
-      type: email                 # `sync:` omitted -> reads a local .mbox instead of a JMAP server
-      common:
-        input_path: ~/backups/Takeout/Mail/All mail Including Spam and Trash.mbox
+steps:
+  - id: slack.download
+    step: slack_api.download
+    outputs: [slack/raw]
+    params: &slack
+      name: slack
+      source:
+        sync:
+          media: true
+          channels:
+            - "some-channel"      # omit `channels:` (or set all_channels: true) for everything
+  - id: slack.render
+    step: slack_api.render
+    inputs: [slack/raw]
+    outputs: [slack/rendered_md]
+    params: *slack
+
+  - id: gmail-takeout.download
+    step: email.download
+    outputs: [gmail-takeout/raw]
+    params: &gmail-takeout
+      name: gmail-takeout
+      source:                     # `sync:` omitted -> reads a local .mbox instead of a JMAP server
+        common:
+          input_path: ~/backups/Takeout/Mail/All mail Including Spam and Trash.mbox
+  - id: gmail-takeout.render
+    step: email.render
+    inputs: [gmail-takeout/raw]
+    outputs: [gmail-takeout/rendered_md]
+    params: *gmail-takeout
+
+  # Shared fan-ins: every source's rendered markdown feeds these.
+  - id: grid_index
+    step: grid_index
+    inputs: ["**/rendered_md"]
+    outputs: [system/backend_index]
+  - id: qmd_index
+    step: qmd_index
+    inputs: ["**/rendered_md"]
+    outputs: [system/qmd]
 ```
 
-Then run the sync. `frankweiler-sync` reads `$FRANKWEILER_CONFIG` automatically;
-auth is handled by latchkey, the run is stoppable and resumable, and re-runs are
-incremental:
+Then run the pipeline. Auth is handled by latchkey, the run is stoppable and
+resumable (Ctrl-C checkpoints partial progress), and re-runs are incremental —
+steps whose inputs are unchanged are skipped:
 
 ```bash
-frankweiler-sync                   # or: frankweiler-sync --config "$FRANKWEILER_CONFIG"
+datalib-dag "$FRANKWEILER_CONFIG"              # everything
+datalib-dag "$FRANKWEILER_CONFIG" --sync slack.download   # just one source
 ```
 
 The first sync of a source is slow (it downloads everything and builds a search
@@ -125,7 +156,7 @@ which flow through the same `latchkey` gateway used elsewhere. If a sync fails
 for a source with a missing-credentials or "request not permitted by the user"
 error, request access using the **`latchkey` skill**: POST a `predefined`
 permission request for that service's scope (e.g. `slack-api`, `github-api`,
-`notion-api`), wait for the user's approval, then re-run `frankweiler-sync`.
+`notion-api`), wait for the user's approval, then re-run `datalib-dag`.
 
 ## Supported sources (inside Minds)
 
