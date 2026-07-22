@@ -32,19 +32,19 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`frankweiler` binaries (a fully-static musl build of `datalib-dag`,
-`datalib-step`, and `frankweiler-http`, pinned to datalib v0.20.0) into
-`~/.local/bin`, so the base template needs no changes. `datalib-dag` runs the
-pipeline config at `$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`)
-that lists which sources to mirror as download/render step pairs, fetches each
-source through `latchkey curl` (so the user's credentials are injected by the
-Minds gateway, never stored in the config), and writes a local store under the
-data root (`/mngr/datalib`, on the persistent
-`/mngr` volume). Search is served by `frankweiler-http` on `127.0.0.1:8731`
-(`GET /api/search`, `GET /api/chat/{uuid}`), which the skill starts on demand;
-there is no supervisord service and no forwarded port -- it is a local tool the
-agent runs when answering a question. Semantic search is also available directly
-against the qmd index at `$DATA_ROOT/system/qmd/index.sqlite`.
+`frankweiler` binaries (a fully-static musl build, pinned to datalib v0.21.0)
+into `~/.local/bin`, so the base template needs no changes. A pipeline config at
+`$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
+to mirror; each source is fetched through `latchkey` (so the user's credentials
+are injected by the Minds gateway, never stored in the config) and written to a
+local store under the data root (`/mngr/datalib`, on the persistent `/mngr`
+volume), where the skill searches it. There is no supervisord service and no
+forwarded port -- it is a local tool the agent runs when answering a question.
+
+The concrete commands, config format, and query surfaces are datalib's own and
+change between versions, so they are deliberately not restated here or in the
+skill. They live in datalib's agent guide, pinned to the version above:
+https://github.com/imbue-ai/datalib/blob/v0.21.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -82,8 +82,7 @@ mind. This is the `use-inspiration` skill's template path; in short:
    YES: ACTIVATE FIRST -- initiate every `requires_permission` line NOW via a
    latchkey permission request (see the `latchkey` skill; the request opens the
    approval/login flow in the minds app), write a `$FRANKWEILER_CONFIG` with the
-   chosen sources, run `frankweiler-sync`, and get the store showing THE USER'S
-   OWN DATA. Done for a data-backed app means the user can search and see their
+   chosen sources, run the sync, and get the store showing THE USER'S OWN DATA. Done for a data-backed app means the user can search and see their
    own data -- NOT that a service starts or an endpoint returns 200. Then tell
    them it is live and to try a search.
 4. Only AFTER that (or immediately, if they chose different sources -- the swap
