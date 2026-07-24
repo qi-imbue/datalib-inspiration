@@ -27,8 +27,8 @@ mkdir -p "$DATA_ROOT"
 # Install the frankweiler binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.21.0/scripts/install.sh" \
-    | FRANKWEILER_VERSION=v0.21.0 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.23.2/scripts/install.sh" \
+    | FRANKWEILER_VERSION=v0.23.2 FRANKWEILER_LIBC=musl FRANKWEILER_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -52,11 +52,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.21.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.23.2/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.21.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.23.2/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
