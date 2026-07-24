@@ -32,7 +32,7 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`frankweiler` binaries (a fully-static musl build, pinned to datalib v0.21.0)
+`frankweiler` binaries (a fully-static musl build, pinned to datalib v0.23.2)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
 `$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
 to mirror; each source is fetched through `latchkey` (so the user's credentials
@@ -44,7 +44,7 @@ forwarded port -- it is a local tool the agent runs when answering a question.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.21.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.23.2/docs/agent_user.md
 
 ## Prerequisites
 
