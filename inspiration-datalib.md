@@ -32,9 +32,9 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`frankweiler` binaries (a fully-static musl build, pinned to datalib v0.23.2)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.25.0)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
-`$FRANKWEILER_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
+`$DATALIB_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
 to mirror; each source is fetched through `latchkey` (so the user's credentials
 are injected by the Minds gateway, never stored in the config) and written to a
 local store under the data root (`/mngr/datalib`, on the persistent `/mngr`
@@ -44,7 +44,7 @@ forwarded port -- it is a local tool the agent runs when answering a question.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.23.2/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.25.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -81,7 +81,7 @@ mind. This is the `use-inspiration` skill's template path; in short:
 3. Ask whether they want to use their own accounts (e.g. their own Slack). If
    YES: ACTIVATE FIRST -- initiate every `requires_permission` line NOW via a
    latchkey permission request (see the `latchkey` skill; the request opens the
-   approval/login flow in the minds app), write a `$FRANKWEILER_CONFIG` with the
+   approval/login flow in the minds app), write a `$DATALIB_CONFIG` with the
    chosen sources, run the sync, and get the store showing THE USER'S OWN DATA. Done for a data-backed app means the user can search and see their
    own data -- NOT that a service starts or an endpoint returns 200. Then tell
    them it is live and to try a search.
@@ -100,11 +100,14 @@ mind. This is the `use-inspiration` skill's template path; in short:
   `all_channels: true`), whether email comes from a Google Takeout `.mbox` on
   disk or a JMAP server, which GitHub/Notion scopes. Nothing is mirrored until
   the config names a source and the sync runs.
-- **Cloudflare-walled sources are out.** `claude_api` (claude.ai) and
-  `chatgpt_api` do not work inside Minds -- latchkey routes through its gateway
-  and bypasses datalib's Chrome-impersonating curl shim, so Cloudflare
-  challenges them. For that data, use an on-disk export (`claude_export`)
-  instead. This is a platform limitation, not something the adapter can wire up.
+- **Cloudflare-walled sources need a recent Minds.** `claude_api` (claude.ai)
+  and `chatgpt_api` work inside Minds as of datalib v0.24.0: the latchkey
+  gateway routes marked requests through datalib's Chrome-impersonating curl,
+  clearing the TLS fingerprint check that used to challenge them. On an older
+  Minds app the gateway's bundled curl predates that and these sources still
+  get challenged -- if a sync returns challenge pages instead of data, use an
+  on-disk export (`claude_export`) for it. Not something the adapter wires up
+  either way.
 - **The store is local and not backed up.** The data root (`/mngr/datalib`)
   persists across restarts on the mind's own volume, but is not part of the
   runtime-backup branch (it is large: doltlite stores + a qmd index). Treat it as

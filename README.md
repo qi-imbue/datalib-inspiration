@@ -106,14 +106,14 @@ Only for the sources you actually want mirrored:
 ## How it's put together
 
 The whole capability is one self-contained skill, `.agents/skills/datalib/`. On
-first use it installs the `frankweiler` binaries (a static musl build, pinned to
-datalib v0.23.2) into `~/.local/bin`, so the base template needs no changes. A
+first use it installs the `datalib-*` binaries (a static musl build, pinned to
+datalib v0.25.0) into `~/.local/bin`, so the base template needs no changes. A
 pipeline config lists the sources to mirror, and the store is written under
 `/mngr/datalib`, where the agent searches it on demand. There's no background
 service and no forwarded port -- it's a local tool the agent runs when answering
 a question. The skill deliberately doesn't restate datalib's commands or config
 format; it points the agent at
-[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.23.2/docs/agent_user.md),
+[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.25.0/docs/agent_user.md),
 pinned to the same version, so the two can't drift.
 
 `inspiration-datalib.md` is the manifest: the authoritative document an agent
