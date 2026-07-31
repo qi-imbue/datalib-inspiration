@@ -32,7 +32,7 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.25.0)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.26.0)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
 `$DATALIB_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
 to mirror; each source is fetched through `latchkey` (so the user's credentials
@@ -44,7 +44,7 @@ forwarded port -- it is a local tool the agent runs when answering a question.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.25.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -109,9 +109,9 @@ mind. This is the `use-inspiration` skill's template path; in short:
   on-disk export (`claude_export`) for it. Not something the adapter wires up
   either way.
 - **The store is local and not backed up.** The data root (`/mngr/datalib`)
-  persists across restarts on the mind's own volume, but is not part of the
-  runtime-backup branch (it is large: doltlite stores + a qmd index). Treat it as
-  rebuildable-by-resync, not as durable storage.
+  persists across restarts on the mind's own volume, but sits outside the
+  workspace tree the encrypted host backup covers (it is large: doltlite stores
+  plus a qmd index). Treat it as rebuildable-by-resync, not as durable storage.
 
 ## Adaptation history
 
