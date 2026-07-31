@@ -27,8 +27,8 @@ mkdir -p "$DATA_ROOT"
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.25.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.25.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.26.0/scripts/install.sh" \
+    | DATALIB_VERSION=v0.26.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -44,7 +44,7 @@ fi
    request permission for that service, then re-run the sync (see "Authorizing
    a source").
 4. **Never commit the store.** `$DATA_ROOT` is on the `/mngr` volume, outside the
-   git workspace. Don't add it to git or copy it into `runtime/`.
+   git workspace. Don't add it to git or copy it into `data/`.
 
 ## Driving datalib: read the upstream agent guide
 
@@ -52,11 +52,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.25.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.25.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
