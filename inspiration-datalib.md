@@ -34,12 +34,13 @@ the original mind onto a clean default-workspace-template base):
 The `datalib` skill is self-contained: on first use it installs the
 `datalib-*` binaries (a fully-static musl build, pinned to datalib v0.26.0)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
-`$DATALIB_CONFIG` (default `/mngr/datalib/config.yaml`) lists which sources
-to mirror; each source is fetched through `latchkey` (so the user's credentials
-are injected by the Minds gateway, never stored in the config) and written to a
-local store under the data root (`/mngr/datalib`, on the persistent `/mngr`
-volume), where the skill searches it. There is no supervisord service and no
-forwarded port -- it is a local tool the agent runs when answering a question.
+`$DATALIB_CONFIG` (default `data/.skills/datalib/config.yaml`) lists which
+sources to mirror; each source is fetched through `latchkey` (so the user's
+credentials are injected by the Minds gateway, never stored in the config) and
+written to a local store under the data root (`data/.skills/datalib`, the
+workspace's own gitignored data tree on the persistent volume), where the skill
+searches it. There is no supervisord service and no forwarded port -- it is a
+local tool the agent runs when answering a question.
 
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
@@ -108,10 +109,12 @@ mind. This is the `use-inspiration` skill's template path; in short:
   get challenged -- if a sync returns challenge pages instead of data, use an
   on-disk export (`claude_export`) for it. Not something the adapter wires up
   either way.
-- **The store is local and not backed up.** The data root (`/mngr/datalib`)
-  persists across restarts on the mind's own volume, but sits outside the
-  workspace tree the encrypted host backup covers (it is large: doltlite stores
-  plus a qmd index). Treat it as rebuildable-by-resync, not as durable storage.
+- **The store is rebuildable, and big enough to think about.** The data root
+  (`data/.skills/datalib`) persists across restarts on the mind's own volume and
+  is covered by the encrypted host backup like the rest of `data/`. It is also
+  large (doltlite stores plus a qmd index) and fully reconstructible by
+  re-syncing, so an adapting mind may prefer to exclude it from backups -- the
+  skill says how. Treat it as rebuildable-by-resync, not as precious storage.
 
 ## Adaptation history
 
