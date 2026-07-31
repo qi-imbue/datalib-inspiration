@@ -15,13 +15,15 @@ a single local store you can search. When the user asks about their own history
 look. Do **not** try to scrape or re-download the original services yourself.
 
 The store's config file is `$DATALIB_CONFIG` (default
-`/mngr/datalib/config.yaml`), and the **data root** is the directory that holds
-it -- on the `/mngr` persistent volume, so it survives restarts. Establish both
-once at the top of your shell work, and make sure the binaries are installed:
+`data/.skills/datalib/config.yaml`, relative to the workspace root), and the
+**data root** is the directory that holds it. `data/` is the workspace's own
+data tree on the persistent volume, so the store survives restarts. Establish
+both once at the top of your shell work, and make sure the binaries are
+installed:
 
 ```bash
-: "${DATALIB_CONFIG:=/mngr/datalib/config.yaml}"
-DATA_ROOT="$(dirname "$DATALIB_CONFIG")"   # e.g. /mngr/datalib
+: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.yaml}"
+DATA_ROOT="$(dirname "$DATALIB_CONFIG")"   # the data root holding the store
 mkdir -p "$DATA_ROOT"
 
 # Install the datalib binaries on first use (fully-static musl build; runs
@@ -43,8 +45,16 @@ fi
    reports missing credentials or "not permitted", use the `latchkey` skill to
    request permission for that service, then re-run the sync (see "Authorizing
    a source").
-4. **Never commit the store.** `$DATA_ROOT` is on the `/mngr` volume, outside the
-   git workspace. Don't add it to git or copy it into `data/`.
+4. **Never commit the store.** Everything under `data/` is gitignored by the
+   workspace, which is why the store lives there. Don't try to force it into
+   git, and don't copy it anywhere that is tracked.
+5. **The store rides the workspace backup.** `data/` is covered by the encrypted
+   host backup. That is fine for a modest mirror, but the store is large and
+   fully rebuildable by re-syncing, so if it grows enough to bloat snapshots,
+   add `**/data/.skills/datalib` to the `excludes` list in
+   `data/system/backup.toml` -- copying the service's default patterns in
+   alongside it, since a list in that file *replaces* the defaults rather than
+   adding to them (see `system/services/host_backup/README.md`).
 
 ## Driving datalib: read the upstream agent guide
 

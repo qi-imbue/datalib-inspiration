@@ -97,9 +97,11 @@ Only for the sources you actually want mirrored:
   Those sources sit behind Cloudflare, and inside Minds the credential gateway
   bypasses the browser-impersonating shim they'd need, so they get challenged.
   Use an on-disk export instead.
-- **The store is rebuildable, not durable.** It lives on the mind's persistent
-  volume and survives restarts, but it's too large to sit inside the workspace
-  the encrypted backup covers. If it's lost, you re-sync rather than restore.
+- **The store is rebuildable.** It lives with the rest of your workspace's data
+  on the mind's persistent volume, survives restarts, and rides the encrypted
+  backup. It's also large, so if you'd rather not pay for backing up something
+  reconstructible, you can ask the mind to leave it out -- losing it costs you a
+  re-sync, not the data itself.
 - **The first sync is slow.** It downloads everything and builds a search index.
   Later runs only pull what changed, and are stoppable and resumable.
 
@@ -109,10 +111,10 @@ The whole capability is one self-contained skill, `.agents/skills/datalib/`. On
 first use it installs the `datalib-*` binaries (a static musl build, pinned to
 datalib v0.26.0) into `~/.local/bin`, so the base template needs no changes. A
 pipeline config lists the sources to mirror, and the store is written under
-`/mngr/datalib`, where the agent searches it on demand. There's no background
-service and no forwarded port -- it's a local tool the agent runs when answering
-a question. The skill deliberately doesn't restate datalib's commands or config
-format; it points the agent at
+`data/.skills/datalib`, where the agent searches it on demand. There's no
+background service and no forwarded port -- it's a local tool the agent runs
+when answering a question. The skill deliberately doesn't restate datalib's
+commands or config format; it points the agent at
 [datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/agent_user.md),
 pinned to the same version, so the two can't drift.
 
