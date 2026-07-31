@@ -129,14 +129,14 @@ tree -- a persistent Claude agent that delegates work to sub-agents and manages
 its own background services. The pieces most worth knowing:
 
 - `CLAUDE.md` -- agent instructions
-- `parent.toml` -- upstream repo, for pulling template updates
+- `system/config/parent.toml` -- upstream repo, for pulling template updates
 - `.agents/skills/` -- the agent's skills, including `datalib` itself
-- `supervisord.conf` -- background service definitions
-- `vendor/mngr/` -- a vendored, mutable copy of `mngr`; changes here do affect
-  the `mngr` command
-- `vendor/tk/` -- the vendored [tk](https://github.com/wedow/ticket) ticket
-  tracker, backing the agent's task management
+- `system/supervisord.conf` -- background service definitions
+- `system/vendor/mngr/` -- a vendored, mutable copy of `mngr`; changes here do
+  affect the `mngr` command
+- `system/vendor/tk/` -- the vendored [tk](https://github.com/wedow/ticket)
+  ticket tracker, backing the agent's task management
 
-The template's own docs cover the rest (sub-agent create templates, the artifact
-harden lifecycle that promotes ad-hoc work into tested skills, and the update
-flow).
+The template's own docs cover the rest (sub-agent create templates, the
+creation-hardening lifecycle that promotes ad-hoc work into tested skills, and
+the update flow).
