@@ -32,7 +32,7 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.26.0)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.27.0)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
 `$DATALIB_CONFIG` (default `data/.skills/datalib/config.yaml`) lists which
 sources to mirror; each source is fetched through `latchkey` (so the user's
@@ -45,7 +45,7 @@ local tool the agent runs when answering a question.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -104,11 +104,14 @@ mind. This is the `use-inspiration` skill's template path; in short:
 - **Cloudflare-walled sources need a recent Minds.** `claude_api` (claude.ai)
   and `chatgpt_api` work inside Minds as of datalib v0.24.0: the latchkey
   gateway routes marked requests through datalib's Chrome-impersonating curl,
-  clearing the TLS fingerprint check that used to challenge them. On an older
-  Minds app the gateway's bundled curl predates that and these sources still
-  get challenged -- if a sync returns challenge pages instead of data, use an
-  on-disk export (`claude_export`) for it. Not something the adapter wires up
-  either way.
+  clearing the TLS fingerprint check that used to challenge them. As of v0.27.0
+  a remotely-hosted mind additionally sends those requests back out through the
+  gateway on the user's own computer (`MINDS_VIA_DESKTOP_URL_PREFIX`, published
+  by Minds), so they carry a residential IP instead of the VPS's -- these sites
+  block datacenter ranges outright. On an older Minds app one or both halves
+  are missing and these sources still get challenged -- if a sync returns
+  challenge pages instead of data, use an on-disk export (`claude_export`) for
+  it. Not something the adapter wires up either way.
 - **The store is rebuildable, and big enough to think about.** The data root
   (`data/.skills/datalib`) persists across restarts on the mind's own volume and
   is covered by the encrypted host backup like the rest of `data/`. It is also

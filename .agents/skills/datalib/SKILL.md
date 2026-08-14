@@ -29,8 +29,8 @@ mkdir -p "$DATA_ROOT"
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.26.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.26.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.27.0/scripts/install.sh" \
+    | DATALIB_VERSION=v0.27.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -62,11 +62,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.26.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
@@ -87,10 +87,17 @@ Takeout `.mbox` on disk, or a JMAP server).
 Cloudflare-walled web sources -- `claude_api` (claude.ai) and `chatgpt_api` --
 also work. Requests that ask for it are routed through datalib's
 Chrome-impersonating curl by the Minds latchkey gateway, which clears the TLS
-fingerprint check that used to challenge them.
+fingerprint check that used to challenge them. On a mind running remotely, the
+same requests also go back out through the gateway on the user's own computer
+(via `MINDS_VIA_DESKTOP_URL_PREFIX`, which Minds sets), so they leave from a
+residential connection rather than the VPS's datacenter IP -- these sites block
+those address ranges outright, which no amount of fingerprint fixing helps.
+Nothing here is configurable; it happens for exactly the providers that get
+impersonation.
 
-This needs a recent Minds app: the gateway's bundled curl has to be datalib
-v0.24.0 or later. If a sync of one of these sources returns Cloudflare
+Both halves need a recent Minds app: the gateway's bundled curl has to be
+datalib v0.24.0 or later, and the desktop-egress route needs a Minds that
+publishes that variable. If a sync of one of these sources returns Cloudflare
 challenge pages instead of data, that is the likely cause -- fall back to an
 on-disk export (`claude_export`) for that data and tell the user why.
 
