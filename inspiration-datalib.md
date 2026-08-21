@@ -32,9 +32,9 @@ the original mind onto a clean default-workspace-template base):
 - `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.27.0)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.28.0)
 into `~/.local/bin`, so the base template needs no changes. A pipeline config at
-`$DATALIB_CONFIG` (default `data/.skills/datalib/config.yaml`) lists which
+`$DATALIB_CONFIG` (default `data/.skills/datalib/config.toml`) lists which
 sources to mirror; each source is fetched through `latchkey` (so the user's
 credentials are injected by the Minds gateway, never stored in the config) and
 written to a local store under the data root (`data/.skills/datalib`, the
@@ -45,7 +45,7 @@ local tool the agent runs when answering a question.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.28.0/docs/agent_user.md
 
 ## Prerequisites
 
