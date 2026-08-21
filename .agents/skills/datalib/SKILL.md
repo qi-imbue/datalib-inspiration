@@ -15,22 +15,22 @@ a single local store you can search. When the user asks about their own history
 look. Do **not** try to scrape or re-download the original services yourself.
 
 The store's config file is `$DATALIB_CONFIG` (default
-`data/.skills/datalib/config.yaml`, relative to the workspace root), and the
+`data/.skills/datalib/config.toml`, relative to the workspace root), and the
 **data root** is the directory that holds it. `data/` is the workspace's own
 data tree on the persistent volume, so the store survives restarts. Establish
 both once at the top of your shell work, and make sure the binaries are
 installed:
 
 ```bash
-: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.yaml}"
+: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.toml}"
 DATA_ROOT="$(dirname "$DATALIB_CONFIG")"   # the data root holding the store
 mkdir -p "$DATA_ROOT"
 
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.27.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.27.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.28.0/scripts/install.sh" \
+    | DATALIB_VERSION=v0.28.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -62,11 +62,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.28.0/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.28.0/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source

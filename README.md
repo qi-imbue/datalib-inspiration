@@ -93,10 +93,13 @@ Only for the sources you actually want mirrored:
 
 ## Good to know
 
-- **Claude.ai and ChatGPT history can't be mirrored over the web API here.**
-  Those sources sit behind Cloudflare, and inside Minds the credential gateway
-  bypasses the browser-impersonating shim they'd need, so they get challenged.
-  Use an on-disk export instead.
+- **Claude.ai and ChatGPT history need a recent Minds app.** Those sources sit
+  behind Cloudflare. Inside Minds the credential gateway now routes their
+  requests through datalib's browser-impersonating curl, and a remotely-hosted
+  mind sends them back out through the gateway on your own computer, so they
+  arrive from a residential connection -- together that clears the challenge.
+  On an older Minds app one or both halves are missing and you'll get challenge
+  pages instead of data; use an on-disk export for those.
 - **The store is rebuildable.** It lives with the rest of your workspace's data
   on the mind's persistent volume, survives restarts, and rides the encrypted
   backup. It's also large, so if you'd rather not pay for backing up something
@@ -109,13 +112,13 @@ Only for the sources you actually want mirrored:
 
 The whole capability is one self-contained skill, `.agents/skills/datalib/`. On
 first use it installs the `datalib-*` binaries (a static musl build, pinned to
-datalib v0.27.0) into `~/.local/bin`, so the base template needs no changes. A
+datalib v0.28.0) into `~/.local/bin`, so the base template needs no changes. A
 pipeline config lists the sources to mirror, and the store is written under
 `data/.skills/datalib`, where the agent searches it on demand. There's no
 background service and no forwarded port -- it's a local tool the agent runs
 when answering a question. The skill deliberately doesn't restate datalib's
 commands or config format; it points the agent at
-[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md),
+[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.28.0/docs/agent_user.md),
 pinned to the same version, so the two can't drift.
 
 `inspiration-datalib.md` is the manifest: the authoritative document an agent
