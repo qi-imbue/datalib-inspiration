@@ -88,15 +88,20 @@ Only for the sources you actually want mirrored:
 - **Slack, GitHub, Notion** -- your approval of a permission request that the
   mind initiates during setup. The approval flow opens in the Minds app; no
   tokens or API keys to find or paste.
-- **Email** -- a Google Takeout `.mbox` file, which needs no permission at all.
-  You just tell the agent where the file is.
+- **Email** -- three ways in. A Google Takeout `.mbox` file needs no permission
+  at all; you just tell the agent where the file is. A Gmail or Google Workspace
+  account can be mirrored live over Google's API, and a Fastmail (or other JMAP)
+  mailbox over JMAP -- both of those authenticate through the same approval flow
+  as Slack.
 
 ## Good to know
 
-- **Claude.ai and ChatGPT history can't be mirrored over the web API here.**
-  Those sources sit behind Cloudflare, and inside Minds the credential gateway
-  bypasses the browser-impersonating shim they'd need, so they get challenged.
-  Use an on-disk export instead.
+- **Claude.ai and ChatGPT history over the web API needs a recent Minds app.**
+  Those sources sit behind Cloudflare. A current Minds routes their requests
+  through datalib's browser-impersonating curl, and a remotely-hosted mind sends
+  them back out through your own computer so they carry a residential IP -- both
+  of which they need to get through. On an older app one or both is missing and
+  the sync comes back with challenge pages; use an on-disk export instead.
 - **The store is rebuildable.** It lives with the rest of your workspace's data
   on the mind's persistent volume, survives restarts, and rides the encrypted
   backup. It's also large, so if you'd rather not pay for backing up something
@@ -107,15 +112,20 @@ Only for the sources you actually want mirrored:
 
 ## How it's put together
 
-The whole capability is one self-contained skill, `.agents/skills/datalib/`. On
-first use it installs the `datalib-*` binaries (a static musl build, pinned to
-datalib v0.27.0) into `~/.local/bin`, so the base template needs no changes. A
-pipeline config lists the sources to mirror, and the store is written under
-`data/.skills/datalib`, where the agent searches it on demand. There's no
-background service and no forwarded port -- it's a local tool the agent runs
-when answering a question. The skill deliberately doesn't restate datalib's
-commands or config format; it points the agent at
-[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md),
+The capability is one self-contained skill, `.agents/skills/datalib/`. On first
+use it installs the `datalib-*` binaries (a static musl build, pinned to datalib
+v0.29.0) into `~/.local/bin`. A pipeline config lists the sources to mirror, and
+the store is written under `data/.skills/datalib`, where the agent searches it
+on demand -- a local tool it runs when answering a question, with no service in
+the loop.
+
+Alongside it, datalib's own web UI runs as the supervised `data` service
+(`system/apps/data/run_datalib_http.sh`, plus a `[program:data]` stanza in
+`system/supervisord.conf`), which is the one change to the base template. It
+registers port 8731 on startup, so it shows up in the workspace's app picker
+like the terminal and browser do. The skill deliberately doesn't restate
+datalib's commands or config format; it points the agent at
+[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md),
 pinned to the same version, so the two can't drift.
 
 `inspiration-datalib.md` is the manifest: the authoritative document an agent

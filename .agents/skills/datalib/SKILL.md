@@ -15,22 +15,22 @@ a single local store you can search. When the user asks about their own history
 look. Do **not** try to scrape or re-download the original services yourself.
 
 The store's config file is `$DATALIB_CONFIG` (default
-`data/.skills/datalib/config.yaml`, relative to the workspace root), and the
+`data/.skills/datalib/config.toml`, relative to the workspace root), and the
 **data root** is the directory that holds it. `data/` is the workspace's own
 data tree on the persistent volume, so the store survives restarts. Establish
 both once at the top of your shell work, and make sure the binaries are
 installed:
 
 ```bash
-: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.yaml}"
+: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.toml}"
 DATA_ROOT="$(dirname "$DATALIB_CONFIG")"   # the data root holding the store
 mkdir -p "$DATA_ROOT"
 
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.27.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.27.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.29.0/scripts/install.sh" \
+    | DATALIB_VERSION=v0.29.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -48,7 +48,29 @@ fi
 4. **Never commit the store.** Everything under `data/` is gitignored by the
    workspace, which is why the store lives there. Don't try to force it into
    git, and don't copy it anywhere that is tracked.
-5. **The store rides the workspace backup.** `data/` is covered by the encrypted
+5. **The web UI is already running; point the user at it.** datalib's own
+   grid UI runs as the supervised `data` service on port 8731, reachable in the
+   workspace at `/service/data/` and listed in the app picker. It is the user's
+   way to browse and search the mirror themselves -- offer it when they'd rather
+   look around than ask you. Every route is behind a per-process API token, so
+   the first visit needs it in the query string:
+
+   ```bash
+   echo "/service/data/?token=$(cat "$DATA_ROOT/system/api-token")"
+   ```
+
+   Tell the user to expect one bounce: datalib sets a session cookie, then
+   redirects to strip the token from the URL -- and because the workspace
+   proxies datalib under a path prefix that datalib doesn't know about, that
+   redirect lands them back on the workspace root. The cookie is already set by
+   then, so opening `data` from the app picker (or `/service/data/`) gets them
+   in, and stays working for the rest of the session.
+
+   The token is regenerated whenever the service restarts, so read the file
+   each time rather than reusing an old link. If the service isn't running,
+   `supervisorctl status data` says why; it installs the datalib binaries
+   itself, so it works before you've run anything else.
+6. **The store rides the workspace backup.** `data/` is covered by the encrypted
    host backup. That is fine for a modest mirror, but the store is large and
    fully rebuildable by re-syncing, so if it grows enough to bloat snapshots,
    add `**/data/.skills/datalib` to the `excludes` list in
@@ -62,11 +84,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
