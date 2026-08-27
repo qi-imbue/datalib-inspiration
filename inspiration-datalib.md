@@ -29,23 +29,42 @@ mind only gets it when the user chooses this inspiration.
 The snapshot includes these paths (each is a repo-root-relative path copied from
 the original mind onto a clean default-workspace-template base):
 
-- `.agents/skills/datalib/SKILL.md` (the datalib skill -- the whole capability)
+- `.agents/skills/datalib/SKILL.md` (the datalib skill -- the capability itself)
+- `system/apps/data/run_datalib_http.sh` (the web UI's service wrapper)
+- the `[program:data]` stanza at the end of `system/supervisord.conf` -- copy
+  the stanza onto the base template's own file, don't copy the file wholesale:
+  the rest of it belongs to the base and drifts with it.
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.27.0)
-into `~/.local/bin`, so the base template needs no changes. A pipeline config at
-`$DATALIB_CONFIG` (default `data/.skills/datalib/config.yaml`) lists which
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.29.0)
+into `~/.local/bin`; the web-UI service is the only thing the base template
+gains. A pipeline config at
+`$DATALIB_CONFIG` (default `data/.skills/datalib/config.toml`) lists which
 sources to mirror; each source is fetched through `latchkey` (so the user's
 credentials are injected by the Minds gateway, never stored in the config) and
 written to a local store under the data root (`data/.skills/datalib`, the
 workspace's own gitignored data tree on the persistent volume), where the skill
-searches it. There is no supervisord service and no forwarded port -- it is a
-local tool the agent runs when answering a question.
+searches it. The agent queries that store directly, as a local tool, when
+answering a question -- no service is involved in the answering.
+
+datalib also ships a web UI (a searchable grid over everything mirrored), and
+the snapshot runs it as the supervised `data` service on port 8731, registered
+through `forward_port.py` so it appears in the workspace's app picker and is
+proxied at `/service/data/`. It is the user's own way into the store, separate
+from the agent's. Two things to know about it: the service installs the datalib
+binaries itself if the skill hasn't yet, so a fresh mind's UI works before any
+sync has run (it just shows an empty index); and every route sits behind
+datalib's per-process API token, so the first visit needs
+`?token=<contents of data/.skills/datalib/system/api-token>`. That sets a
+session cookie and then bounces once to the workspace root -- datalib strips
+the token from the URL by redirecting, and it doesn't know it is being served
+under a path prefix. Reopening `data` from the picker works from then on. The
+skill tells the adopting agent how to hand the user that link.
 
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.27.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -68,7 +87,9 @@ http://latchkey-self.invalid/permissions/available/<service>` and use the
 `*-read-all` variant; the `latchkey` skill drives the request/approval flow. No
 `requires_secret`: credentials are handled entirely by latchkey. (Email from a
 Google Takeout `.mbox` needs no permission at all -- it is a file on disk; the
-user just points the config at it.)
+user just points the config at it. The two live email modes do need one: Gmail /
+Google Workspace goes through latchkey's built-in `google-gmail` service, and a
+JMAP mailbox through the service for that host.)
 
 ## How to adapt it
 
@@ -98,9 +119,10 @@ mind. This is the `use-inspiration` skill's template path; in short:
 
 - **Which sources, and how much.** The skill ships an example config only. The
   adapter must set the user's real sources: which Slack channels (or
-  `all_channels: true`), whether email comes from a Google Takeout `.mbox` on
-  disk or a JMAP server, which GitHub/Notion scopes. Nothing is mirrored until
-  the config names a source and the sync runs.
+  `all_channels = true`), which of the three email modes to use -- a Google
+  Takeout `.mbox` on disk, a Gmail account over Google's API, or a JMAP
+  server -- and which GitHub/Notion scopes. Nothing is mirrored until the
+  config names a source and the sync runs.
 - **Cloudflare-walled sources need a recent Minds.** `claude_api` (claude.ai)
   and `chatgpt_api` work inside Minds as of datalib v0.24.0: the latchkey
   gateway routes marked requests through datalib's Chrome-impersonating curl,
