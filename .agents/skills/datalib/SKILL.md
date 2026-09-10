@@ -29,8 +29,8 @@ mkdir -p "$DATA_ROOT"
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.31.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.31.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.31.1/scripts/install.sh" \
+    | DATALIB_VERSION=v0.31.1 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -84,11 +84,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.31.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.31.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it. v0.31.0 changed the
 config format, so if this mind already has a `$DATALIB_CONFIG` written against
 an older pin, run `datalib-migrate-config` on it once and work from the shape

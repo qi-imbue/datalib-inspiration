@@ -36,7 +36,7 @@ the original mind onto a clean default-workspace-template base):
   the rest of it belongs to the base and drifts with it.
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.31.0)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.31.1)
 into `~/.local/bin`; the web-UI service is the only thing the base template
 gains. A pipeline config at
 `$DATALIB_CONFIG` (default `data/.skills/datalib/config.toml`) lists which
@@ -64,7 +64,7 @@ skill tells the adopting agent how to hand the user that link.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.31.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/agent_user.md
 
 ## Prerequisites
 

@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Keep this pin in step with .agents/skills/datalib/SKILL.md -- the service and
 # the skill must install the same datalib, or the UI and the agent's tools
 # disagree about the store format.
-DATALIB_VERSION=v0.31.0
+DATALIB_VERSION=v0.31.1
 
 # datalib-http binds this by default; set it explicitly so the port we register
 # and the port it listens on cannot drift.
