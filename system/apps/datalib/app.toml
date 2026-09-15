@@ -1,0 +1,22 @@
+# The Datalib tab: datalib's own web UI (the Manage screen and the Add/Edit
+# source wizard served by datalib-http) over the store the datalib skill
+# writes. Multi-instance only so that the app, not the shell, chooses the
+# tab's URL: datalib-http admits a browser only once it has seen the API
+# token, and the one listed instance opens at `/?token=...` to hand it over
+# (see src/datalib_app/source.py).
+name = "datalib"
+display_name = "Datalib"
+icon = "icon.svg"
+instances = true
+instances_url = "http://127.0.0.1:8732"
+critical = false
+priority = "user"
+program = "datalib"
+
+[default_shortcut]
+action = "open"
+mode = "focus"
+
+[[actions]]
+id = "open"
+label = "Open Datalib"
