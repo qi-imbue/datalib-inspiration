@@ -1,0 +1,82 @@
+# Machine-readable manifest for this template. The sibling
+# template.md holds the prose, the Requirements list, and the two
+# append-only history logs; this file is authoritative for everything
+# below. Both are maintained together -- validate_template.py fails if
+# they disagree.
+format = "v2"
+
+[template]
+slug = "datalib"
+title = "datalib -- your personal data, searchable"
+description = "Mirror your own data (Slack, email, GitHub, Notion, chat history) into a private local store, and let the mind search and answer questions from it."
+thumbnail = "template.svg"
+version = "v2"
+
+# How this template is DERIVED from the workspace it came from. An
+# update re-runs this recipe rather than diffing two repos, which is what
+# keeps an exclusion excluded even though the thing still exists upstream.
+[recipe]
+include = [
+    ".agents/skills/datalib",
+    "system/apps/datalib",
+    "system/supervisord.conf.d/datalib.conf",
+    "system/scripts/env.d/2000-datalib-binaries.sh",
+    "uv.lock",
+]
+data_include = []
+exclude = [
+    "data/.skills/datalib -- the store itself: it holds the user's personal data and is rebuilt by re-syncing, so it never ships",
+    "data/.skills/datalib/config.toml -- the pipeline config names the publisher's own sources; the adopter writes their own",
+]
+modification_rules = []
+
+# Everything an adopter must deal with before this is really theirs.
+# One list -- but each entry's KIND says how it is handled, because the
+# two are handled at different times by different mechanisms:
+#
+#   permission / secret / llm = ACTIVATION. The adopting agent acts on
+#   these FIRST and BY ITSELF, initiating each latchkey permission
+#   request before asking the user anything. Every one of them must have
+#   a matching requires_ line in template.md and vice versa -- the
+#   validator checks that.
+#
+#   adaptation = worked through INTERACTIVELY with the user afterwards.
+#   Prose on both sides, so it is not cross-checked.
+#
+# Only the permission(s) for the source(s) the user actually wants are
+# requested; each one below is conditional on that choice.
+[requirements]
+
+[[requirements.permission]]
+scope = "slack-api"
+permission = "slack-read-all"
+note = "mirroring the user's Slack; only if they want Slack mirrored"
+
+[[requirements.permission]]
+scope = "github-api"
+permission = "github-read-all"
+note = "mirroring the user's GitHub activity; only if they want GitHub mirrored"
+
+[[requirements.permission]]
+scope = "notion-api"
+permission = "notion-read-all"
+note = "mirroring the user's Notion pages; only if they want Notion mirrored"
+
+[[requirements.adaptation]]
+summary = "Which sources, and how much: the store ships with no config, so nothing is mirrored until a source is named"
+resolution = "Set the user's real sources (which Slack channels or all of them; which of the three email modes -- a Takeout .mbox on disk, Gmail over Google's API, or a JMAP server; which GitHub and Notion scopes), through the Datalib tab's wizard or by writing the config, then run the first sync"
+
+[[requirements.adaptation]]
+summary = "Cloudflare-walled sources (claude.ai and ChatGPT over their web APIs) need a recent Minds app"
+resolution = "Nothing to wire up; if a sync of one of these returns challenge pages instead of data, use an on-disk export (claude_export) for it and tell the user why"
+
+[[requirements.adaptation]]
+summary = "The store is rebuildable, and big enough to think about: it persists on the mind's volume and rides the encrypted host backup, but is large and fully reconstructible by re-syncing"
+resolution = "Leave it in the backup for a modest mirror; exclude data/.skills/datalib from data/system/backup.toml if it grows enough to bloat snapshots (the skill says how)"
+
+# What the included code needs INSTALLED. The datalib binaries are a
+# URL-fetched release with no package database, so they ship as an env.d
+# unit (the pin lives inside it) rather than as a package entry.
+[environment]
+apt = []
+env_d_units = ["system/scripts/env.d/2000-datalib-binaries.sh"]

@@ -1,7 +1,7 @@
 ---
 name: datalib
 description: Retrieve, search, and store the user's own personal data and history -- their chat conversations (Claude, ChatGPT), Slack, email, GitHub / GitLab, Notion, contacts, and messages. Use whenever the user asks about their past conversations, messages, mail, or other personal data, or asks you to import / mirror more of it. Prefer this over re-downloading or scraping the original services.
-compatibility: Self-installing -- pulls the datalib binaries on first use. Needs node.js, curl, and latchkey (all present in a default-workspace-template mind).
+compatibility: The datalib binaries are installed at boot by system/scripts/env.d/2000-datalib-binaries.sh. Needs node.js, curl, and latchkey (all present in a default-workspace-template mind).
 ---
 
 # datalib
@@ -14,24 +14,23 @@ a single local store you can search. When the user asks about their own history
 ("what did I say to X about Y?", "find the email where..."), this is where you
 look. Do **not** try to scrape or re-download the original services yourself.
 
-The store's config file is `$DATALIB_CONFIG` (default
-`data/.skills/datalib/config.toml`, relative to the workspace root), and the
-**data root** is the directory that holds it. `data/` is the workspace's own
-data tree on the persistent volume, so the store survives restarts. Establish
-both once at the top of your shell work, and make sure the binaries are
-installed:
+The **data root** is `data/.skills/datalib` (relative to the workspace root),
+and the store's config file is `config.toml` inside it. `data/` is the
+workspace's own data tree on the persistent volume, so the store survives
+restarts. The binaries live in `~/.local/bin`, which is not on PATH for every
+shell, so establish all of this once at the top of your shell work:
 
 ```bash
-: "${DATALIB_CONFIG:=$HOME/workspace/data/.skills/datalib/config.toml}"
-DATA_ROOT="$(dirname "$DATALIB_CONFIG")"   # the data root holding the store
+export PATH="$HOME/.local/bin:$PATH"
+DATA_ROOT="$HOME/workspace/data/.skills/datalib"   # the data root holding the store
+DATALIB_CONFIG="$DATA_ROOT/config.toml"
 mkdir -p "$DATA_ROOT"
 
-# Install the datalib binaries on first use (fully-static musl build; runs
-# as-is on any Linux). No-op once installed.
-if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.29.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.29.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
-fi
+# The binaries are pinned to datalib v0.31.1 and installed on the env-converge
+# one-shot at boot. If they are not there yet (a first boot still converging,
+# or a workspace that adopted this template and has not rebooted), run the
+# unit by hand -- it is idempotent and a no-op once installed:
+command -v datalib-dag >/dev/null 2>&1 || bash "$HOME/workspace/system/scripts/env.d/2000-datalib-binaries.sh"
 ```
 
 1. **Search the existing mirror first.** The user may already have data
@@ -39,7 +38,10 @@ fi
    result means "nothing mirrored yet", so offer to sync -- don't treat it as
    "no such data".
 2. **Sync to import or refresh data.** Syncs are incremental and resumable; the
-   first sync of a source is slow, later runs only pull deltas.
+   first sync of a source is slow, later runs only pull deltas. `datalib-dag`
+   runs alongside the Datalib tab's server on the same root without conflict;
+   never start a second `datalib-http` on this root, though -- the running one
+   holds the root's `system/` lock, and its API is yours to use (below).
 3. **Credentials go through latchkey.** The web-API sources authenticate via
    `latchkey`, already wired to the user through the Minds app. If a sync
    reports missing credentials or "not permitted", use the `latchkey` skill to
@@ -48,29 +50,33 @@ fi
 4. **Never commit the store.** Everything under `data/` is gitignored by the
    workspace, which is why the store lives there. Don't try to force it into
    git, and don't copy it anywhere that is tracked.
-5. **The web UI is already running; point the user at it.** datalib's own
-   grid UI runs as the supervised `data` service on port 8731, reachable in the
-   workspace at `/service/data/` and listed in the app picker. It is the user's
-   way to browse and search the mirror themselves -- offer it when they'd rather
-   look around than ask you. Every route is behind a per-process API token, so
-   the first visit needs it in the query string:
+5. **The Datalib tab is the user's way in; open it for them.** datalib's own
+   web UI -- the Manage screen (every configured source and its sync state)
+   and the Add/Edit source wizard -- runs as the supervised `datalib` app over
+   this same store, so a source the user adds there is one you can search, and
+   a sync you run is one they can watch. Open it beside your chat with:
 
    ```bash
-   echo "/service/data/?token=$(cat "$DATA_ROOT/system/api-token")"
+   python3 system/scripts/layout.py open datalib
    ```
 
-   Tell the user to expect one bounce: datalib sets a session cookie, then
-   redirects to strip the token from the URL -- and because the workspace
-   proxies datalib under a path prefix that datalib doesn't know about, that
-   redirect lands them back on the workspace root. The cookie is already set by
-   then, so opening `data` from the app picker (or `/service/data/`) gets them
-   in, and stays working for the rest of the session.
+   The tab signs itself in (the app hands datalib its API token), so there is
+   no link to paste. If the tab is empty or the app is missing from the
+   launcher, `supervisorctl status datalib` says why -- on a fresh mind it
+   waits for the binaries above to arrive, then starts on its own.
+6. **The API is reachable with the bearer token.** The same server answers
+   `http://127.0.0.1:8731` from inside the workspace, and every route needs
+   the token it publishes at `$DATA_ROOT/system/api-token` (stable across
+   restarts of the app):
 
-   The token is regenerated whenever the service restarts, so read the file
-   each time rather than reusing an old link. If the service isn't running,
-   `supervisorctl status data` says why; it installs the datalib binaries
-   itself, so it works before you've run anything else.
-6. **The store rides the workspace backup.** `data/` is covered by the encrypted
+   ```bash
+   curl -sS -H "Authorization: Bearer $(cat "$DATA_ROOT/system/api-token")" \
+     http://127.0.0.1:8731/api/health
+   ```
+
+   Which endpoints exist, and what the search query language looks like, is
+   datalib's own surface -- read the agent guide below rather than guessing.
+7. **The store rides the workspace backup.** `data/` is covered by the encrypted
    host backup. That is fine for a modest mirror, but the store is large and
    fully rebuildable by re-syncing, so if it grows enough to bloat snapshots,
    add `**/data/.skills/datalib` to the `excludes` list in
@@ -81,14 +87,15 @@ fi
 ## Driving datalib: read the upstream agent guide
 
 datalib ships its own guide for agents using it. **Read it before doing any
-datalib work** -- how to write the pipeline config, run a sync, and query the
-mirrored data all live there, and they change with the version pinned above:
+datalib work** -- how to write the pipeline config, run a sync, query the
+mirrored data, and use the HTTP API all live there, and they change with the
+version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
