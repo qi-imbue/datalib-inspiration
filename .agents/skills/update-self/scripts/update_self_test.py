@@ -1818,6 +1818,17 @@ def test_read_app_tools_skips_an_app_it_cannot_describe(tmp_path: Path, capsys) 
     assert "broken" in err and "unreadable" in err and "nameless" in err
 
 
+# Every app tool this repo installs: the template's own plus the datalib tab.
+_EVERY_APP_TOOL = {
+    "system-interface",
+    "chat",
+    "browser",
+    "terminal-app",
+    "files-app",
+    "datalib-app",
+}
+
+
 @pytest.mark.parametrize(
     ("path", "tool_names"),
     [
@@ -1842,24 +1853,26 @@ def test_read_app_tools_skips_an_app_it_cannot_describe(tmp_path: Path, capsys) 
         # excluded directories, so a beacon edit reinstalls the (editable) tool:
         # harmless, and cheaper than a per-app exception to the rule.
         ("system/apps/files/assets/index.js", {"files-app"}),
+        ("system/apps/datalib/src/datalib_app/main.py", {"datalib-app"}),
+        ("system/apps/datalib/app.toml", {"datalib-app"}),
         # A shared backend manifest is part of every app tool's closure: the
         # vendored packages an app depends on editable, and the plugin table
         # that assigns plugins to its tool.
         (
             "system/apps/system_interface/pyproject.toml",
-            {"system-interface", "chat", "browser", "terminal-app", "files-app"},
+            _EVERY_APP_TOOL,
         ),
         (
             "system/vendor/mngr/libs/mngr/pyproject.toml",
-            {"system-interface", "chat", "browser", "terminal-app", "files-app"},
+            _EVERY_APP_TOOL,
         ),
         (
             update_layout.PLUGIN_MANIFEST_PATH,
-            {"system-interface", "chat", "browser", "terminal-app", "files-app"},
+            _EVERY_APP_TOOL,
         ),
         (
             "uv.lock",
-            {"system-interface", "chat", "browser", "terminal-app", "files-app"},
+            _EVERY_APP_TOOL,
         ),
     ],
 )
