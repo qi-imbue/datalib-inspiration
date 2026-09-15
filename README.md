@@ -114,7 +114,7 @@ Only for the sources you actually want mirrored:
 
 The capability is one self-contained skill, `.agents/skills/datalib/`. On first
 use it installs the `datalib-*` binaries (a static musl build, pinned to datalib
-v0.29.0) into `~/.local/bin`. A pipeline config lists the sources to mirror, and
+v0.32.0) into `~/.local/bin`. A pipeline config lists the sources to mirror, and
 the store is written under `data/.skills/datalib`, where the agent searches it
 on demand -- a local tool it runs when answering a question, with no service in
 the loop.
@@ -125,7 +125,7 @@ Alongside it, datalib's own web UI runs as the supervised `data` service
 registers port 8731 on startup, so it shows up in the workspace's app picker
 like the terminal and browser do. The skill deliberately doesn't restate
 datalib's commands or config format; it points the agent at
-[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md),
+[datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.32.0/docs/agent_user.md),
 pinned to the same version, so the two can't drift.
 
 `inspiration-datalib.md` is the manifest: the authoritative document an agent

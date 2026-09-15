@@ -29,8 +29,8 @@ mkdir -p "$DATA_ROOT"
 # Install the datalib binaries on first use (fully-static musl build; runs
 # as-is on any Linux). No-op once installed.
 if ! command -v datalib-dag >/dev/null 2>&1; then
-  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.29.0/scripts/install.sh" \
-    | DATALIB_VERSION=v0.29.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
+  curl -LsSf "https://raw.githubusercontent.com/imbue-ai/datalib/v0.32.0/scripts/install.sh" \
+    | DATALIB_VERSION=v0.32.0 DATALIB_LIBC=musl DATALIB_INSTALL_DIR="$HOME/.local/bin" sh
 fi
 ```
 
@@ -84,11 +84,11 @@ datalib ships its own guide for agents using it. **Read it before doing any
 datalib work** -- how to write the pipeline config, run a sync, and query the
 mirrored data all live there, and they change with the version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.32.0/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.32.0/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
@@ -102,12 +102,14 @@ permission request for that service's scope (e.g. `slack-api`, `github-api`,
 
 ## Supported sources (inside Minds)
 
-Reliable through the Minds latchkey gateway: **Slack** (`slack_api`), **GitHub**
-(`github_api`), **Notion** (`notion_api`), and **email** (`email` -- a Google
-Takeout `.mbox` on disk, or a JMAP server).
+Reliable through the Minds latchkey gateway: **Slack** (`slack`), **GitHub**
+(`github`), **Notion** (`notion`), and **email** (`email` -- a Google
+Takeout `.mbox` on disk, a Gmail account over Google's API, or a JMAP server).
+A source's `type` names the thing mirrored; how it is reached is a method
+table on its ingest step (the agent guide shows the shape).
 
-Cloudflare-walled web sources -- `claude_api` (claude.ai) and `chatgpt_api` --
-also work. Requests that ask for it are routed through datalib's
+Cloudflare-walled web sources -- `claude` (claude.ai) and `chatgpt`, over their
+`api` method -- also work. Requests that ask for it are routed through datalib's
 Chrome-impersonating curl by the Minds latchkey gateway, which clears the TLS
 fingerprint check that used to challenge them. On a mind running remotely, the
 same requests also go back out through the gateway on the user's own computer
@@ -121,7 +123,8 @@ Both halves need a recent Minds app: the gateway's bundled curl has to be
 datalib v0.24.0 or later, and the desktop-egress route needs a Minds that
 publishes that variable. If a sync of one of these sources returns Cloudflare
 challenge pages instead of data, that is the likely cause -- fall back to an
-on-disk export (`claude_export`) for that data and tell the user why.
+on-disk export (the `claude` source's `export` method) for that data and tell
+the user why.
 
 ## Notes
 

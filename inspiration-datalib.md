@@ -36,7 +36,7 @@ the original mind onto a clean default-workspace-template base):
   the rest of it belongs to the base and drifts with it.
 
 The `datalib` skill is self-contained: on first use it installs the
-`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.29.0)
+`datalib-*` binaries (a fully-static musl build, pinned to datalib v0.32.0)
 into `~/.local/bin`; the web-UI service is the only thing the base template
 gains. A pipeline config at
 `$DATALIB_CONFIG` (default `data/.skills/datalib/config.toml`) lists which
@@ -64,7 +64,7 @@ skill tells the adopting agent how to hand the user that link.
 The concrete commands, config format, and query surfaces are datalib's own and
 change between versions, so they are deliberately not restated here or in the
 skill. They live in datalib's agent guide, pinned to the version above:
-https://github.com/imbue-ai/datalib/blob/v0.29.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.32.0/docs/agent_user.md
 
 ## Prerequisites
 
@@ -117,23 +117,24 @@ mind. This is the `use-inspiration` skill's template path; in short:
 
 ## Holes
 
-- **Which sources, and how much.** The skill ships an example config only. The
-  adapter must set the user's real sources: which Slack channels (or
-  `all_channels = true`), which of the three email modes to use -- a Google
-  Takeout `.mbox` on disk, a Gmail account over Google's API, or a JMAP
-  server -- and which GitHub/Notion scopes. Nothing is mirrored until the
-  config names a source and the sync runs.
-- **Cloudflare-walled sources need a recent Minds.** `claude_api` (claude.ai)
-  and `chatgpt_api` work inside Minds as of datalib v0.24.0: the latchkey
-  gateway routes marked requests through datalib's Chrome-impersonating curl,
-  clearing the TLS fingerprint check that used to challenge them. As of v0.27.0
+- **Which sources, and how much.** The skill ships no config; the adapter
+  writes one (the pinned agent guide has the shape) naming the user's real
+  sources: which Slack channels (or `all_channels = true`), which of the three
+  email modes to use -- a Google Takeout `.mbox` on disk, a Gmail account over
+  Google's API, or a JMAP server -- and which GitHub/Notion scopes. Nothing is
+  mirrored until the config names a source and the sync runs.
+- **Cloudflare-walled sources need a recent Minds.** `claude` (claude.ai)
+  and `chatgpt`, over their `api` method, work inside Minds as of datalib
+  v0.24.0: the latchkey gateway routes marked requests through datalib's
+  Chrome-impersonating curl, clearing the TLS fingerprint check that used to
+  challenge them. As of v0.27.0
   a remotely-hosted mind additionally sends those requests back out through the
   gateway on the user's own computer (`MINDS_VIA_DESKTOP_URL_PREFIX`, published
   by Minds), so they carry a residential IP instead of the VPS's -- these sites
   block datacenter ranges outright. On an older Minds app one or both halves
   are missing and these sources still get challenged -- if a sync returns
-  challenge pages instead of data, use an on-disk export (`claude_export`) for
-  it. Not something the adapter wires up either way.
+  challenge pages instead of data, use an on-disk export (the `claude` source's
+  `export` method) for it. Not something the adapter wires up either way.
 - **The store is rebuildable, and big enough to think about.** The data root
   (`data/.skills/datalib`) persists across restarts on the mind's own volume and
   is covered by the encrypted host backup like the rest of `data/`. It is also
