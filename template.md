@@ -53,8 +53,8 @@ store directly, as a local tool, when answering a question. The concrete
 commands, config format, and query surfaces are datalib's own and change
 between versions, so they are deliberately not restated here or in the skill.
 They live in datalib's agent guide, pinned to the release the binaries come
-from (datalib v0.31.1):
-https://github.com/imbue-ai/datalib/blob/v0.31.1/docs/agent_user.md
+from (datalib v0.33.0):
+https://github.com/imbue-ai/datalib/blob/v0.33.0/docs/agent_user.md
 
 The **Datalib tab** is how the user uses it. datalib's own web UI -- the
 Manage screen, which shows every configured source and its sync state, and
@@ -71,7 +71,7 @@ there, datalib-http sets its session cookie and redirects to `/`. The token is
 `data/.skills/datalib/system/api-token`, kept stable across restarts, and it
 is also what the agent sends as a bearer token to reach the API.
 
-The **binaries** (a fully-static musl build of datalib v0.31.1: `datalib-http`
+The **binaries** (a fully-static musl build of datalib v0.33.0: `datalib-http`
 for the tab, `datalib-dag` and the rest for the skill) are installed by the
 env.d unit on the env-converge one-shot, into `~/.local/share/datalib/<version>/`
 with links in `~/.local/bin`. On a first boot that takes a few minutes; the
@@ -132,8 +132,9 @@ Adaptation:
   Gmail account over Google's API, or a JMAP server -- and which GitHub/Notion
   scopes. The Datalib tab's wizard is the user's way to do this; the agent can
   also write the config directly.
-- **Cloudflare-walled sources need a recent Minds.** `claude_api` (claude.ai)
-  and `chatgpt_api` work inside Minds as of datalib v0.24.0: the latchkey
+- **Cloudflare-walled sources need a recent Minds.** The `claude` source over
+  claude.ai's API (its `api` method) and the `chatgpt` source work inside
+  Minds as of datalib v0.24.0: the latchkey
   gateway routes marked requests through datalib's Chrome-impersonating curl,
   clearing the TLS fingerprint check that used to challenge them. As of v0.27.0
   a remotely-hosted mind additionally sends those requests back out through the
@@ -141,8 +142,9 @@ Adaptation:
   by Minds), so they carry a residential IP instead of the VPS's -- these sites
   block datacenter ranges outright. On an older Minds app one or both halves
   are missing and these sources still get challenged -- if a sync returns
-  challenge pages instead of data, use an on-disk export (`claude_export`) for
-  it. Not something the adapter wires up either way.
+  challenge pages instead of data, point the source at an on-disk export
+  instead (the `claude` source's `export` method). Not something the adapter
+  wires up either way.
 - **The store is rebuildable, and big enough to think about.** The data root
   (`data/.skills/datalib`) persists across restarts on the mind's own volume and
   is covered by the encrypted host backup like the rest of `data/`. It is also
@@ -159,7 +161,7 @@ out consistent with the rest of that mind's environment rather than frozen to
 whatever this publisher happened to have.
 
 - `system/scripts/env.d/2000-datalib-binaries.sh`: the datalib binaries,
-  pinned to v0.31.1 (a fully-static musl build fetched from datalib's GitHub
+  pinned to v0.33.0 (a fully-static musl build fetched from datalib's GitHub
   release, with its published checksum verified). Both the Datalib tab and the
   skill run them. No apt packages, npm globals, uv tools, or cargo crates
   beyond the stock workspace: `datalib-app` is a workspace member installed
