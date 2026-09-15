@@ -26,6 +26,7 @@ from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.imbue_common.primitives import PositiveFloat
 from imbue.imbue_common.pure import pure
 from imbue.mngr.config.field_markers import RegistryField
+from imbue.mngr.config.field_markers import SettingsPatchField
 from imbue.mngr.config.overlay_merge import merge_models_via_overlay
 from imbue.mngr.errors import ConfigParseError
 from imbue.mngr.errors import ParseSpecError
@@ -41,6 +42,7 @@ from imbue.mngr.primitives import ProviderInstanceName
 from imbue.mngr.primitives import UserId
 from imbue.mngr.utils.file_utils import atomic_write
 from imbue.mngr.utils.logging import LoggingConfig
+from imbue.mngr.utils.suspension_watchdog import SuspensionWatchdog
 from imbue.overlay.markers import ScalarTuple
 
 USER_ID_FILENAME: Final[str] = "user_id"
@@ -68,6 +70,11 @@ _DEFAULT_DISCOVERY_WARN_SECONDS: Final[float] = 20.0
 _DEFAULT_DISCOVERY_ERROR_TIMEOUT_SECONDS: Final[float] = 120.0
 _DEFAULT_HOST_DISCOVERY_TIMEOUT_SECONDS: Final[float] = 30.0
 _DEFAULT_AGENT_DISCOVERY_TIMEOUT_SECONDS: Final[float] = 30.0
+
+# Wall-clock budget for reading one host's live details while listing agents/hosts.
+# A host slower than this falls back to its offline/partial data so one slow or
+# contended host cannot stall the whole read.
+_DEFAULT_HOST_DETAIL_READ_TIMEOUT_SECONDS: Final[float] = 20.0
 
 # === Helper Functions ===
 
@@ -323,8 +330,12 @@ class CommandDefaults(FrozenModel):
     Field names should match the CLI parameter names (after click's conversion).
     """
 
-    # Store as a flexible dict since we don't know all possible CLI parameters ahead of time
-    defaults: dict[str, Any] = Field(
+    # Store as a flexible dict since we don't know all possible CLI parameters ahead of time.
+    # A settings patch rather than an assign-by-default aggregate: each layer's
+    # ``[commands.<name>]`` table sets only the parameters it cares about, and a local
+    # ``type = "codex"`` must add to the project's ``connect = false`` rather than replace
+    # the whole map. A same-key list assigned bare across layers is still a narrowing.
+    defaults: Annotated[dict[str, Any], SettingsPatchField()] = Field(
         default_factory=dict,
         description="Map of parameter name to default value",
     )
@@ -505,6 +516,12 @@ class MngrConfig(FrozenModel):
         default_factory=RetryConfig,
         description="Connection retry configuration",
     )
+    host_detail_read_timeout_seconds: PositiveFloat = Field(
+        default=PositiveFloat(_DEFAULT_HOST_DETAIL_READ_TIMEOUT_SECONDS),
+        description="How long (in seconds) to wait for a single host's live detail collection while listing "
+        "agents/hosts before falling back to that host's offline/partial data, so one slow or contended host "
+        "cannot stall the whole read.",
+    )
     logging: LoggingConfig = Field(
         default_factory=LoggingConfig,
         description="Logging configuration",
@@ -546,6 +563,13 @@ class MngrConfig(FrozenModel):
             "poorly-scoped test cannot pick up a real config (e.g. ~/.mngr) and perform real "
             "operations; configs written for tests set this to True to opt in."
         ),
+    )
+    strict_host_record_parsing: bool = Field(
+        default=False,
+        description="When true, a host record that exists on a provider's state store but cannot be parsed "
+        "(after retries) raises an error instead of being treated as missing. The default (false) logs a "
+        "warning and treats the record as missing, which keeps discovery and destroy working around a "
+        "corrupt record at the cost of that host silently dropping out of listings.",
     )
     default_destroyed_host_persisted_seconds: float = Field(
         default=_DEFAULT_DESTROYED_HOST_PERSISTED_SECONDS,
@@ -598,9 +622,9 @@ class MngrConfig(FrozenModel):
 
         The narrowings are the single config-load narrowing detector: cross-scope
         bare-drops of a non-empty aggregate by a higher-precedence layer -- both ordinary
-        assign-by-default field drops (e.g. ``agent_types.<name>.cli_args``,
-        ``commands.create.defaults.env``) and ``SettingsPatchField`` drops *inside* an
-        accumulating settings patch (e.g. ``agent_types.<name>.settings_overrides.<key>...``).
+        assign-by-default field drops (e.g. ``agent_types.<name>.cli_args``) and
+        ``SettingsPatchField`` drops *inside* an accumulating settings patch (e.g.
+        ``commands.create.defaults.env``, ``agent_types.<name>.settings_overrides.<key>...``).
         ``Static*`` atomic aggregates are exempt via the override-side re-marking. The loader
         routes the whole list into its flag-gated narrowing aggregation; callers that only
         need the merged value drop the second element explicitly.
@@ -648,6 +672,10 @@ class MngrContext(FrozenModel):
         default=False,
         description="When True, always query all providers during discovery (skip event-stream optimization)",
     )
+    suspension_watchdog: SuspensionWatchdog = Field(
+        default_factory=SuspensionWatchdog,
+        description="Closes SSH transports a machine suspension left half-open; every OuterHost connection registers with it.",
+    )
     project_root: Path | None = Field(
         default=None,
         description="Project root directory (git worktree root)",
@@ -682,6 +710,10 @@ class OutputOptions(FrozenModel):
     is_quiet: bool = Field(
         default=False,
         description="Whether to suppress all stdout output (set by --quiet)",
+    )
+    extra_format: str | None = Field(
+        default=None,
+        description="A command-specific extra format name (e.g. 'atif') that matched instead of a builtin OutputFormat",
     )
 
 

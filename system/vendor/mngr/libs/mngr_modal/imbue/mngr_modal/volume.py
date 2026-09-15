@@ -70,6 +70,14 @@ class ModalVolume(BaseVolume):
     modal_volume: VolumeInterface = Field(frozen=True, description="The underlying volume interface")
 
     @_translate_transient_proxy_errors
+    def resolve_id(self) -> str:
+        """Resolve this volume against Modal, confirming that it exists.
+
+        Raises ModalProxyNotFoundError when the volume does not exist.
+        """
+        return self.modal_volume.get_object_id()
+
+    @_translate_transient_proxy_errors
     def listdir(self, path: str) -> list[VolumeFile]:
         entries = self.modal_volume.listdir(path)
         return [_proxy_file_entry_to_volume_file(e) for e in entries]
@@ -98,4 +106,13 @@ class ModalVolume(BaseVolume):
 
     @_translate_transient_proxy_errors
     def write_files(self, file_contents_by_path: Mapping[str, bytes]) -> None:
+        """Write files via the underlying VolumeInterface.
+
+        Satisfies the per-file atomic-visibility contract of
+        ``Volume.write_files`` without a temp-name + rename step: the
+        underlying implementation stages the files through modal's batched
+        upload, which commits them as a unit, so a concurrent reader only
+        ever observes committed file contents -- never a truncated or
+        partially-uploaded file.
+        """
         self.modal_volume.write_files(file_contents_by_path)

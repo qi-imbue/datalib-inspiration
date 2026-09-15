@@ -191,6 +191,10 @@ class CommandResult(FrozenModel):
     stdout: str = Field(description="Standard output from the command")
     stderr: str = Field(description="Standard error from the command")
     success: bool = Field(description="True if the command succeeded (had an expected exit code)")
+    exit_code: int | None = Field(
+        default=None,
+        description="The command's exit code when the executor observed one (None when not surfaced)",
+    )
 
 
 class CleanupFailureCategory(UpperCaseStrEnum):
@@ -269,6 +273,15 @@ class HostResources(FrozenModel):
     gpu: GpuResources | None = Field(
         default=None,
         description="GPU resources (None if no GPU allocated)",
+    )
+
+
+class HostBootInfo(FrozenModel):
+    """A host's boot time and its uptime, read together in a single host-side probe."""
+
+    boot_time: datetime | None = Field(default=None, description="When the host was last started (None if unknown)")
+    uptime_seconds: float | None = Field(
+        default=None, description="Seconds since the host was last started, measured on the host (None if unknown)"
     )
 
 

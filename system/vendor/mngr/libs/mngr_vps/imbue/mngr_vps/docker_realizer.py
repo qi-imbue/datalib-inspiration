@@ -23,10 +23,12 @@ from imbue.mngr.providers.listing_utils import extract_agent_data_from_parsed_li
 from imbue.mngr.providers.listing_utils import parse_listing_collection_output
 from imbue.mngr.providers.ssh_host_setup import build_start_activity_watcher_command
 from imbue.mngr.providers.ssh_utils import add_host_to_known_hosts
-from imbue.mngr.providers.ssh_utils import load_or_create_ssh_keypair
+from imbue.mngr.providers.ssh_utils import load_or_create_per_host_client_keypair
+from imbue.mngr.providers.ssh_utils import resolve_per_host_client_keypair
 from imbue.mngr_vps.container_setup import CONTAINER_ENTRYPOINT_CMD
 from imbue.mngr_vps.container_setup import HOME_SUBPATH
 from imbue.mngr_vps.container_setup import HOST_DIR_SUBPATH
+from imbue.mngr_vps.container_setup import HOST_VOLUME_HOME_PATH
 from imbue.mngr_vps.container_setup import HOST_VOLUME_MOUNT_PATH
 from imbue.mngr_vps.container_setup import LABEL_HOST_ID
 from imbue.mngr_vps.container_setup import LABEL_HOST_NAME
@@ -57,6 +59,7 @@ from imbue.mngr_vps.container_setup import start_container
 from imbue.mngr_vps.container_setup import start_container_sshd
 from imbue.mngr_vps.container_setup import stop_container
 from imbue.mngr_vps.data_types import AgentEndpoint
+from imbue.mngr_vps.data_types import ContainerFile
 from imbue.mngr_vps.data_types import PlacementHandle
 from imbue.mngr_vps.data_types import RealizePlacementContext
 from imbue.mngr_vps.data_types import RealizedPlacement
@@ -190,8 +193,19 @@ class DockerRealizer(SnapshotCapableRealizer):
 
     # --- container identity (keys + known_hosts) ---------------------------
 
-    def _container_ssh_keypair(self) -> tuple[Path, str]:
-        return load_or_create_ssh_keypair(self.key_dir, CONTAINER_SSH_KEY_NAME)
+    def _container_ssh_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        # Per host for containers created after per-host client keys landed;
+        # older containers only authorize the legacy provider-wide pair, which
+        # remains the read fallback for them.
+        return resolve_per_host_client_keypair(
+            self.key_dir, host_id, CONTAINER_SSH_KEY_NAME, CONTAINER_KNOWN_HOSTS_NAME
+        )
+
+    def _create_per_host_container_ssh_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        """Mint (or load) this host's own container client keypair (creation paths only)."""
+        return load_or_create_per_host_client_keypair(
+            self.key_dir, host_id, CONTAINER_SSH_KEY_NAME, CONTAINER_KNOWN_HOSTS_NAME
+        )
 
     def _container_host_keypair(self, host_id: HostId) -> tuple[Path, str]:
         # Per host: each container gets its own sshd host key so one host's key can
@@ -203,8 +217,8 @@ class DockerRealizer(SnapshotCapableRealizer):
     def _container_known_hosts_path(self) -> Path:
         return self.key_dir / CONTAINER_KNOWN_HOSTS_NAME
 
-    def agent_endpoint(self, vps_ip: str) -> AgentEndpoint:
-        container_key_path, _container_pub = self._container_ssh_keypair()
+    def agent_endpoint(self, vps_ip: str, host_id: HostId) -> AgentEndpoint:
+        container_key_path, _container_pub = self._container_ssh_keypair(host_id)
         return AgentEndpoint(
             hostname=vps_ip,
             port=self.config.container_ssh_port,
@@ -213,7 +227,11 @@ class DockerRealizer(SnapshotCapableRealizer):
         )
 
     def open_host_store(self, outer: OuterHostInterface, host_id: HostId) -> VpsHostStore:
-        return open_host_store(outer, host_volume_name_for(host_id))
+        return open_host_store(
+            outer,
+            host_volume_name_for(host_id),
+            is_strict_parsing=self.mngr_ctx.config.strict_host_record_parsing,
+        )
 
     # --- discovery / listing ----------------------------------------------
 
@@ -259,9 +277,12 @@ class DockerRealizer(SnapshotCapableRealizer):
         known_hosts_entries: tuple[str, ...],
         authorized_keys_entries: tuple[str, ...],
         home_volume_symlink: tuple[str, str] | None,
+        extra_ssh_config_files: tuple[ContainerFile, ...],
     ) -> None:
         """Set up SSH inside the container via docker exec."""
-        _container_key_path, container_public_key = self._container_ssh_keypair()
+        # Creation path: mint this host's own container client key so the new
+        # container authorizes per-host material (never the provider-wide pair).
+        _container_key_path, container_public_key = self._create_per_host_container_ssh_keypair(host_id)
         container_host_key_path, container_host_public_key = self._container_host_keypair(host_id)
         setup_container_ssh(
             outer,
@@ -274,6 +295,7 @@ class DockerRealizer(SnapshotCapableRealizer):
             known_hosts_entries=known_hosts_entries,
             authorized_keys_entries=authorized_keys_entries,
             home_volume_symlink=home_volume_symlink,
+            extra_ssh_config_files=extra_ssh_config_files,
         )
 
     def _prepare_btrfs_on_outer(self, outer: OuterHostInterface, host_id: HostId) -> Path:
@@ -375,10 +397,7 @@ class DockerRealizer(SnapshotCapableRealizer):
             # volume's host_dir/ subdir exactly as before.
             if self.config.volume_home_path is not None:
                 host_dir_symlink_target = None
-                home_volume_symlink = (
-                    str(self.config.volume_home_path),
-                    f"{HOST_VOLUME_MOUNT_PATH}/{HOME_SUBPATH}",
-                )
+                home_volume_symlink = (str(self.config.volume_home_path), HOST_VOLUME_HOME_PATH)
             else:
                 host_dir_symlink_target = f"{HOST_VOLUME_MOUNT_PATH}/{HOST_DIR_SUBPATH}"
                 home_volume_symlink = None
@@ -390,6 +409,7 @@ class DockerRealizer(SnapshotCapableRealizer):
                 known_hosts_entries=tuple(ctx.known_hosts or ()),
                 authorized_keys_entries=tuple(ctx.authorized_keys or ()),
                 home_volume_symlink=home_volume_symlink,
+                extra_ssh_config_files=ctx.extra_ssh_config_files,
             )
 
         _container_host_key_path, container_host_public_key = self._container_host_keypair(ctx.host_id)
@@ -398,6 +418,7 @@ class DockerRealizer(SnapshotCapableRealizer):
             hostname=ctx.vps_ip,
             port=self.config.container_ssh_port,
             public_key=container_host_public_key,
+            host_id=ctx.host_id,
         )
         return RealizedPlacement(
             handle=PlacementHandle(

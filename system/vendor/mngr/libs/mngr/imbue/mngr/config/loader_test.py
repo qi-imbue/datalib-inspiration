@@ -798,14 +798,22 @@ def test_parse_create_templates_accepts_extend_suffix() -> None:
     assert result[CreateTemplateName("dev")].options == {"env__extend": ["DEBUG=1"]}
 
 
-def test_parse_create_templates_rejects_unknown_field_even_with_extend_suffix() -> None:
-    """``<unknown>__extend`` is still rejected -- the ``__extend`` suffix opts the
-    base key into additive merge, but the base key still has to be a real
-    CreateCliOptions field. (Same shape as the bare-key validation that flagged
-    typos in template options before.)"""
-    raw = {"dev": {"bogus_typo__extend": ["X=1"]}}
-    with pytest.raises(ConfigParseError, match="Unknown field 'bogus_typo__extend'"):
-        _parse_create_templates(raw)
+def test_parse_create_templates_defers_non_option_keys_instead_of_rejecting_them() -> None:
+    """A key that is not a create option parses through, for `apply_create_template` to judge.
+
+    Parsing cannot judge these: a template may set a field on the agent type the create
+    resolves to (`output_style`), and the registry naming those fields is populated by the
+    harness plugins only *after* config parsing. A check here would therefore see an empty
+    registry and reject every such key -- which is exactly what broke a real workspace
+    create. The key asserted is deliberately nonsense: if this ever consults the registry
+    again, `output_style` might pass while this still fails.
+    """
+    raw = {"dev": {"not_a_create_option": "x", "also_not_one__extend": ["X=1"]}}
+    result = _parse_create_templates(raw)
+    assert result[CreateTemplateName("dev")].options == {
+        "not_a_create_option": "x",
+        "also_not_one__extend": ["X=1"],
+    }
 
 
 # =============================================================================
@@ -976,7 +984,9 @@ def test_load_config_threads_every_field_from_toml(
     assert config.headless is True
     assert config.is_nested_tmux_allowed is True
     assert config.is_error_reporting_enabled is False
+    assert config.strict_host_record_parsing is True
     assert config.default_destroyed_host_persisted_seconds == 12345.0
+    assert config.host_detail_read_timeout_seconds == 45.0
     assert config.retry.connect_retry_times == 5
     assert config.retry.connect_retry_delay == "10s"
     assert config.tmux.primary_window_name == "main"
@@ -1089,9 +1099,11 @@ _SAMPLE_CONFIG_VALUES: dict[str, Any] = {
     "headless": True,
     "is_error_reporting_enabled": False,
     "is_allowed_in_pytest": True,
+    "strict_host_record_parsing": True,
     "default_destroyed_host_persisted_seconds": 12345.0,
     "default_min_online_host_age_seconds": 600.0,
     "agent_ready_timeout": 15.0,
+    "host_detail_read_timeout_seconds": 45.0,
     "allow_settings_key_assignment_narrowing": True,
 }
 
@@ -1107,9 +1119,11 @@ is_nested_tmux_allowed = true
 headless = true
 is_error_reporting_enabled = false
 is_allowed_in_pytest = true
+strict_host_record_parsing = true
 default_destroyed_host_persisted_seconds = 12345.0
 default_min_online_host_age_seconds = 600.0
 agent_ready_timeout = 15.0
+host_detail_read_timeout_seconds = 45.0
 allow_settings_key_assignment_narrowing = true
 
 [commands.create]
@@ -2201,6 +2215,35 @@ def test_load_config_extend_avoids_narrowing_without_opt_in(
 
     mngr_ctx = load_config(pm=pm, concurrency_group=cg)
     assert mngr_ctx.config.commands["create"].defaults["env"] == ["X=4", "X=5"]
+
+
+def test_load_config_local_command_defaults_add_to_the_projects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, temp_git_repo_cwd: Path, cg: ConcurrencyGroup
+) -> None:
+    """A local ``[commands.create]`` naming only a ``type`` keeps every parameter the project's
+    table set: the table is a settings patch, not a map one layer replaces wholesale. Without
+    this a workspace that writes its default agent type locally would lose its project's
+    ``connect`` and ``host_env`` on every create.
+    """
+    pm = pluggy.PluginManager("mngr")
+    pm.add_hookspecs(hookspecs)
+    load_all_registries(pm)
+
+    _isolate_load_config_env(monkeypatch)
+    (tmp_path / "settings.toml").write_text(
+        'is_allowed_in_pytest = true\n\n[commands.create]\nconnect = false\nhost_env__extend = ["A=1"]\n'
+    )
+    (tmp_path / "settings.local.toml").write_text(
+        'is_allowed_in_pytest = true\n\n[commands.create]\ntype = "codex"\nlabel__extend = ["account=a"]\n'
+    )
+    monkeypatch.setenv("MNGR_PROJECT_CONFIG_DIR", str(tmp_path))
+
+    mngr_ctx = load_config(pm=pm, concurrency_group=cg)
+    defaults = mngr_ctx.config.commands["create"].defaults
+    assert defaults["type"] == "codex"
+    assert defaults["label"] == ["account=a"]
+    assert defaults["connect"] is False
+    assert defaults["host_env"] == ["A=1"]
 
 
 # === load_config narrowing guard against agent_types / providers / create_templates ===

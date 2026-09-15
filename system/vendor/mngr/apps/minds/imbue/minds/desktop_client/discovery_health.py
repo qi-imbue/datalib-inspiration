@@ -40,18 +40,21 @@ The watchdog never touches the consumer subprocess: it is also the HTTP traffic
 proxy, and its bound port is baked into app state / ``AgentCreator`` / the
 Electron shell, so respawning it is heavyweight and risks a port rebind.
 
-Health is a three-state machine surfaced to the chrome:
+Health is a three-state machine surfaced to the SPA:
 
 - ``HEALTHY`` -- pipeline fresh; nothing surfaced.
 - ``RECONNECTING`` -- producer stall detected; remediation is healing in the
   background and keeps retrying indefinitely. The currently-loaded workspace
   still works, so nothing is surfaced (the providers panel's "time since last
-  discovery" counter is the only passive signal); this state never escalates to
-  the error-takeover screen.
-- ``BLOCKED`` -- the consumer died: forwarding is down / the app is unusable, so
-  the chrome redirects the whole app to an error-takeover screen. ``BLOCKED`` is
-  terminal -- it stays until the user restarts the app -- and is reached *only*
-  via consumer death, never from a producer stall.
+  discovery" counter is the only passive signal).
+- ``BLOCKED`` -- the consumer died: forwarding is down and every machine reads
+  unreachable. The SPA surfaces this as a notice band over a displayed machine
+  (and an in-page notice on hub pages) offering the app restart, and withholds
+  the machine list's per-row state and controls, whose data can no longer be
+  refreshed. It deliberately does NOT take the windows over: the machines keep
+  running and the user's windows are left alone. ``BLOCKED`` is terminal -- it
+  stays until the user restarts the app -- and is reached *only* via consumer
+  death, never from a producer stall.
 
 State changes fire registered on-change callbacks, invoked outside the internal
 lock so they may take the FastAPI app's own locks without deadlocking.
@@ -171,8 +174,8 @@ class DiscoveryHealthWatchdog(MutableModel):
     - the consumer's lifecycle watcher, which calls :meth:`record_consumer_death`
       when the ``mngr forward`` subprocess exits unexpectedly.
 
-    The chrome SSE generator subscribes via :meth:`add_on_change_callback` and
-    surfaces the ``BLOCKED`` transition.
+    The UI publisher subscribes via :meth:`add_on_change_callback` and pushes
+    the state onto the ``/ui/ws`` channel, where the SPA renders it.
     """
 
     remediator: ProducerRemediator = Field(description="Producer-side bounce/restart remediations.")
@@ -210,6 +213,9 @@ class DiscoveryHealthWatchdog(MutableModel):
     _restart_count: int = PrivateAttr(default=0)
     # When the most recent remediation ran, for the inter-remediation backoff.
     _last_remediation_at: datetime | None = PrivateAttr(default=None)
+    # The latest wake ``evaluate`` has been told about, so a wake is acted on
+    # exactly once rather than on every tick that keeps reporting it.
+    _last_wake_at_seen: datetime | None = PrivateAttr(default=None)
     _on_change_callbacks: list[OnChangeCallback] = PrivateAttr(default_factory=list)
 
     # -- Public callback registration -------------------------------------
@@ -250,7 +256,7 @@ class DiscoveryHealthWatchdog(MutableModel):
         if self._set_blocked():
             logger.error("Discovery watchdog: consumer subprocess died; discovery pipeline is down")
 
-    def evaluate(self, last_event_at: datetime | None) -> None:
+    def evaluate(self, last_event_at: datetime | None, last_wake_at: datetime | None = None) -> None:
         """Re-assess producer health from the resolver's freshness and drive remediation.
 
         Called every poll by the watchdog loop with the resolver's most recent
@@ -260,6 +266,19 @@ class DiscoveryHealthWatchdog(MutableModel):
         on a capped exponential backoff). The producer path never reaches
         ``BLOCKED`` -- it retries forever. A no-op once ``BLOCKED`` (consumer
         death).
+
+        ``last_wake_at`` is when this process was last observed running again
+        after not running at all (a laptop sleep -- see
+        ``environment_signals.SleepTracker``), or ``None`` where that is not
+        tracked. It does two things, both of which say the same thing: nothing
+        that happened before it was observed by a loop that was running. It
+        joins the freshness baseline, so the first tick after a lid opens ages
+        from the wake rather than from an event the producer emitted before the
+        machine went down -- otherwise a night of sleep reads as a stalled
+        producer and is answered with a SIGHUP the producer never needed. And it
+        ends the current remediation episode, so a stall that *is* detected
+        afterwards starts again from the cheap bounce rather than resuming a
+        backoff whose waits also elapsed while nothing was running.
         """
         now = self.now_fn()
         action: Callable[[], None] | None = None
@@ -269,13 +288,16 @@ class DiscoveryHealthWatchdog(MutableModel):
                 return
             if self._started_at is None:
                 self._started_at = now
-            if not self._is_stalled_locked(last_event_at, now):
+            if last_wake_at is not None and (
+                self._last_wake_at_seen is None or last_wake_at > self._last_wake_at_seen
+            ):
+                self._last_wake_at_seen = last_wake_at
+                self._reset_remediation_episode_locked()
+            if not self._is_stalled_locked(last_event_at, now, last_wake_at):
                 if self._health != DiscoveryHealth.HEALTHY:
                     self._health = DiscoveryHealth.HEALTHY
                     fire = DiscoveryHealth.HEALTHY
-                self._bounce_attempted = False
-                self._restart_count = 0
-                self._last_remediation_at = None
+                self._reset_remediation_episode_locked()
             else:
                 action = self._next_remediation_locked(now)
                 if self._health == DiscoveryHealth.HEALTHY:
@@ -295,7 +317,19 @@ class DiscoveryHealthWatchdog(MutableModel):
 
     # -- Internals --------------------------------------------------------
 
-    def _is_stalled_locked(self, last_event_at: datetime | None, now: datetime) -> bool:
+    def _reset_remediation_episode_locked(self) -> None:
+        """Forget the current stall episode's remediation history (must hold ``_lock``).
+
+        Whatever has been tried against the producer no longer describes the
+        situation: either it worked (the pipeline is fresh again) or nothing at
+        all was running while it appeared not to (a wake). Either way the next
+        stall is a new episode, which starts at the cheap bounce.
+        """
+        self._bounce_attempted = False
+        self._restart_count = 0
+        self._last_remediation_at = None
+
+    def _is_stalled_locked(self, last_event_at: datetime | None, now: datetime, last_wake_at: datetime | None) -> bool:
         """Whether the producer is emitting nothing (must hold ``_lock``).
 
         Only an event from this watchdog's own lifetime counts as producer
@@ -306,8 +340,16 @@ class DiscoveryHealthWatchdog(MutableModel):
         supervisor to death. An event predating ``_started_at`` -- like no event
         at all (cold start) -- therefore ages from the watchdog's start, giving
         a normal startup the full grace period before the backstop fires.
+
+        A wake is the same argument inside a single lifetime: an event from
+        before the machine slept is as unrepresentative of the producer's
+        current state as one from before the process started, and the silence
+        since is not silence anyone was listening to. So the baseline is the
+        latest of the two, and a just-woken app gets the same full grace period
+        a just-started one does.
         """
-        baseline = self._started_at if self._started_at is not None else now
+        started_at = self._started_at if self._started_at is not None else now
+        baseline = max(started_at, last_wake_at) if last_wake_at is not None else started_at
         if last_event_at is not None and last_event_at >= baseline:
             age = (now - last_event_at).total_seconds()
             return age > self.stall_threshold_seconds

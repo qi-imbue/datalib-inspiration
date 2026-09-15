@@ -1,37 +1,19 @@
 #!/usr/bin/env bash
-# Common transcript converter for codex agents.
+# Common transcript converter daemon for codex agents.
 #
-# Reads the raw codex rollout stream at logs/codex_transcript/events.jsonl
-# (produced verbatim by stream_transcript.sh) and converts the semantically
-# important rollout items into the agent-agnostic common format at
-# events/codex/common_transcript/events.jsonl.
+# Polls the raw codex rollout stream at logs/codex_transcript/events.jsonl
+# (written verbatim by stream_transcript.sh) and, whenever it has grown, shells
+# out to common_transcript_convert.py to append new records to
+# events/codex/common_transcript/events.jsonl. Each pass runs under the shared
+# convert lock, which serializes the poll loop against the turn-end
+# --single-pass flush, and the converter's stdout/stderr never reaches this
+# watcher's own -- appended counts and converter errors are logged to
+# events/logs/common_transcript instead of surfacing in the agent's pane.
 #
-# codex rollout wire shape (verified live against codex 0.64.0):
-#   {"timestamp":"<ISO8601>","type":<t>,"payload":<p>}
-# with the item kinds this converter cares about carried under type
-# "response_item":
-#   payload.type=="message", role=="user"      -> user_message
-#       (text = join of payload.content[] items with type "input_text", .text)
-#   payload.type=="message", role=="assistant" -> assistant_message
-#       (text = join of payload.content[] items with type "output_text", .text)
-#   payload.type=="function_call"              -> remembered by payload.call_id
-#       (name=payload.name, arguments=payload.arguments [a raw JSON string])
-#   payload.type=="function_call_output"       -> tool_result, paired by call_id
-#       (output=payload.output, EITHER a string OR an array of content items)
-#
-# Deliberately ignored:
-#   type=="event_msg"   -- display duplicates of the response items above
-#                          (a user_message event_msg mirrors the response_item
-#                          message); emitting them would double every message.
-#   session_meta / turn_context / compacted / ghost_snapshot / token_count / ...
-#                       -- bookkeeping, not conversation content.
-#
-# Event ids: the rollout carries no global per-line id, so we synthesize a
-# stable id from the line's 1-based index in the raw input file (the stream is
-# append-only, so a given line keeps its index across restarts) plus the item
-# kind. Re-processing the same input therefore never produces duplicates; the
-# converter also dedupes against the set of event_ids already in the output file.
-# function_call/function_call_output are paired by payload.call_id.
+# What is converted, how the emitted records are shaped, and which native
+# rollout items are deliberately dropped is decided entirely by
+# common_transcript_convert.py; its module docstring is the single source of
+# truth for that contract.
 #
 # Usage: common_transcript.sh [--single-pass]
 #
@@ -50,6 +32,13 @@ INPUT_FILE="$AGENT_DATA_DIR/logs/codex_transcript/events.jsonl"
 OUTPUT_FILE="$AGENT_DATA_DIR/events/codex/common_transcript/events.jsonl"
 POLL_INTERVAL=5
 
+# Size and mtime of the input file as of the last completed conversion pass. A
+# pass re-reads the whole input file and the whole output file, so running one
+# when nothing was appended costs a python startup plus a full parse of both for
+# no result. Kept in memory only: after a restart it is empty, so the first pass
+# always runs and reconciles against the output exactly as before.
+_LAST_CONVERTED_INPUT_SIGNATURE=""
+
 _MNGR_LOG_TYPE="common_transcript"
 _MNGR_LOG_SOURCE="logs/common_transcript"
 _MNGR_LOG_FILE="$AGENT_DATA_DIR/events/logs/common_transcript/events.jsonl"
@@ -62,15 +51,25 @@ source "$MNGR_AGENT_STATE_DIR/commands/mngr_log.sh"
 # shellcheck source=mngr_common_transcript_lib.sh
 source "$MNGR_AGENT_STATE_DIR/commands/mngr_common_transcript_lib.sh"
 
+# Print "<size> <mtime>" for the input file, or nothing when it does not exist.
+# GNU and BSD stat spell these differently and agents run on Linux hosts as well
+# as on a developer's macOS machine under the local provider, so try both. Always
+# succeeds so a missing file is an empty signature rather than a failed pass.
+_input_signature() {
+    stat -c '%s %Y' "$INPUT_FILE" 2>/dev/null || stat -f '%z %m' "$INPUT_FILE" 2>/dev/null || true
+}
+
 convert_new_events() {
     if [ ! -f "$INPUT_FILE" ]; then
         log_debug "Input file not found: $INPUT_FILE"
         return
     fi
 
+    # Report the skip to the caller so the poll loop retries on the next cycle
+    # instead of recording this input as already converted.
     if ! mngr_common_transcript_acquire_lock; then
         log_warn "could not acquire convert lock; skipping pass"
-        return
+        return 1
     fi
 
     local convert_stderr
@@ -115,12 +114,23 @@ main() {
     log_info "  Poll interval: ${POLL_INTERVAL}s"
 
     if [ "$is_single_pass" = true ]; then
-        convert_new_events
+        # A pass skipped for a held lock is not a script failure -- the caller
+        # only needs to know the flush was attempted.
+        convert_new_events || true
         return
     fi
 
     while true; do
-        convert_new_events
+        # Only pay for a pass when the input actually changed. The signature
+        # advances only after a pass completes, so a pass skipped for a held
+        # lock is retried on the next cycle rather than being lost.
+        local current_signature
+        current_signature=$(_input_signature)
+        if [ "$current_signature" != "$_LAST_CONVERTED_INPUT_SIGNATURE" ]; then
+            if convert_new_events; then
+                _LAST_CONVERTED_INPUT_SIGNATURE="$current_signature"
+            fi
+        fi
         sleep "$POLL_INTERVAL"
     done
 }

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
@@ -36,6 +37,7 @@ from imbue.mngr.errors import DockerBuildTimeoutError
 from imbue.mngr.errors import DockerGvisorEphemeralRootfsError
 from imbue.mngr.errors import DockerRuntimeNotRegisteredError
 from imbue.mngr.errors import HostNotFoundError
+from imbue.mngr.errors import HostRecordUnreadableError
 from imbue.mngr.errors import MngrError
 from imbue.mngr.errors import ProviderUnavailableError
 from imbue.mngr.errors import SnapshotNotFoundError
@@ -76,6 +78,10 @@ from imbue.mngr.primitives import SnapshotName
 from imbue.mngr.primitives import VolumeId
 from imbue.mngr.providers.base_provider import BaseProviderInstance
 from imbue.mngr.providers.docker.config import DockerProviderConfig
+from imbue.mngr.providers.docker.config import LOCAL_DOCKER_SSH_HOST
+from imbue.mngr.providers.docker.config import format_docker_publish_address
+from imbue.mngr.providers.docker.config import is_docker_daemon_local
+from imbue.mngr.providers.docker.config import ssh_host_for_docker_daemon
 from imbue.mngr.providers.docker.host_store import ContainerConfig
 from imbue.mngr.providers.docker.host_store import DockerHostStore
 from imbue.mngr.providers.docker.host_store import HostRecord
@@ -89,6 +95,8 @@ from imbue.mngr.providers.docker.volume import ensure_state_container
 from imbue.mngr.providers.docker.volume import host_container_name
 from imbue.mngr.providers.docker.volume import state_container_name
 from imbue.mngr.providers.docker.volume import state_volume_name
+from imbue.mngr.providers.host_key_store import has_host_key_store
+from imbue.mngr.providers.host_key_store import remove_host_key_record
 from imbue.mngr.providers.ssh_host_setup import REQUIRED_HOST_PACKAGES
 from imbue.mngr.providers.ssh_host_setup import build_add_authorized_keys_command
 from imbue.mngr.providers.ssh_host_setup import build_add_known_hosts_command
@@ -101,8 +109,11 @@ from imbue.mngr.providers.ssh_host_setup import parse_warnings_from_output
 from imbue.mngr.providers.ssh_host_setup import resolve_host_log_dir
 from imbue.mngr.providers.ssh_utils import add_host_to_known_hosts
 from imbue.mngr.providers.ssh_utils import create_pyinfra_host
-from imbue.mngr.providers.ssh_utils import load_or_create_host_keypair
-from imbue.mngr.providers.ssh_utils import load_or_create_ssh_keypair
+from imbue.mngr.providers.ssh_utils import load_or_create_per_host_client_keypair
+from imbue.mngr.providers.ssh_utils import load_or_create_per_host_host_keypair
+from imbue.mngr.providers.ssh_utils import per_host_key_dir
+from imbue.mngr.providers.ssh_utils import resolve_per_host_client_keypair
+from imbue.mngr.providers.ssh_utils import resolve_per_host_host_keypair
 from imbue.mngr.providers.ssh_utils import wait_for_sshd
 
 # PID-1 entrypoint for host containers. Unlike the idle state-container
@@ -239,20 +250,37 @@ def parse_container_labels(
     return host_id, host_name, provider_name, user_tags
 
 
-def _get_ssh_host_from_docker_config(docker_host_url: str) -> str:
-    """Extract the SSH-reachable hostname from a Docker host URL.
+@pure
+def build_ssh_publish_spec(config: DockerProviderConfig) -> str:
+    """Build the `docker run -p` spec that publishes the container's sshd on a random host port.
 
-    For local Docker (empty string or unix socket), returns 127.0.0.1.
-    For remote Docker (ssh:// or tcp://), returns the hostname from the URL.
+    An explicit `ssh_bind_address` wins. Otherwise a local daemon binds loopback only
+    (nothing needs LAN reachability, since mngr itself connects to 127.0.0.1) and a
+    remote daemon binds all interfaces, since mngr reaches it via the daemon's hostname.
     """
-    if not docker_host_url or docker_host_url.startswith("unix://"):
-        return "127.0.0.1"
+    if config.ssh_bind_address is not None:
+        return f"{format_docker_publish_address(config.ssh_bind_address)}::{CONTAINER_SSH_PORT}"
+    if is_docker_daemon_local(config.host):
+        return f"{LOCAL_DOCKER_SSH_HOST}::{CONTAINER_SSH_PORT}"
+    return f":{CONTAINER_SSH_PORT}"
 
-    parsed = urlparse(docker_host_url)
-    if parsed.hostname:
-        return parsed.hostname
 
-    return "127.0.0.1"
+@pure
+def ssh_host_for_docker_config(config: DockerProviderConfig) -> str:
+    """Return the hostname mngr SSHes to for containers created under `config`.
+
+    Mirrors `build_ssh_publish_spec`: a local daemon publishes sshd on this machine, so
+    mngr connects to the interface it is bound to -- the explicit `ssh_bind_address` when it
+    names one, else loopback (which also reaches a wildcard bind). A remote daemon's bind is
+    an address on the daemon's machine, so mngr connects via the daemon's hostname regardless.
+    """
+    if (
+        config.ssh_bind_address is not None
+        and not config.ssh_bind_address.is_unspecified
+        and is_docker_daemon_local(config.host)
+    ):
+        return str(config.ssh_bind_address)
+    return ssh_host_for_docker_daemon(config.host)
 
 
 def _get_docker_context_host() -> str | None:
@@ -460,7 +488,10 @@ class DockerProviderInstance(BaseProviderInstance):
     @cached_property
     def _host_store(self) -> DockerHostStore:
         """Get the host record store backed by the state volume."""
-        return DockerHostStore(volume=self._state_volume)
+        return DockerHostStore(
+            volume=self._state_volume,
+            is_strict_parsing=self.mngr_ctx.config.strict_host_record_parsing,
+        )
 
     @property
     def _keys_dir(self) -> Path:
@@ -570,17 +601,29 @@ class DockerProviderInstance(BaseProviderInstance):
         verify_engine_version_supports_volume_subpath(engine_version)
         self._is_isolation_check_passed = True
 
-    def _get_ssh_keypair(self) -> tuple[Path, str]:
-        """Get or create the SSH keypair for this provider instance."""
-        return load_or_create_ssh_keypair(self._keys_dir, key_name="docker_ssh_key")
+    def _get_ssh_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        """Resolve the client keypair that opens this host: per-host first, legacy shared as fallback.
 
-    def _get_host_keypair(self) -> tuple[Path, str]:
-        """Get or create the SSH host keypair for Docker containers."""
-        return load_or_create_host_keypair(self._keys_dir)
+        Hosts created before per-host client keys existed only authorize the
+        legacy shared ``docker_ssh_key``, so it wins for them; new hosts get a
+        per-host pair minted at create time. A per-host key dir carries a
+        ``known_hosts`` symlink so key-sibling consumers (the forward SSH
+        tunnel) keep finding the pinned host keys.
+        """
+        return resolve_per_host_client_keypair(self._keys_dir, host_id, "docker_ssh_key", "known_hosts")
+
+    def _get_host_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        """Resolve the sshd host keypair for this host's container: per-host first, legacy fallback.
+
+        Restart/restore paths re-inject whatever this resolves, so a legacy
+        host keeps serving the shared key already pinned for it while new
+        hosts serve their own per-host key.
+        """
+        return resolve_per_host_host_keypair(self._keys_dir, host_id, "host_key")
 
     def _get_ssh_host(self) -> str:
         """Get the SSH-reachable hostname for containers."""
-        return _get_ssh_host_from_docker_config(self.config.host)
+        return ssh_host_for_docker_config(self.config)
 
     # =========================================================================
     # Docker Exec Helpers
@@ -721,8 +764,8 @@ class DockerProviderInstance(BaseProviderInstance):
 
         Returns (Host, ssh_host, ssh_port, host_public_key).
         """
-        private_key_path, client_public_key = self._get_ssh_keypair()
-        host_key_path, host_public_key = self._get_host_keypair()
+        private_key_path, client_public_key = self._get_ssh_keypair(host_id)
+        host_key_path, host_public_key = self._get_host_keypair(host_id)
         host_private_key = host_key_path.read_text()
 
         # Provision against the host_dir this host was created with (recorded in
@@ -748,7 +791,7 @@ class DockerProviderInstance(BaseProviderInstance):
         logger.trace("Found SSH endpoint available", ssh_host=ssh_host, ssh_port=ssh_port)
 
         with log_span("Adding host to known_hosts", ssh_host=ssh_host, ssh_port=ssh_port):
-            add_host_to_known_hosts(self._known_hosts_path, ssh_host, ssh_port, host_public_key)
+            add_host_to_known_hosts(self._known_hosts_path, ssh_host, ssh_port, host_public_key, host_id=host_id)
 
         with log_span("Waiting for sshd to be ready..."):
             self._wait_for_sshd(ssh_host, ssh_port)
@@ -994,7 +1037,7 @@ kill -TERM 1
         `["--mount", "<spec>"]` for the isolated subpath mount). Empty when
         the host has no persistent volume.
         """
-        cmd = ["run", "-d", "--name", container_name, "-p", f":{CONTAINER_SSH_PORT}"]
+        cmd = ["run", "-d", "--name", container_name, "-p", build_ssh_publish_spec(self.config)]
 
         # Select a non-default container runtime (e.g. 'runsc' for gVisor) when configured.
         # The named runtime must be registered with the Docker daemon, otherwise this run
@@ -1322,9 +1365,10 @@ kill -TERM 1
             ssh_host,
             ssh_port,
             ssh_host_public_key,
+            host_id=host_id,
         )
 
-        private_key_path, _ = self._get_ssh_keypair()
+        private_key_path, _ = self._get_ssh_keypair(host_id)
         pyinfra_host = self._create_pyinfra_host(
             ssh_host,
             ssh_port,
@@ -1511,6 +1555,12 @@ kill -TERM 1
             created_at=now,
             updated_at=now,
         )
+
+        # Mint this host's own client + host keypairs up front so the setup
+        # helper's per-host resolution uses them for the new container instead
+        # of falling back to a legacy shared pair from older hosts.
+        load_or_create_per_host_client_keypair(self._keys_dir, host_id, "docker_ssh_key", "known_hosts")
+        load_or_create_per_host_host_keypair(self._keys_dir, host_id, "host_key")
 
         try:
             host, ssh_host, ssh_port, host_public_key = self._setup_container_ssh_and_create_host(
@@ -1926,6 +1976,16 @@ kill -TERM 1
         # Reached only if the cleanup above had no failures (the `with` raises
         # otherwise), so a failed cleanup keeps the host record for retry.
         self._host_store.delete_host_record(host_id)
+        # Forget the host's pins (dead-endpoint GC) and its per-host keypairs;
+        # both are useless once the host is permanently deleted. Benign local
+        # cleanup past the point of no return (the record is gone), so an OS
+        # error must not fail the deletion.
+        if has_host_key_store(self._known_hosts_path):
+            try:
+                remove_host_key_record(self._known_hosts_path, host_id)
+            except OSError as e:
+                logger.trace("Failed to clean up host-key store for {}: {}", self._known_hosts_path, e)
+        shutil.rmtree(per_host_key_dir(self._keys_dir, host_id), ignore_errors=True)
         self._container_cache_by_id.pop(host_id, None)
         self._evict_cached_host(host_id)
 
@@ -2102,6 +2162,11 @@ kill -TERM 1
                         if host_obj is not None:
                             hosts_with_state.append((host_obj, HostState.RUNNING))
                             continue
+                    except HostRecordUnreadableError:
+                        # Strict parsing: a running container with an unreadable
+                        # record must fail discovery loudly, not degrade to the
+                        # stale offline view below.
+                        raise
                     except (KeyError, ValueError, MngrError) as e:
                         logger.warning("Failed to create host from container {}: {}", host_id, e)
 
@@ -2132,6 +2197,10 @@ kill -TERM 1
                     host_obj = self._create_host_from_container(container)
                     if host_obj is not None:
                         hosts_with_state.append((host_obj, HostState.RUNNING))
+                except HostRecordUnreadableError:
+                    # Strict parsing: a running container with an unreadable
+                    # record must fail discovery loudly, not silently vanish.
+                    raise
                 except (KeyError, ValueError, MngrError) as e:
                     logger.warning("Failed to create host from container {}: {}", host_id, e)
 
@@ -2451,9 +2520,10 @@ kill -TERM 1
             host_record.ssh_host,
             host_record.last_discovered_ssh_port,
             host_record.ssh_host_public_key,
+            host_id=host_id,
         )
 
-        private_key_path, _ = self._get_ssh_keypair()
+        private_key_path, _ = self._get_ssh_keypair(host_id)
         return self._create_pyinfra_host(
             host_record.ssh_host,
             host_record.last_discovered_ssh_port,
@@ -2463,6 +2533,10 @@ kill -TERM 1
     # =========================================================================
     # Agent Data Persistence
     # =========================================================================
+
+    @property
+    def is_agent_data_persistence_supported(self) -> bool:
+        return True
 
     def list_persisted_agent_data_for_host(self, host_id: HostId) -> list[dict[str, Any]]:
         """List persisted agent data for a stopped host."""

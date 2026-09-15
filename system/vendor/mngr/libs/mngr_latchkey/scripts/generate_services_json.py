@@ -29,8 +29,14 @@ Minds' own *additional* (custom) services -- ones detent has no schemas for, e.g
 ``claude.ai`` -- are appended from ``additional_services.json`` (see
 :mod:`imbue.mngr_latchkey.additional_services`). Folding them in here is what
 lets every reader of the catalog work from one file in one shape; that file
-remains the source of the extra data those services need beyond the catalog
-(their ``base_api_url`` and their inline detent schemas).
+remains the source of the extra data those services need beyond the catalog:
+their latchkey registration (stored in latchkey's own ``registeredServices``
+shape and copied into its config verbatim) and their inline detent schemas.
+
+Conversely, services minds hides from agents entirely
+(:data:`imbue.mngr_latchkey.core.HIDDEN_BUILTIN_SERVICES`) are left out of the
+catalog: latchkey never injects their credentials, so a catalog entry for one
+only offers grants that can never be used.
 
 Run with::
 
@@ -51,6 +57,7 @@ from pydantic import Field
 from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.imbue_common.logging import setup_logging
 from imbue.mngr_latchkey.additional_services import additional_services_catalog_payload
+from imbue.mngr_latchkey.core import HIDDEN_BUILTIN_SERVICES
 
 # detent built-in schemas live under this subdirectory of a detent checkout.
 _BUILTIN_SCHEMAS_SUBPATH: Final[str] = "src/schemas/builtin"
@@ -72,6 +79,22 @@ _NON_SERVICE_FILES: Final[frozenset[str]] = frozenset({"any.json"})
 _AWS_SCHEMA_FILE: Final[str] = "aws.json"
 _AWS_SCOPE_SCHEMAS: Final[frozenset[str]] = frozenset({"aws"})
 
+# Scope schema names conventionally carry an ``-api`` suffix that the permissions
+# under them do not (``fastmail-dav-api`` owns ``fastmail-dav-read-all``), so the
+# suffix is stripped before a permission is matched against a scope by prefix.
+_SCOPE_NAME_SUFFIX: Final[str] = "-api"
+
+# Label for a service as a whole, where that is not just its scope's label.
+# A multi-scope service disambiguates each scope with a parenthetical (``GitHub
+# (REST API)``, ``GitHub (git)``), but one credential backs them all, so the
+# connection spanning them is named here. A service left out takes its single
+# scope's label verbatim -- so ``notion-mcp`` stays ``Notion (MCP)``, where the
+# parenthetical is part of the name rather than a scope marker.
+_DISPLAY_NAME_BY_SERVICE: Final[Mapping[str, str]] = {
+    "github": "GitHub",
+    "gitlab": "GitLab",
+}
+
 # Human-readable scope labels. detent has no notion of a display name, so this
 # is curated here. Keyed by detent scope schema name.
 _DISPLAY_NAME_BY_SCOPE: Final[Mapping[str, str]] = {
@@ -84,7 +107,7 @@ _DISPLAY_NAME_BY_SCOPE: Final[Mapping[str, str]] = {
     "gitlab-git": "GitLab (git)",
     "dropbox-api": "Dropbox",
     "linear-api": "Linear",
-    "notion-api": "Notion",
+    "ngrok-api": "ngrok",
     "notion-mcp-api": "Notion (MCP)",
     "mailchimp-api": "Mailchimp",
     "zoom-api": "Zoom",
@@ -95,16 +118,24 @@ _DISPLAY_NAME_BY_SCOPE: Final[Mapping[str, str]] = {
     "figma-api": "Figma",
     "calendly-api": "Calendly",
     "yelp-api": "Yelp",
+    "ramp-api": "Ramp",
     "coolify-api": "Coolify",
     "umami-api": "Umami",
+    "todoist-api": "Todoist",
     "google-gmail-api": "Gmail",
     "google-calendar-api": "Google Calendar",
     "google-drive-api": "Google Drive",
     "google-docs-api": "Google Docs",
     "google-sheets-api": "Google Sheets",
     "google-people-api": "Google Contacts",
+    "google-slides-api": "Google Slides",
     "google-analytics-api": "Google Analytics",
     "google-directions-api": "Google Directions",
+    "huggingface-api": "Hugging Face",
+    "openrouter-api": "OpenRouter",
+    "tailscale-api": "Tailscale",
+    "fastmail-api": "Fastmail",
+    "fastmail-dav-api": "Fastmail (DAV)",
 }
 
 # Curated order in which services appear in the catalog (and thus in the
@@ -116,7 +147,6 @@ _SERVICE_ORDER: Final[Sequence[str]] = (
     "gitlab",
     "dropbox",
     "linear",
-    "notion",
     "notion-mcp",
     "mailchimp",
     "zoom",
@@ -164,6 +194,10 @@ class _ScopeCatalogEntry(FrozenModel):
 
     scope: str = Field(description="Detent scope schema name (e.g. ``slack-api``).")
     display_name: str = Field(description="Human-readable label shown in the permission dialog.")
+    service_display_name: str = Field(
+        default="",
+        description="Label for the service as a whole; omitted when it is just ``display_name``.",
+    )
     description: str = Field(description="Plain-English summary of the scope (detent's ``$comment``).")
     permissions: tuple[_CatalogPermission, ...] = Field(
         description="Permissions grantable under the scope, each with its plain-English summary.",
@@ -187,16 +221,22 @@ def _select_scope_for_permission(
 ) -> str:
     """Pick the scope a permission belongs to: the longest scope name that prefixes it.
 
-    A permission ``github-git-read`` belongs to scope ``github-git`` (the
-    longest scope whose name prefixes it). Permissions that match no scope name
-    (e.g. ``github-read-all`` under ``github-rest-api``) fall back to the first
-    scope declared in the file, which is the service's primary scope.
+    Scope names are compared with any ``-api`` suffix stripped, since the
+    permissions under a scope drop it: ``fastmail-dav-read-all`` belongs to
+    ``fastmail-dav-api``, and ``github-git-read`` to ``github-git``. The longest
+    matching prefix wins, so a permission under a more specific scope is not
+    claimed by a broader sibling. Permissions that match no scope name (e.g.
+    ``github-read-all`` under ``github-rest-api``) fall back to the first scope
+    declared in the file, which is the service's primary scope.
     """
+    prefix_by_scope = {scope: scope.removesuffix(_SCOPE_NAME_SUFFIX) for scope in scopes_in_order}
     matching_scopes = [
-        scope for scope in scopes_in_order if permission_name == scope or permission_name.startswith(f"{scope}-")
+        scope
+        for scope, prefix in prefix_by_scope.items()
+        if permission_name == prefix or permission_name.startswith(f"{prefix}-")
     ]
     if matching_scopes:
-        return max(matching_scopes, key=lambda scope: len(scope))
+        return max(matching_scopes, key=lambda scope: len(prefix_by_scope[scope]))
     return scopes_in_order[0]
 
 
@@ -255,6 +295,7 @@ def _build_scope_entries_for_service(
             _ScopeCatalogEntry(
                 scope=scope_name,
                 display_name=_display_name_for_scope(scope_name, service_name),
+                service_display_name=_DISPLAY_NAME_BY_SERVICE.get(service_name, ""),
                 description=_description_for_schema(schemas_by_name[scope_name]),
                 permissions=permissions,
             )
@@ -285,6 +326,18 @@ def _service_sort_key(service_name: str) -> tuple[int, str]:
         return (len(_SERVICE_ORDER), service_name)
 
 
+def _dump_entry(entry: _ScopeCatalogEntry) -> dict[str, object]:
+    """Serialize a scope entry, omitting ``service_display_name`` when it adds nothing.
+
+    Most services take their single scope's label as their own name, so the
+    key is emitted only for the few that are curated differently.
+    """
+    dumped = entry.model_dump()
+    if not dumped["service_display_name"]:
+        del dumped["service_display_name"]
+    return dumped
+
+
 def build_services_catalog(builtin_schemas_directory: Path) -> dict[str, list[dict[str, object]]]:
     """Build the full services.json catalog from a detent built-in schema directory."""
     if not builtin_schemas_directory.is_dir():
@@ -296,6 +349,12 @@ def build_services_catalog(builtin_schemas_directory: Path) -> dict[str, list[di
         if file_path.name in _NON_SERVICE_FILES:
             continue
         service_name = file_path.stem
+        # A detent schema file is named after the latchkey service it covers, so
+        # the services latchkey is told to hide from agents are dropped here by
+        # the same name.
+        if service_name in HIDDEN_BUILTIN_SERVICES:
+            logger.info("Skipping hidden built-in service {}", service_name)
+            continue
         schemas_by_name = _read_service_schema_file(file_path)
         scope_entries = _build_scope_entries_for_service(service_name, schemas_by_name)
         if len(scope_entries) > 0:
@@ -304,7 +363,7 @@ def build_services_catalog(builtin_schemas_directory: Path) -> dict[str, list[di
     # Emit services in curated order, serializing each entry to a plain dict.
     ordered_service_names = sorted(entries_by_service_name, key=_service_sort_key)
     catalog: dict[str, list[dict[str, object]]] = {
-        service_name: [entry.model_dump() for entry in entries_by_service_name[service_name]]
+        service_name: [_dump_entry(entry) for entry in entries_by_service_name[service_name]]
         for service_name in ordered_service_names
     }
 

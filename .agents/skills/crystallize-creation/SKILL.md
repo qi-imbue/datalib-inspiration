@@ -1,6 +1,8 @@
 ---
 name: crystallize-creation
 description: "Promote the just-finished work into a new, reusable, committed, tested skill. Use when that process would recur with new inputs -- especially something you figured out through research or debugging -- or when the user says 'crystallize this'."
+metadata:
+  author: imbue
 ---
 
 # Crystallizing a creation into existence
@@ -78,8 +80,8 @@ echo "$TICKET_ID" > data/.tasks/harden/crystallize-$NAME/ticket_id.txt
 
 ## Step 3: Write the task file
 
-The frontmatter carries `operation: crystallize`, the `type`, the worker
-reporting fields (`lead_agent` / `finish_report_path` per
+The frontmatter carries `operation: crystallize`, the `type`,
+`finish_report_path` (the report destination the lead polls; see
 `.agents/shared/references/worker-reporting.md`), and an optional
 `source_artifacts_dir`. The body *describes* the work and -- for a skill
 reconstructed from the transcript -- anchors the worker's search with verbatim
@@ -92,7 +94,6 @@ flow steps, or argparse surfaces -- those are the worker's decisions.
 {
 cat << FRONTMATTER_EOF
 ---
-lead_agent: $MNGR_AGENT_NAME
 finish_report_path: data/.tasks/harden/crystallize-$NAME/reports/report.md
 operation: crystallize
 type: skill
@@ -154,12 +155,12 @@ worker.
 ```bash
 uv run .agents/skills/launch-task/scripts/create_worker.py launch \
     --name crystallize-$NAME \
-    --template subskill-worker \
+    --template worker \
     --runtime-dir data/.tasks/harden/crystallize-$NAME/ \
     --task-file data/.tasks/harden/crystallize-$NAME/task.md
 ```
 
-The `subskill-worker` template installs the generic `harden-worker` sub-skill.
+The `worker` template installs the generic `harden-worker` sub-skill.
 If the frontmatter sets `source_artifacts_dir`, `launch` pushes it too -- no
 extra flag.
 

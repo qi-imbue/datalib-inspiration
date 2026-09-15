@@ -1,5 +1,7 @@
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -16,9 +18,12 @@ from imbue.imbue_common.model_update import to_update
 from imbue.mngr import hookimpl
 from imbue.mngr.api.discover import _all_identifiers_found
 from imbue.mngr.api.discover import _discover_provider_hosts_and_agents
+from imbue.mngr.api.discover import discover_by_address
 from imbue.mngr.api.discover import discover_hosts_and_agents
 from imbue.mngr.api.discover import warn_on_duplicate_host_names
 from imbue.mngr.api.discovery_events import get_discovery_events_path
+from imbue.mngr.api.find import find_all_agents
+from imbue.mngr.api.find import find_one_agent
 from imbue.mngr.api.list import AgentErrorInfo
 from imbue.mngr.api.list import ErrorInfo
 from imbue.mngr.api.list import HostErrorInfo
@@ -35,14 +40,19 @@ from imbue.mngr.api.list import _process_host_with_error_handling
 from imbue.mngr.api.list import agent_details_to_cel_context
 from imbue.mngr.api.list import build_agent_cel_context
 from imbue.mngr.api.list import list_agents
+from imbue.mngr.cli.exit_codes import EXIT_CODE_ERROR
 from imbue.mngr.config.data_types import MngrContext
 from imbue.mngr.config.data_types import ProviderInstanceConfig
 from imbue.mngr.config.provider_config_registry import _provider_config_registry
+from imbue.mngr.errors import AgentNotFoundError
+from imbue.mngr.errors import EXIT_CODE_TARGET_NOT_FOUND
 from imbue.mngr.errors import MngrError
 from imbue.mngr.errors import ProviderDiscoveryError
 from imbue.mngr.errors import ProviderEmptyError
 from imbue.mngr.errors import ProviderNotAuthorizedError
 from imbue.mngr.errors import ProviderUnavailableError
+from imbue.mngr.errors import UserInputError
+from imbue.mngr.errors import parse_provider_unavailable_reason
 from imbue.mngr.hosts.host import Host
 from imbue.mngr.interfaces.data_types import AgentDetails
 from imbue.mngr.interfaces.data_types import CertifiedHostData
@@ -52,6 +62,7 @@ from imbue.mngr.interfaces.data_types import HostResources
 from imbue.mngr.interfaces.host import CreateAgentOptions
 from imbue.mngr.interfaces.provider_backend import ProviderBackendInterface
 from imbue.mngr.interfaces.provider_instance import ProviderInstanceInterface
+from imbue.mngr.primitives import AgentAddress
 from imbue.mngr.primitives import AgentId
 from imbue.mngr.primitives import AgentLifecycleState
 from imbue.mngr.primitives import AgentName
@@ -60,6 +71,7 @@ from imbue.mngr.primitives import CommandString
 from imbue.mngr.primitives import DiscoveredAgent
 from imbue.mngr.primitives import DiscoveredHost
 from imbue.mngr.primitives import ErrorBehavior
+from imbue.mngr.primitives import HostAddress
 from imbue.mngr.primitives import HostId
 from imbue.mngr.primitives import HostName
 from imbue.mngr.primitives import HostState
@@ -67,6 +79,8 @@ from imbue.mngr.primitives import IdleMode
 from imbue.mngr.primitives import ProviderBackendName
 from imbue.mngr.primitives import ProviderInstanceName
 from imbue.mngr.primitives import SSHInfo
+from imbue.mngr.providers.local.backend import LOCAL_BACKEND_NAME
+from imbue.mngr.providers.local.instance import LOCAL_HOST_NAME
 from imbue.mngr.providers.mock_provider_test import MockProviderInstance
 from imbue.mngr.providers.mock_provider_test import make_offline_host
 from imbue.mngr.providers.registry import _backend_registry
@@ -74,9 +88,7 @@ from imbue.mngr.utils.cel_utils import TolerantMapType
 from imbue.mngr.utils.cel_utils import compile_cel_filters
 from imbue.mngr.utils.testing import capture_loguru
 
-# =============================================================================
 # Helpers
-# =============================================================================
 
 
 def _make_host_details() -> HostDetails:
@@ -102,9 +114,7 @@ def _make_agent_details(name: str, host_details: HostDetails) -> AgentDetails:
     )
 
 
-# =============================================================================
 # Duplicate Host Name Warning Tests
-# =============================================================================
 
 
 def _make_discovered_host(
@@ -202,9 +212,7 @@ def test_warn_on_duplicate_host_names_no_warning_when_destroyed_host_shares_name
     assert "Duplicate host name" not in log_output.getvalue()
 
 
-# =============================================================================
 # ErrorInfo Tests
-# =============================================================================
 
 
 def test_error_info_build_creates_correct_error_from_exception() -> None:
@@ -223,9 +231,7 @@ def test_error_info_build_captures_custom_exception_type() -> None:
     assert error.message == "bad value"
 
 
-# =============================================================================
 # ProviderErrorInfo Tests
-# =============================================================================
 
 
 def test_provider_error_info_build_for_provider() -> None:
@@ -263,9 +269,7 @@ def test_provider_error_info_from_generic_exception_is_not_inaccessible() -> Non
     assert error.help_text is None
 
 
-# =============================================================================
 # HostErrorInfo Tests
-# =============================================================================
 
 
 def test_host_error_info_build_for_host() -> None:
@@ -278,9 +282,7 @@ def test_host_error_info_build_for_host() -> None:
     assert error.host_id == host_id
 
 
-# =============================================================================
 # AgentErrorInfo Tests
-# =============================================================================
 
 
 def test_agent_error_info_build_for_agent() -> None:
@@ -293,9 +295,7 @@ def test_agent_error_info_build_for_agent() -> None:
     assert error.agent_id == agent_id
 
 
-# =============================================================================
 # ListResult Tests
-# =============================================================================
 
 
 def test_list_result_initializes_with_empty_lists() -> None:
@@ -319,9 +319,7 @@ def test_list_result_allows_appending() -> None:
     assert len(result.errors) == 1
 
 
-# =============================================================================
 # agent_details_to_cel_context Tests
-# =============================================================================
 
 
 def test_agent_details_to_cel_context_basic_fields() -> None:
@@ -695,9 +693,7 @@ def test_agent_details_to_cel_context_exposes_host_provider_under_both_names() -
     assert host["provider_name"] == "modal"
 
 
-# =============================================================================
 # _apply_cel_filters Tests
-# =============================================================================
 
 
 def test_apply_cel_filters_includes_matching_agent() -> None:
@@ -740,9 +736,7 @@ def test_apply_cel_filters_no_filters_includes_all() -> None:
     assert _apply_cel_filters(agent, [], []) is True
 
 
-# =============================================================================
 # _maybe_write_provider_discovery_snapshots Tests
-# =============================================================================
 
 
 def test_maybe_write_provider_discovery_snapshots_writes_when_unfiltered_and_error_free(
@@ -874,9 +868,7 @@ def test_maybe_write_provider_discovery_snapshots_skips_when_include_filters_set
     assert not events_path.exists()
 
 
-# =============================================================================
 # list_agents Tests
-# =============================================================================
 
 
 def test_list_agents_batch_mode_no_agents_returns_empty_result(
@@ -970,8 +962,6 @@ def test_list_agents_streaming_mode_on_agent_callback_is_called(
 
 
 @pytest.mark.tmux
-# real agent setup/teardown occasionally exceeds the 10s default.
-@pytest.mark.timeout(30)
 def test_list_agents_with_include_filter_excludes_non_matching(
     temp_work_dir: Path,
     temp_mngr_ctx: MngrContext,
@@ -1011,26 +1001,24 @@ def test_list_agents_with_include_filter_excludes_non_matching(
     assert "list-include-no" not in result_names
 
 
-# =============================================================================
 # discover_hosts_and_agents Tests
-# =============================================================================
 
 
 def test_discover_hosts_and_agents_returns_empty_for_no_agents(
     temp_mngr_ctx: MngrContext,
 ) -> None:
     """discover_hosts_and_agents should return empty dict when no agents exist."""
-    agents_by_host, providers = discover_hosts_and_agents(
+    outcome = discover_hosts_and_agents(
         temp_mngr_ctx,
         provider_names=None,
         agent_identifiers=None,
         include_destroyed=False,
         reset_caches=False,
     )
-    assert isinstance(agents_by_host, dict)
-    assert isinstance(providers, list)
+    assert isinstance(outcome.agents_by_host, dict)
+    assert isinstance(outcome.providers, list)
     # At least the local provider should be present
-    assert len(providers) > 0
+    assert len(outcome.providers) > 0
 
 
 def test_discover_hosts_and_agents_full_discovery_skips_optimization(
@@ -1045,7 +1033,7 @@ def test_discover_hosts_and_agents_full_discovery_skips_optimization(
     # If it tried the optimization with a bogus identifier, it would either
     # error or return filtered results -- but with full discovery it just
     # does a normal scan and returns everything.
-    agents_by_host, providers = discover_hosts_and_agents(
+    outcome = discover_hosts_and_agents(
         safe_ctx,
         provider_names=None,
         agent_identifiers=("nonexistent-agent-xyz",),
@@ -1053,13 +1041,44 @@ def test_discover_hosts_and_agents_full_discovery_skips_optimization(
         reset_caches=False,
     )
     # Should succeed (full scan) rather than fail trying to resolve the identifier
-    assert isinstance(agents_by_host, dict)
-    assert len(providers) > 0
+    assert isinstance(outcome.agents_by_host, dict)
+    assert len(outcome.providers) > 0
 
 
-# =============================================================================
+def test_discover_by_address_narrows_to_the_constrained_host(
+    temp_mngr_ctx: MngrContext,
+) -> None:
+    """A host constraint drops the hosts it excludes while the rest of the outcome survives.
+
+    The constrained result is a rebuild of the unconstrained one, so it has two
+    ways to go wrong that both read as success at the call site: the hosts the
+    constraint excludes come back anyway, or the outcome's other fields (the
+    providers that answered, and the ones that could not be reached) are lost on
+    the way through. ``mngr pair --source-host`` resolves its source through
+    exactly this path.
+    """
+    unconstrained = discover_by_address(
+        AgentAddress(agent=AgentName("no-such-agent")),
+        temp_mngr_ctx,
+    )
+    assert HostName(LOCAL_HOST_NAME) in {host_ref.host_name for host_ref in unconstrained.agents_by_host}
+
+    excluded = discover_by_address(
+        AgentAddress(agent=AgentName("no-such-agent"), host=HostAddress(host=HostName("no-such-host"))),
+        temp_mngr_ctx,
+    )
+    assert excluded.agents_by_host == {}
+    assert excluded.providers == unconstrained.providers
+    assert excluded.unavailable_providers == unconstrained.unavailable_providers
+
+    kept = discover_by_address(
+        AgentAddress(agent=AgentName("no-such-agent"), host=HostAddress(host=HostName(LOCAL_HOST_NAME))),
+        temp_mngr_ctx,
+    )
+    assert {host_ref.host_name for host_ref in kept.agents_by_host} == {HostName(LOCAL_HOST_NAME)}
+
+
 # _all_identifiers_found Tests
-# =============================================================================
 
 
 def test_all_identifiers_found_by_name() -> None:
@@ -1099,9 +1118,7 @@ def test_all_identifiers_found_returns_true_for_empty_identifiers() -> None:
     assert _all_identifiers_found([], {})
 
 
-# =============================================================================
 # agent_field_generators integration tests
-# =============================================================================
 
 
 class _FieldGeneratorPlugin:
@@ -1301,9 +1318,7 @@ def test_no_field_generators_produces_empty_plugin(
         assert agent.plugin == {}
 
 
-# =============================================================================
 # discover_hosts_and_agents Tests
-# =============================================================================
 
 
 @pytest.mark.tmux
@@ -1322,7 +1337,7 @@ def test_discover_hosts_and_agents_groups_agents_by_host(
         ),
     )
 
-    agents_by_host, providers = discover_hosts_and_agents(
+    outcome = discover_hosts_and_agents(
         temp_mngr_ctx,
         provider_names=None,
         agent_identifiers=None,
@@ -1333,12 +1348,12 @@ def test_discover_hosts_and_agents_groups_agents_by_host(
     local_host.destroy_agent(agent)
 
     # There should be at least one host with agents
-    non_empty_hosts = {k: v for k, v in agents_by_host.items() if v}
+    non_empty_hosts = {k: v for k, v in outcome.agents_by_host.items() if v}
     assert len(non_empty_hosts) >= 1
 
     # Find our agent in the results
     found_agent = False
-    for _host_ref, agent_refs in agents_by_host.items():
+    for _host_ref, agent_refs in outcome.agents_by_host.items():
         for ref in agent_refs:
             if str(ref.agent_name) == "grouped-test":
                 found_agent = True
@@ -1346,9 +1361,7 @@ def test_discover_hosts_and_agents_groups_agents_by_host(
     assert found_agent
 
 
-# =============================================================================
 # Test Provider Implementations (for error-path coverage)
-# =============================================================================
 
 
 class _RaisingDiscoveryProviderInstance(MockProviderInstance):
@@ -1507,8 +1520,8 @@ class _RaisingDetailProviderInstance(MockProviderInstance):
 class _MismatchedProviderInstance(MockProviderInstance):
     """Provider that returns hosts whose provider_name differs from self.name.
 
-    Used to exercise the ProviderInstanceNotFoundError path in
-    _list_agents_batch (lines 271-279).
+    Listing cannot map such a host back to a configured provider, so it
+    raises ProviderInstanceNotFoundError.
     """
 
     def discover_hosts_and_agents(
@@ -1751,19 +1764,26 @@ def _make_list_params(
     )
 
 
-# =============================================================================
 # Provider instantiation errors honor --on-error in get_all_provider_instances
-# =============================================================================
 
 
 def _make_broken_provider_ctx(temp_mngr_ctx: MngrContext) -> MngrContext:
-    """Build a MngrContext with a configured provider that has an unknown backend."""
-    failing_config = ProviderInstanceConfig(backend=ProviderBackendName("nonexistent-backend-xyz"))
+    """Build a MngrContext with a configured provider that has an unknown backend.
+
+    Pin ``enabled_backends`` so a full-enumeration ``list_agents`` only constructs the
+    ``local`` and broken providers. Otherwise it also discovers over every other
+    registered backend -- e.g. the ``lima`` default instance, whose discovery shells out
+    to ``limactl`` and reads the real ``/mngr`` host dir -- whose environment-dependent
+    failures would add a spurious second error (MIND-229).
+    """
+    broken_backend = ProviderBackendName("nonexistent-backend-xyz")
+    failing_config = ProviderInstanceConfig(backend=broken_backend)
     updated_config = temp_mngr_ctx.config.model_copy_update(
         to_update(
             temp_mngr_ctx.config.field_ref().providers,
             {ProviderInstanceName("broken-provider"): failing_config},
         ),
+        to_update(temp_mngr_ctx.config.field_ref().enabled_backends, [LOCAL_BACKEND_NAME, broken_backend]),
     )
     return temp_mngr_ctx.model_copy_update(
         to_update(temp_mngr_ctx.field_ref().config, updated_config),
@@ -1815,8 +1835,44 @@ def test_list_agents_batch_continue_mode_records_failing_provider_error(
     assert "nonexistent-backend-xyz" in result.errors[0].message
 
 
+@pytest.mark.allow_warnings(match=r"Error discovering agents for provider")
+def test_list_agents_continue_mode_ignores_incidental_backends(
+    temp_mngr_ctx: MngrContext,
+) -> None:
+    """A full-enumeration continue-mode listing only touches the ctx's enabled backends.
+
+    MIND-229 regression guard: a registered backend outside the ctx's ``enabled_backends``
+    must never be constructed or discovered, so its failures cannot leak into
+    ``result.errors``. This is what keeps the continue-mode provider-error tests hermetic
+    against incidental backends like the ``lima`` default instance.
+    """
+    _backend_registry[_RAISING_DISCOVERY_BACKEND_NAME] = _RaisingDiscoveryProviderBackend
+    _provider_config_registry[_RAISING_DISCOVERY_BACKEND_NAME] = ProviderInstanceConfig
+    try:
+        failing_ctx = _make_broken_provider_ctx(temp_mngr_ctx)
+
+        result = list_agents(
+            mngr_ctx=failing_ctx,
+            is_streaming=False,
+            error_behavior=ErrorBehavior.CONTINUE,
+        )
+
+        provider_errors = [e for e in result.errors if isinstance(e, ProviderErrorInfo)]
+        assert len(provider_errors) == 1
+        assert provider_errors[0].provider_name == ProviderInstanceName("broken-provider")
+    finally:
+        del _backend_registry[_RAISING_DISCOVERY_BACKEND_NAME]
+        del _provider_config_registry[_RAISING_DISCOVERY_BACKEND_NAME]
+
+
 def _make_not_authorized_alongside_local_ctx(temp_mngr_ctx: MngrContext) -> MngrContext:
-    """Build a MngrContext with the default local provider plus one unauthenticated provider."""
+    """Build a MngrContext with the default local provider plus one unauthenticated provider.
+
+    Pin ``enabled_backends`` so a full-enumeration ``list_agents`` only discovers the
+    ``local`` and unauthenticated providers; otherwise an incidental backend (e.g. ``lima``)
+    erroring during discovery would break the "all provider errors are inaccessible"
+    assertion (MIND-229).
+    """
     provider_config = ProviderInstanceConfig(backend=_NOT_AUTHORIZED_DISCOVERY_BACKEND_NAME)
     merged_providers = {
         **temp_mngr_ctx.config.providers,
@@ -1824,6 +1880,10 @@ def _make_not_authorized_alongside_local_ctx(temp_mngr_ctx: MngrContext) -> Mngr
     }
     updated_config = temp_mngr_ctx.config.model_copy_update(
         to_update(temp_mngr_ctx.config.field_ref().providers, merged_providers),
+        to_update(
+            temp_mngr_ctx.config.field_ref().enabled_backends,
+            [LOCAL_BACKEND_NAME, _NOT_AUTHORIZED_DISCOVERY_BACKEND_NAME],
+        ),
     )
     return temp_mngr_ctx.model_copy_update(
         to_update(temp_mngr_ctx.field_ref().config, updated_config),
@@ -1884,11 +1944,6 @@ def test_list_agents_abort_mode_propagates_top_level_mngr_error(
         )
 
 
-# =============================================================================
-# Lines 235-237: OSError when writing full discovery snapshot
-# =============================================================================
-
-
 def test_maybe_write_provider_discovery_snapshots_logs_warning_on_oserror(
     temp_mngr_ctx: MngrContext,
 ) -> None:
@@ -1929,9 +1984,8 @@ def test_maybe_write_provider_discovery_snapshots_emits_ssh_host_info(
 ) -> None:
     """_maybe_write_provider_discovery_snapshots emits SSH info for hosts that have it.
 
-    When an agent's host has SSH connection info, the snapshot write should
-    also call emit_host_ssh_info (line 235). The events file must contain
-    both the DISCOVERY_FULL and the SSH info events.
+    The details land in the events file beside the per-provider discovery
+    record, never the whole-fleet snapshot it replaced.
     """
     ssh_info = SSHInfo(
         user="ubuntu",
@@ -1965,11 +2019,6 @@ def test_maybe_write_provider_discovery_snapshots_emits_ssh_host_info(
     assert "DISCOVERY_PROVIDER" in content
     assert "DISCOVERY_FULL" not in content
     assert "ssh-agent" in content
-
-
-# =============================================================================
-# Lines 271-279: ProviderInstanceNotFoundError in batch mode
-# =============================================================================
 
 
 def test_list_agents_batch_continue_mode_handles_mismatched_provider_name(
@@ -2025,11 +2074,6 @@ def test_list_agents_batch_abort_mode_raises_for_mismatched_provider_name(
     finally:
         del _backend_registry[_MISMATCHED_BACKEND_NAME]
         del _provider_config_registry[_MISMATCHED_BACKEND_NAME]
-
-
-# =============================================================================
-# Lines 348-385: Provider-level MngrError in streaming mode
-# =============================================================================
 
 
 def _make_raising_provider_ctx(temp_mngr_ctx: MngrContext) -> MngrContext:
@@ -2142,9 +2186,7 @@ def test_construct_discover_and_emit_for_provider_success_path_processes_agents(
     assert result.errors == []
 
 
-# =============================================================================
 # ProviderEmptyError: always silently skipped in listing, regardless of mode
-# =============================================================================
 
 
 def _make_empty_provider_ctx(temp_mngr_ctx: MngrContext) -> MngrContext:
@@ -2208,11 +2250,6 @@ def test_list_agents_batch_abort_mode_silently_skips_empty_provider(
     finally:
         del _backend_registry[_EMPTY_BACKEND_NAME]
         del _provider_config_registry[_EMPTY_BACKEND_NAME]
-
-
-# =============================================================================
-# Lines 396-405: Error differentiation in _handle_listing_error
-# =============================================================================
 
 
 def test_handle_listing_error_continue_with_discovered_agent_creates_agent_error() -> None:
@@ -2321,11 +2358,6 @@ def test_handle_listing_error_abort_mode_raises() -> None:
         )
 
     assert result.errors == []
-
-
-# =============================================================================
-# Lines 416-430: CEL filter application in _collect_and_emit_details_for_host
-# =============================================================================
 
 
 def _make_offline_test_provider(
@@ -2569,11 +2601,6 @@ def test_collect_and_emit_details_for_host_no_filter_adds_all_agents(
     assert len(result.agents) == 3
 
 
-# =============================================================================
-# Lines 446-463: Host-level error handling in _process_host_with_error_handling
-# =============================================================================
-
-
 @pytest.mark.allow_warnings(match=r"Error processing host")
 def test_process_host_with_error_handling_continue_mode_records_host_error(
     temp_mngr_ctx: MngrContext,
@@ -2663,3 +2690,235 @@ def test_process_host_with_error_handling_abort_mode_propagates_error(
         )
 
     assert result.errors == []
+
+
+_UNCONSTRUCTABLE_BACKEND_NAME = ProviderBackendName("test-unconstructable-backend")
+_UNCONSTRUCTABLE_REASON = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+# Stands in for the guidance the cloud backends curate (``run `modal token new``,
+# the AWS credential-chain checklist): text that is only right for this provider,
+# and that the constructor's generic default would replace with "start Docker".
+_UNCONSTRUCTABLE_HELP_TEXT = "Start the test daemon, or run `mngr config set ...` to disable this provider."
+
+
+class _UnconstructableProviderBackend(ProviderBackendInterface):
+    """Backend that reports itself unreachable while being *constructed*.
+
+    The shape the real Docker backend has: a dead daemon is detected in
+    ``build_provider_instance`` (via its state-container check), not on a later
+    discovery call, so the provider never becomes an instance that discovery can
+    query.
+    """
+
+    @staticmethod
+    def get_name() -> ProviderBackendName:
+        return _UNCONSTRUCTABLE_BACKEND_NAME
+
+    @staticmethod
+    def get_description() -> str:
+        return "Test backend that cannot be constructed because its daemon is down"
+
+    @staticmethod
+    def get_config_class() -> type[ProviderInstanceConfig]:
+        return ProviderInstanceConfig
+
+    @staticmethod
+    def get_build_args_help() -> str:
+        return "No arguments supported."
+
+    @staticmethod
+    def get_start_args_help() -> str:
+        return "No arguments supported."
+
+    @staticmethod
+    def build_provider_instance(
+        name: ProviderInstanceName,
+        config: ProviderInstanceConfig,
+        mngr_ctx: MngrContext,
+    ) -> ProviderInstanceInterface:
+        raise ProviderUnavailableError(name, _UNCONSTRUCTABLE_REASON, user_help_text=_UNCONSTRUCTABLE_HELP_TEXT)
+
+
+@contextmanager
+def _registered_unconstructable_backend() -> Iterator[None]:
+    _backend_registry[_UNCONSTRUCTABLE_BACKEND_NAME] = _UnconstructableProviderBackend
+    _provider_config_registry[_UNCONSTRUCTABLE_BACKEND_NAME] = ProviderInstanceConfig
+    try:
+        yield
+    finally:
+        del _backend_registry[_UNCONSTRUCTABLE_BACKEND_NAME]
+        del _provider_config_registry[_UNCONSTRUCTABLE_BACKEND_NAME]
+
+
+@pytest.mark.allow_warnings
+def test_discovery_reports_a_provider_it_could_not_construct(temp_mngr_ctx: MngrContext) -> None:
+    """A provider that failed to construct is carried on the outcome, not silently dropped.
+
+    Discovery cannot query it, so its agents are absent from the snapshot exactly
+    as if it held none. Recording the skip is what lets a caller tell those apart.
+    """
+    with _registered_unconstructable_backend():
+        outcome = discover_hosts_and_agents(
+            temp_mngr_ctx,
+            provider_names=None,
+            agent_identifiers=None,
+            include_destroyed=False,
+            reset_caches=False,
+        )
+
+    assert [str(skipped.provider_name) for skipped in outcome.unavailable_providers] == [
+        str(_UNCONSTRUCTABLE_BACKEND_NAME)
+    ]
+    assert _UNCONSTRUCTABLE_REASON in outcome.unavailable_providers[0].error_message
+    # The providers that *did* answer still came through -- one unreachable
+    # backend must not cost the user the rest of their machines.
+    assert len(outcome.providers) > 0
+
+
+@pytest.mark.allow_warnings
+def test_an_agent_lookup_blames_the_unreachable_backend_rather_than_the_agent(
+    temp_mngr_ctx: MngrContext,
+) -> None:
+    """Looking up an agent while a provider is unreachable is an outage, not a missing agent.
+
+    This is the whole point of carrying the skips: the agent may well live on the
+    provider that is down, so "no agent found" states something discovery is in
+    no position to know. Reporting it that way sends the reader looking for a
+    machine they think they deleted, when the real problem is a backend that is
+    not answering -- and it hides the provider's own explanation, which is the
+    one useful thing anybody has.
+    """
+    with _registered_unconstructable_backend():
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            find_all_agents(
+                addresses=[AgentAddress(agent=AgentName("some-machine"))],
+                filter_all=False,
+                target_state=None,
+                mngr_ctx=temp_mngr_ctx,
+            )
+
+    message = str(exc_info.value)
+    assert _UNCONSTRUCTABLE_REASON in message
+    assert "some-machine" in message
+    # The skip carries the provider's already-rendered error, so re-wrapping it
+    # unaltered would nest a whole ProviderUnavailableError inside another one:
+    # the provider named twice, mngr's marker sentence trailing twice, and a
+    # reason that the in-band parser then hands to minds with mngr's own wrapper
+    # still on the front of it.
+    assert message.count(f"Provider '{_UNCONSTRUCTABLE_BACKEND_NAME}' is not available") == 1
+    assert parse_provider_unavailable_reason(message, str(_UNCONSTRUCTABLE_BACKEND_NAME)) == (
+        f"{_UNCONSTRUCTABLE_REASON} (so mngr cannot tell whether some-machine exists)"
+    )
+    # The provider's own remediation is the other half of "the useful thing
+    # anybody has", and it is what the CLI prints after the message. Rebuilding
+    # the error from the skip's message alone would swap it for the generic
+    # "start Docker" default -- the advice a cloud credential failure curates
+    # its own text precisely to avoid giving.
+    assert exc_info.value.user_help_text == _UNCONSTRUCTABLE_HELP_TEXT
+
+
+@pytest.mark.allow_warnings
+def test_an_agent_lookup_still_reports_a_genuinely_missing_agent_as_not_found(
+    temp_mngr_ctx: MngrContext,
+) -> None:
+    """With every provider reachable, an absent agent is still plainly absent.
+
+    The outage verdict must not swallow the ordinary case: when discovery could
+    see everywhere, "not found" is the honest answer and the one the user needs.
+    """
+    with pytest.raises(AgentNotFoundError):
+        find_all_agents(
+            addresses=[AgentAddress(agent=AgentName("some-machine"))],
+            filter_all=False,
+            target_state=None,
+            mngr_ctx=temp_mngr_ctx,
+        )
+
+
+@pytest.mark.allow_warnings
+def test_the_single_agent_lookup_blames_the_unreachable_backend_too(temp_mngr_ctx: MngrContext) -> None:
+    """The other agent-lookup entry point has to give the same answer.
+
+    ``mngr wait`` / ``transcript`` / ``rename`` / ``file`` and the interactive
+    picker resolve through :func:`find_one_agent`, not :func:`find_all_agents`.
+    A user whose Docker daemon is stopped would otherwise be told the honest
+    thing by ``mngr stop`` and "could not find agent" by ``mngr wait`` on the
+    same machine a second later.
+    """
+    address = AgentAddress(agent=AgentName("some-machine"))
+
+    with _registered_unconstructable_backend():
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            find_one_agent(address, temp_mngr_ctx)
+
+    assert _UNCONSTRUCTABLE_REASON in str(exc_info.value)
+
+    # With every provider reachable this stays the ordinary bad-input answer.
+    with pytest.raises(UserInputError):
+        find_one_agent(address, temp_mngr_ctx)
+
+
+# A lookup that matches nothing exits with the gone-target code only when every
+# identifier it was given is machine-generated. mngr_forward reads the exit code
+# alone to decide whether respawning its per-agent `mngr event --follow` child
+# could ever succeed, and it always addresses `<agent_id>@<host_id>`. A name is
+# user-typed, so a miss there is as likely a typo and must keep the ordinary
+# code -- otherwise `mngr stop <typo>` is indistinguishable from a gone target.
+_MISSING_AGENT_NAME = AgentName("some-machine")
+_MISSING_AGENT_ID = AgentId("agent-fa29307a16734899aa77b0f0563c8c99")
+_MISSING_HOST_ID = HostId("host-fa29307a16734899aa77b0f0563c8c99")
+
+
+@pytest.mark.allow_warnings
+@pytest.mark.parametrize(
+    ("address", "expected_exit_code"),
+    [
+        (AgentAddress(agent=_MISSING_AGENT_NAME), EXIT_CODE_ERROR),
+        (AgentAddress(agent=_MISSING_AGENT_ID), EXIT_CODE_TARGET_NOT_FOUND),
+        (
+            AgentAddress(agent=_MISSING_AGENT_NAME, host=HostAddress(host=HostName("some-host"))),
+            EXIT_CODE_ERROR,
+        ),
+        (
+            AgentAddress(agent=_MISSING_AGENT_NAME, host=HostAddress(host=_MISSING_HOST_ID)),
+            EXIT_CODE_TARGET_NOT_FOUND,
+        ),
+    ],
+    ids=["agent_name", "agent_id", "host_name", "host_id"],
+)
+def test_the_single_agent_lookup_reserves_the_gone_target_code_for_ids(
+    address: AgentAddress, expected_exit_code: int, temp_mngr_ctx: MngrContext
+) -> None:
+    """find_one_agent's four miss paths: an id is gone, a name is bad input."""
+    with pytest.raises(MngrError) as exc_info:
+        find_one_agent(address, temp_mngr_ctx)
+
+    assert exc_info.value.exit_code == expected_exit_code
+
+
+@pytest.mark.allow_warnings
+@pytest.mark.parametrize(
+    ("agent", "expected_exit_code"),
+    [(_MISSING_AGENT_NAME, EXIT_CODE_ERROR), (_MISSING_AGENT_ID, EXIT_CODE_TARGET_NOT_FOUND)],
+    ids=["agent_name", "agent_id"],
+)
+def test_the_bulk_agent_lookup_reserves_the_gone_target_code_for_ids(
+    agent: AgentName | AgentId, expected_exit_code: int, temp_mngr_ctx: MngrContext
+) -> None:
+    """The other entry point has to make the same split.
+
+    `mngr stop` / `start` / `destroy` / `message` / `label` / `archive` resolve
+    through :func:`find_all_agents`, which fails in a different place
+    (``_raise_for_unmatched_identifiers``) than :func:`find_one_agent` does. An
+    exit code carried by the shared exception *class* would look correct in the
+    single-agent tests while silently giving every mistyped name here the
+    gone-target code.
+    """
+    with pytest.raises(MngrError) as exc_info:
+        find_all_agents(
+            addresses=[AgentAddress(agent=agent)],
+            filter_all=False,
+            target_state=None,
+            mngr_ctx=temp_mngr_ctx,
+        )
+
+    assert exc_info.value.exit_code == expected_exit_code

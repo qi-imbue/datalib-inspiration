@@ -24,7 +24,11 @@ import os
 import shutil
 from collections.abc import Iterator
 from collections.abc import Mapping
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Final
+
+from loguru import logger
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.concurrency_group.subprocess_utils import FinishedProcess
@@ -75,6 +79,12 @@ def read_vault_kv(
     or test fixture), we synthesize a fresh CG for the duration of the
     call.
 
+    Soft-deleted leaves (``vault kv delete`` keeps the key in LIST but its
+    GET returns no data) are treated as absent and skipped with a warning:
+    a deleted key means "deliberately removed", and one lingering tombstone
+    must not fail the read of every healthy sibling leaf. Use
+    ``vault kv metadata delete`` to also drop the tombstone from LIST.
+
     Raises :class:`VaultSecretNotFoundError` when the directory itself is
     absent, and :class:`VaultReadError` for any other failure (CLI missing,
     command failed, output not parseable, a leaf missing its ``value``
@@ -87,9 +97,18 @@ def read_vault_kv(
     )
     result_map: dict[str, str] = {}
     for key in keys:
-        result_map[key] = _read_leaf_value(
+        leaf_value = _read_leaf_value(
             relative, key, path=path, parent=parent_concurrency_group, vault_binary=vault_binary
         )
+        if leaf_value is None:
+            logger.warning(
+                "Skipped soft-deleted Vault leaf {}/{} (still listed but has no data; "
+                "run `vault kv metadata delete` to remove the tombstone).",
+                path,
+                key,
+            )
+            continue
+        result_map[key] = leaf_value
     return result_map
 
 
@@ -102,8 +121,8 @@ def write_vault_kv(
 ) -> None:
     """Write each ``{key: value}`` pair as a single-``value`` leaf under ``path``.
 
-    Used by :mod:`imbue.minds.envs.generation` to write the tier
-    generation ID. Each key becomes its own leaf ``path/<key>`` holding
+    Used by the operator env tooling's generation-id lifecycle to write
+    the tier generation ID. Each key becomes its own leaf ``path/<key>`` holding
     ``{"value": <value>}``. Refuses to pass any value containing the ``@``
     sigil since ``vault kv put`` would interpret it as a file-path
     reference -- callers that need to write such values should add a
@@ -167,6 +186,100 @@ def delete_vault_kv(
         raise VaultReadError(
             f"`{vault_binary} kv metadata delete {leaf_relative}` failed (exit {result.returncode}): {stderr}"
         )
+
+
+def sign_ssh_public_key(
+    *,
+    mount: str,
+    role: str,
+    public_key_path: Path,
+    ttl: str,
+    principals: Sequence[str],
+    parent_concurrency_group: ConcurrencyGroup | None = None,
+    vault_binary: str = VAULT_BINARY,
+) -> str:
+    """Have ``mount``'s SSH CA sign the OpenSSH public key at ``public_key_path``; return the certificate line.
+
+    Runs ``vault write <mount>/sign/<role>`` with the operator's own login (the
+    OIDC token ``vault login`` left behind), so the certificate's key id records
+    who asked. The requested ``ttl`` is capped by the role's ``max_ttl`` in
+    Vault; the returned certificate is a single ``ssh-ed25519-cert-v01@openssh.com``
+    line ready to be written beside the private key as ``<key>-cert.pub``.
+
+    Raises :class:`VaultReadError` when the CLI is missing, the sign fails
+    (no login, no policy for the role, a principal outside the role), or the
+    response lacks a signed key.
+    """
+    _check_vault_binary(vault_binary)
+    command = [
+        vault_binary,
+        "write",
+        "-format=json",
+        f"{mount}/sign/{role}",
+        f"public_key=@{public_key_path}",
+        f"ttl={ttl}",
+        f"valid_principals={','.join(principals)}",
+    ]
+    return _read_vault_data_field(
+        command,
+        field="signed_key",
+        label=f"write {mount}/sign/{role}",
+        failure_hint=(
+            "Check that `vault login` succeeded with a role allowed to sign this tier's management SSH "
+            "certificates (apps/minds/docs/deploy/setup/vault.md)."
+        ),
+        parent=parent_concurrency_group,
+        vault_binary=vault_binary,
+    )
+
+
+def read_ssh_ca_public_key(
+    mount: str,
+    *,
+    parent_concurrency_group: ConcurrencyGroup | None = None,
+    vault_binary: str = VAULT_BINARY,
+) -> str:
+    """The OpenSSH public key of the SSH CA configured on ``mount`` (``vault read <mount>/config/ca``).
+
+    Raises :class:`VaultReadError` when the mount has no CA or cannot be read.
+    """
+    _check_vault_binary(vault_binary)
+    command = [vault_binary, "read", "-format=json", f"{mount}/config/ca"]
+    return _read_vault_data_field(
+        command,
+        field="public_key",
+        label=f"read {mount}/config/ca",
+        failure_hint="Has the tier's SSH CA been brought up (imbue-ai/vault terraform)?",
+        parent=parent_concurrency_group,
+        vault_binary=vault_binary,
+    )
+
+
+def _read_vault_data_field(
+    command: list[str],
+    *,
+    field: str,
+    # The ``<verb> <path>`` fragment naming the command in every error message.
+    label: str,
+    # Appended to the failure message when the command exits non-zero.
+    failure_hint: str,
+    parent: ConcurrencyGroup | None,
+    vault_binary: str,
+) -> str:
+    """Run a ``-format=json`` vault command and return the non-empty string at ``data.<field>`` of its output."""
+    result = _run_vault_command(command, parent=parent, vault_binary=vault_binary)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise VaultReadError(f"`{vault_binary} {label}` failed (exit {result.returncode}): {stderr}. {failure_hint}")
+    try:
+        parsed = json.loads(result.stdout)
+    except ValueError as exc:
+        raise VaultReadError(f"`{vault_binary} {label}` returned non-JSON output: {exc}") from exc
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    value = data.get(field) if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise VaultReadError(f"`{vault_binary} {label}` returned no data.{field}")
+    return value.strip()
 
 
 def _check_vault_binary(vault_binary: str) -> None:
@@ -290,7 +403,8 @@ def _read_leaf_value(
     path: VaultPath,
     parent: ConcurrencyGroup | None,
     vault_binary: str,
-) -> str:
+    # the leaf's ``value`` field, or None when the leaf is soft-deleted (listed but dataless)
+) -> str | None:
     """Read the single ``value`` field of the leaf secret at ``relative/key``."""
     leaf_relative = f"{relative}/{key}"
     command = [vault_binary, "kv", "get", "-format=json", f"-mount={_DEFAULT_MOUNT}", leaf_relative]
@@ -309,6 +423,11 @@ def _read_leaf_value(
     data = parsed.get("data") if isinstance(parsed, dict) else None
     inner = data.get("data") if isinstance(data, dict) else None
     if not isinstance(inner, dict):
+        # A soft-deleted leaf returns data.data = null alongside a metadata
+        # block (deletion_time set). That is a deliberate removal, not
+        # corruption -- report it as absent so the caller can skip it.
+        if isinstance(data, dict) and inner is None and isinstance(data.get("metadata"), dict):
+            return None
         raise VaultReadError(
             f"`{vault_binary} kv get {leaf_relative}` returned no data.data dict; payload shape: {type(parsed).__name__}"
         )
@@ -320,3 +439,38 @@ def _read_leaf_value(
             "single-`value` leaf."
         )
     return value
+
+
+# Vault field (under a tier's ``<vault_prefix>/supertokens`` entry) holding the
+# connector admin API key, and its deprecated spelling from when the key only
+# guarded the paid-list CRUD. The deprecated field is still read (with a
+# warning) while Vault entries migrate.
+_ADMIN_KEY_VAULT_FIELD: Final[str] = "MINDS_ADMIN_KEY"
+_LEGACY_ADMIN_KEY_VAULT_FIELD: Final[str] = "MINDS_PAID_ADMIN_KEY"
+
+
+def admin_key_from_supertokens_secret(secret: Mapping[str, str], vault_prefix: str) -> str:
+    """Pick the connector admin API key out of a tier's ``<vault_prefix>/supertokens`` secret.
+
+    Prefers the ``MINDS_ADMIN_KEY`` field, falling back (with a warning) to the
+    deprecated ``MINDS_PAID_ADMIN_KEY`` spelling while Vault entries migrate.
+    ``vault_prefix`` is only used in the warning / error messages. Raises
+    ``VaultReadError`` when neither field is populated (the admin API is not
+    enabled for the tier).
+    """
+    admin_key = secret.get(_ADMIN_KEY_VAULT_FIELD, "")
+    if admin_key:
+        return admin_key
+    legacy_admin_key = secret.get(_LEGACY_ADMIN_KEY_VAULT_FIELD, "")
+    if legacy_admin_key:
+        logger.warning(
+            "Admin API key found under deprecated Vault field {}; rename it to {} in {}/supertokens",
+            _LEGACY_ADMIN_KEY_VAULT_FIELD,
+            _ADMIN_KEY_VAULT_FIELD,
+            vault_prefix,
+        )
+        return legacy_admin_key
+    raise VaultReadError(
+        f"Vault entry {vault_prefix}/supertokens is missing {_ADMIN_KEY_VAULT_FIELD!r}; "
+        "the admin API is not enabled for this tier (add the key and redeploy)."
+    )

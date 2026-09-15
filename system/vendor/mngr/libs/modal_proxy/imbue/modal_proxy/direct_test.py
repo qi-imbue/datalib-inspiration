@@ -12,8 +12,9 @@ import modal.exception
 import pytest
 from grpclib.exceptions import ProtocolError
 from grpclib.exceptions import StreamTerminatedError
+from modal.config import config
 from modal.stream_type import StreamType as ModalStreamType
-from modal.volume import FileEntryType as ModalFileEntryType
+from modal.types import FileEntryType as ModalFileEntryType
 from tenacity import RetryCallState
 from tenacity import Retrying
 
@@ -24,6 +25,7 @@ from imbue.modal_proxy.direct import DirectApp
 from imbue.modal_proxy.direct import DirectFunction
 from imbue.modal_proxy.direct import DirectImage
 from imbue.modal_proxy.direct import DirectModalInterface
+from imbue.modal_proxy.direct import DirectSandbox
 from imbue.modal_proxy.direct import DirectSecret
 from imbue.modal_proxy.direct import DirectVolume
 from imbue.modal_proxy.direct import _should_retry_volume_op
@@ -38,6 +40,7 @@ from imbue.modal_proxy.direct import _unwrap_volume
 from imbue.modal_proxy.direct import _volume_wait
 from imbue.modal_proxy.errors import ModalProxyAppLockedError
 from imbue.modal_proxy.errors import ModalProxyAuthError
+from imbue.modal_proxy.errors import ModalProxyConnectionError
 from imbue.modal_proxy.errors import ModalProxyError
 from imbue.modal_proxy.errors import ModalProxyInternalError
 from imbue.modal_proxy.errors import ModalProxyInvalidError
@@ -46,6 +49,7 @@ from imbue.modal_proxy.errors import ModalProxyRateLimitError
 from imbue.modal_proxy.errors import ModalProxyRemoteError
 from imbue.modal_proxy.errors import ModalProxyTypeError
 from imbue.modal_proxy.errors import is_app_locked_error
+from imbue.modal_proxy.errors import is_deploy_function_vanished_error
 from imbue.modal_proxy.interface import AppInterface
 from imbue.modal_proxy.interface import ImageInterface
 from imbue.modal_proxy.interface import SecretInterface
@@ -101,6 +105,9 @@ class _FakeVolume(VolumeInterface):
 
     def get_name(self) -> str | None:
         return None
+
+    def get_object_id(self) -> str:
+        raise NotImplementedError
 
     def listdir(self, path: str) -> list[FileEntry]:
         raise NotImplementedError
@@ -242,6 +249,16 @@ def test_translate_modal_cli_not_found_reraises_for_other() -> None:
             id="resource_exhausted",
         ),
         pytest.param(modal.exception.RemoteError("remote"), ModalProxyRemoteError, id="remote"),
+        # The control plane could not be reached at all -- what a dropped network
+        # or a Modal outage looks like. This must get its own type rather than
+        # falling through to the generic branch: consumers decide "Modal is
+        # temporarily unavailable" (skippable) from "Modal answered with a real
+        # failure" (fatal) on exactly this distinction.
+        pytest.param(
+            modal.exception.ConnectionError("Could not connect to the Modal server."),
+            ModalProxyConnectionError,
+            id="connection",
+        ),
         # A bare modal.exception.Error that matches none of the specific branches
         # must fall through to the generic ModalProxyError.
         pytest.param(modal.exception.Error("generic"), ModalProxyError, id="fallback_generic"),
@@ -344,6 +361,20 @@ def test_is_app_locked_error(message: str, expected: bool) -> None:
     assert is_app_locked_error(message) is expected
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param("Error: Function fu-7O62Sp60LIHTdROU1VJl6q not found", True, id="real_modal_message"),
+        pytest.param("error: FUNCTION FU-abc123 NOT FOUND", True, id="case_insensitive"),
+        pytest.param("Lookup failed for Function 'snapshot_and_shutdown' not found", False, id="name_not_id"),
+        pytest.param("Failed to deploy snapshot.py: some other error", False, id="unrelated_error"),
+        pytest.param("", False, id="empty"),
+    ],
+)
+def test_is_deploy_function_vanished_error(message: str, expected: bool) -> None:
+    assert is_deploy_function_vanished_error(message) is expected
+
+
 # --- Deploy retry tests ---
 
 # The real Modal message; deploy must classify this as retryable.
@@ -382,6 +413,20 @@ def test_deploy_retries_on_locked_app_then_succeeds(tmp_path: Path, monkeypatch:
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
     # Should ride through the transient lock and return normally.
+    DirectModalInterface().deploy(tmp_path / "snapshot.py", app_name="my-app")
+
+    assert counter.read_text().strip() == "2", "expected one failed attempt followed by a successful retry"
+
+
+def test_deploy_retries_on_vanished_function_then_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The function-vanished flavor of the concurrent-deploy race must retry like the app lock."""
+    bin_dir = tmp_path / "bin"
+    counter = tmp_path / "count"
+    _write_fake_modal(
+        bin_dir, counter, fail_times=1, error_message="Error: Function fu-7O62Sp60LIHTdROU1VJl6q not found"
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
     DirectModalInterface().deploy(tmp_path / "snapshot.py", app_name="my-app")
 
     assert counter.read_text().strip() == "2", "expected one failed attempt followed by a successful retry"
@@ -439,3 +484,52 @@ def test_get_web_url_does_not_retry_on_other_error() -> None:
         function.get_web_url()
 
     assert fake.call_count == 1, "non-NotFound failures must not be retried"
+
+
+def test_direct_modal_interface_enables_sandbox_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Constructing the real Modal boundary opts every Sandbox operation into the V2 Sandbox backend."""
+    monkeypatch.delenv("MODAL_SANDBOX_V2", raising=False)
+
+    DirectModalInterface()
+
+    assert os.environ["MODAL_SANDBOX_V2"] == "1"
+    assert config.get("sandbox_v2") is True
+
+
+def test_direct_modal_interface_respects_explicit_sandbox_v2_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit MODAL_SANDBOX_V2=0 survives construction, so V2 can still be turned off."""
+    monkeypatch.setenv("MODAL_SANDBOX_V2", "0")
+
+    DirectModalInterface()
+
+    assert os.environ["MODAL_SANDBOX_V2"] == "0"
+    assert config.get("sandbox_v2") is False
+
+
+class _FakeModalSandbox:
+    """Minimal stand-in for modal.Sandbox that only supports poll()."""
+
+    def __init__(self, poll_result: int | None = None, error: modal.exception.Error | None = None) -> None:
+        self._poll_result = poll_result
+        self._error = error
+
+    def poll(self) -> int | None:
+        if self._error is not None:
+            raise self._error
+        return self._poll_result
+
+
+def test_direct_sandbox_poll_returns_none_while_running() -> None:
+    sandbox = DirectSandbox.model_construct(sandbox=_FakeModalSandbox(poll_result=None))
+    assert sandbox.poll() is None
+
+
+def test_direct_sandbox_poll_returns_exit_code_when_finished() -> None:
+    sandbox = DirectSandbox.model_construct(sandbox=_FakeModalSandbox(poll_result=137))
+    assert sandbox.poll() == 137
+
+
+def test_direct_sandbox_poll_translates_modal_errors() -> None:
+    sandbox = DirectSandbox.model_construct(sandbox=_FakeModalSandbox(error=modal.exception.NotFoundError("gone")))
+    with pytest.raises(ModalProxyNotFoundError):
+        sandbox.poll()

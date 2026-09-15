@@ -10,6 +10,25 @@ from imbue.imbue_common.ratchet_testing.ratchets import TEST_FILE_PATTERNS
 # so the source dir is parent.parent instead of parent.parent.parent
 _DIR = Path(__file__).parent.parent
 
+# agents/data_types/atif/ is a vendored copy of harbor's ATIF models (see its README.md): upstream
+# style is deliberately preserved there, so it is carved out of the ratchets its
+# patterns would trip rather than counted against this project. The vendored modules
+# are listed one by one rather than globbed, so that mngr-authored files in the same
+# directory (trajectory_test.py) stay subject to the ratchets, and a re-vendor that
+# adds a module fails loudly instead of silently widening the carve-out.
+_VENDORED_ATIF_PATTERNS = (
+    "agents/data_types/atif/agent.py",
+    "agents/data_types/atif/content.py",
+    "agents/data_types/atif/final_metrics.py",
+    "agents/data_types/atif/metrics.py",
+    "agents/data_types/atif/observation.py",
+    "agents/data_types/atif/observation_result.py",
+    "agents/data_types/atif/step.py",
+    "agents/data_types/atif/subagent_trajectory_ref.py",
+    "agents/data_types/atif/tool_call.py",
+    "agents/data_types/atif/trajectory.py",
+)
+
 pytestmark = pytest.mark.xdist_group(name="ratchets")
 
 
@@ -41,11 +60,13 @@ def test_prevent_global_keyword() -> None:
 
 
 def test_prevent_bare_print() -> None:
-    # 34 includes the blessed `write_stderr_line` helper in cli/output_helpers.py -- the
+    # 35 includes the blessed `write_stderr_line` helper in cli/output_helpers.py -- the
     # stderr sibling of `write_human_line`, used for the `mngr list` end-of-output error
     # block so piped stdout stays clean. Call sites route through it rather than writing
-    # to sys.stderr directly.
-    rc.check_bare_print(_DIR, snapshot(34), excluded_patterns=("_kqueue_tty_test_script.py",))
+    # to sys.stderr directly. It also includes cli/transcript.py's ATIF-document write,
+    # which is machine-readable output on stdout exactly like the JSONL/JSON writes
+    # beside it in `_emit_transcript`.
+    rc.check_bare_print(_DIR, snapshot(35), excluded_patterns=("_kqueue_tty_test_script.py",))
 
 
 # --- Exception handling ---
@@ -56,7 +77,7 @@ def test_prevent_bare_except() -> None:
 
 
 def test_prevent_broad_exception_catch() -> None:
-    rc.check_broad_exception_catch(_DIR, snapshot(8))
+    rc.check_broad_exception_catch(_DIR, snapshot(7))
 
 
 def test_prevent_base_exception_catch() -> None:
@@ -64,7 +85,7 @@ def test_prevent_base_exception_catch() -> None:
 
 
 def test_prevent_builtin_exception_raises() -> None:
-    rc.check_builtin_exception_raises(_DIR, snapshot(0))
+    rc.check_builtin_exception_raises(_DIR, snapshot(0), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 def test_prevent_silent_decode_error_catches() -> None:
@@ -75,7 +96,7 @@ def test_prevent_silent_decode_error_catches() -> None:
 
 
 def test_prevent_inline_imports() -> None:
-    rc.check_inline_imports(_DIR, snapshot(4))
+    rc.check_inline_imports(_DIR, snapshot(3))
 
 
 def test_prevent_relative_imports() -> None:
@@ -90,6 +111,10 @@ def test_prevent_importlib_import_module() -> None:
     rc.check_importlib_import_module(_DIR, snapshot(0))
 
 
+# Flaky: the tree-wide regex scan usually finishes in well under a second, but
+# on a cold-cache offload run (sandbox I/O still saturated by the base image
+# build) it has blown the 10s pytest-timeout once and passed on retry.
+@pytest.mark.flaky
 def test_prevent_getattr() -> None:
     # config/key_resolver.py's _walk_to_field walks MngrConfig (and sub-model)
     # fields by name via the model_fields iterable (the override resolver looks up
@@ -103,7 +128,7 @@ def test_prevent_getattr() -> None:
     # (HOST_PROVISIONING_FIELD_MAP). Both are data-driven traversals where
     # the attribute name only exists in the map; static field access is not
     # possible.
-    rc.check_getattr(_DIR, snapshot(9))
+    rc.check_getattr(_DIR, snapshot(9), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 def test_prevent_setattr() -> None:
@@ -181,19 +206,19 @@ def test_prevent_init_docstrings() -> None:
 
 @pytest.mark.timeout(10)
 def test_prevent_args_in_docstrings() -> None:
-    rc.check_args_in_docstrings(_DIR, snapshot(0))
+    rc.check_args_in_docstrings(_DIR, snapshot(0), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 @pytest.mark.timeout(10)
 def test_prevent_returns_in_docstrings() -> None:
-    rc.check_returns_in_docstrings(_DIR, snapshot(0))
+    rc.check_returns_in_docstrings(_DIR, snapshot(0), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 # --- Type safety ---
 
 
 def test_prevent_literal_with_multiple_options() -> None:
-    rc.check_literal_with_multiple_options(_DIR, snapshot(1))
+    rc.check_literal_with_multiple_options(_DIR, snapshot(1), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 def test_prevent_bare_generic_types() -> None:
@@ -274,7 +299,7 @@ def test_prevent_bare_urwid_tty_signal_keys() -> None:
 # indirection the regex can't see through; safe in practice because the value
 # already includes the exact-match `=` prefix.
 def test_prevent_bare_tmux_targets() -> None:
-    rc.check_bare_tmux_targets(_DIR, snapshot(2))
+    rc.check_bare_tmux_targets(_DIR, snapshot(0))
 
 
 def test_prevent_direct_subprocess() -> None:
@@ -287,7 +312,7 @@ def test_prevent_direct_subprocess() -> None:
 
 
 def test_prevent_if_elif_without_else() -> None:
-    rc.check_if_elif_without_else(_DIR, snapshot(0))
+    rc.check_if_elif_without_else(_DIR, snapshot(0), excluded_patterns=_VENDORED_ATIF_PATTERNS)
 
 
 def test_prevent_inline_functions() -> None:
@@ -299,7 +324,15 @@ def test_prevent_underscore_imports() -> None:
 
 
 def test_prevent_init_methods_in_non_exception_classes() -> None:
-    rc.check_init_methods_in_non_exception_classes(_DIR, snapshot(3))
+    # 4: LazyProviderCliGroup (utils/click_utils.py) is a click.Group subclass whose
+    # __init__ stores the lazy loader that defers a provider's operator CLI (and its cloud
+    # SDK) off `mngr`'s startup path (MIND-179). A click.Group cannot be a pydantic model,
+    # so an __init__ is required here.
+    # 5: _WakeOnDirectoryChangeHandler (utils/file_watch.py) is a watchdog
+    # FileSystemEventHandler subclass whose __init__ stores the wake event it sets.
+    # watchdog keeps handlers in hash-based collections, so a pydantic model (whose
+    # value-based __eq__ breaks hashing) cannot be used; an __init__ is required here.
+    rc.check_init_methods_in_non_exception_classes(_DIR, snapshot(5))
 
 
 def test_prevent_cast_usage() -> None:
@@ -330,3 +363,10 @@ def test_prevent_code_in_init_files() -> None:
             'hookimpl = pluggy.HookimplMarker("mngr")',
         },
     )
+
+
+# --- Modal images ---
+
+
+def test_prevent_unpinned_modal_pip_install() -> None:
+    rc.check_unpinned_modal_pip_install(_DIR, snapshot(0))

@@ -27,6 +27,15 @@ function getUvBinDir() {
   return path.dirname(getUvPath());
 }
 
+/** macOS-only shim that shadows /usr/bin/install_name_tool for uv's spawns. */
+function getInstallNameToolShimPath() {
+  return path.join(getResourcesDir(), 'uv-shims', 'install_name_tool');
+}
+
+function getUvShimBinDir() {
+  return path.dirname(getInstallNameToolShimPath());
+}
+
 function getGitPath() {
   return path.join(getResourcesDir(), 'git', 'bin', 'git');
 }
@@ -107,6 +116,17 @@ function getLatchkeyCurlDispatchPath() {
  */
 function getLatchkeyPath() {
   if (isDev()) {
+    // Dev only: run the app against a latchkey checkout instead of the
+    // installed dependency, for testing an unreleased latchkey. The backend
+    // already publishes this path to the Python side as MINDS_LATCHKEY_BINARY
+    // and `minds run` already honors it, so an export here reaches the
+    // gateway and every `latchkey` subprocess minds spawns. A packaged build
+    // ignores it, mirroring getMindsRootName: a stale export from a parent
+    // shell must not be able to redirect a shipped binary.
+    const fromEnv = process.env.MINDS_LATCHKEY_BINARY;
+    if (fromEnv) {
+      return fromEnv;
+    }
     return path.join(__dirname, '..', 'node_modules', '.bin', 'latchkey');
   }
   return path.join(getResourcesDir(), 'latchkey', 'bin', 'latchkey');
@@ -180,13 +200,18 @@ function getBundledMindsRootName() {
 /**
  * Resolve the MINDS_ROOT_NAME the runtime should run as.
  *
+ * This is the tier -- which infrastructure the app talks to and which data
+ * directory it owns -- and has nothing to do with the release channel. A build
+ * is stamped with one tier for its whole life; switching channel moves which
+ * build you are offered, never where your data lives.
+ *
  * Precedence:
  *   1. The bundled root_name file (built into the app via
- *      MINDS_ROOT_NAME_BUNDLE) -- the production / staging / beta
- *      packaged-build case. Always wins so a user with a stale
- *      MINDS_ROOT_NAME export from a parent shell can't accidentally
- *      misdirect a packaged build.
- *   2. The process env MINDS_ROOT_NAME (the dev-mode `minds env activate`
+ *      MINDS_ROOT_NAME_BUNDLE) -- any packaged build, which today means
+ *      production ("minds") or staging ("minds-staging"). Always wins so a
+ *      user with a stale MINDS_ROOT_NAME export from a parent shell can't
+ *      accidentally misdirect a packaged build.
+ *   2. The process env MINDS_ROOT_NAME (the dev-mode `minds-admin env activate`
  *      case). Validated against the runtime regex.
  *   3. Default to 'minds' (production) for the case where dev mode
  *      runs without activation (the Python backend will then refuse to
@@ -202,7 +227,7 @@ function getMindsRootName() {
     if (!/^minds(-[a-z0-9][a-z0-9_-]{0,38}[a-z0-9])?$/.test(fromEnv)) {
       throw new Error(
         `MINDS_ROOT_NAME=${JSON.stringify(fromEnv)} does not match \`minds(-<env-name>)?\`. ` +
-          'Activate a valid env via `eval "$(minds env activate <name>)"` or unset the var.'
+          'Activate a valid env via `eval "$(minds-admin env activate <name>)"` or unset the var.'
       );
     }
     return fromEnv;
@@ -255,6 +280,7 @@ module.exports = {
   getResourcesDir,
   getUvPath,
   getUvBinDir,
+  getUvShimBinDir,
   getGitPath,
   getGitBinDir,
   getGitRootDir,

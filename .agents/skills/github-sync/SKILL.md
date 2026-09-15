@@ -2,6 +2,8 @@
 name: github-sync
 description: Enable, check, or disable GitHub sync for this workspace. Enabling creates a dedicated PRIVATE GitHub repo via latchkey, points origin at it, and auto-pushes every commit from every checkout. Workspace data under data/ is NOT synced to GitHub (the restic host backup covers it). Use when the user asks to back up / sync the workspace to GitHub, enable auto-push, or asks about GitHub sync status.
 compatibility: Requires latchkey (see the latchkey skill) and the user approving GitHub permissions in the Minds app.
+metadata:
+  author: imbue
 ---
 
 # GitHub sync
@@ -43,17 +45,27 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
 2. **Request GitHub permissions** through latchkey (see the latchkey skill
    for the permission-request mechanics). GitHub exposes two latchkey scopes
    and a permission request carries exactly one scope, so this is two
-   requests -- **fire both back-to-back, before any other GitHub call**, so
-   the user approves them in a single sitting. Never dribble out further
-   requests later in the flow.
+   requests. A request must be the **only** command in its tool call, so these
+   are two calls -- send them back to back; you do not have to wait for the
+   first verdict to file the second.
+   Do both **before any other GitHub call**, and say up front that two
+   approvals are coming so the user is not surprised by the second. Never
+   dribble out further requests later in the flow.
+
+   First call, on its own:
 
    ```bash
    latchkey curl -XPOST http://latchkey-self.invalid/permission-requests \
      -H 'Content-Type: application/json' \
-     -d '{"agent_id": "'"$MNGR_AGENT_ID"'", "type": "predefined", "payload": {"scope": "github-git", "permissions": ["github-git-read", "github-git-write"]}, "rationale": "GitHub sync: push this workspace'"'"'s branches to your private sync repo."}'
+     -d '{"agent_id": "'"${MINDS_CHAT_ID:-$MNGR_AGENT_ID}"'", "type": "predefined", "payload": {"scope": "github-git", "permissions": ["github-git-read", "github-git-write"]}, "rationale": "GitHub sync: push this workspace'"'"'s branches to your private sync repo."}'
+   ```
+
+   Then the second call, on its own:
+
+   ```bash
    latchkey curl -XPOST http://latchkey-self.invalid/permission-requests \
      -H 'Content-Type: application/json' \
-     -d '{"agent_id": "'"$MNGR_AGENT_ID"'", "type": "predefined", "payload": {"scope": "github-rest-api", "permissions": ["github-read-user", "github-read-repos", "github-write-all"]}, "rationale": "GitHub sync: create the private sync repo (needs github-write-all), confirm which GitHub account it lands under (github-read-user), and verify it stays private (github-read-repos)."}'
+     -d '{"agent_id": "'"${MINDS_CHAT_ID:-$MNGR_AGENT_ID}"'", "type": "predefined", "payload": {"scope": "github-rest-api", "permissions": ["github-read-user", "github-read-repos", "github-write-all"]}, "rationale": "GitHub sync: create the private sync repo (needs github-write-all), confirm which GitHub account it lands under (github-read-user), and verify it stays private (github-read-repos)."}'
    ```
 
    This exact permission set is what the flow needs -- do not trim it, or the
@@ -145,9 +157,11 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
    for b in $(git for-each-ref --format='%(refname:short)' refs/heads/ | grep -v -x -e "$(git branch --show-current)"); do git push origin "$b"; done
    ```
 
-9. **Add the service** by appending this block to `system/supervisord.conf`, then
+9. **Add the service** by writing this block to its own
+    `system/supervisord.conf.d/github-sync.conf`, then
     `supervisorctl reread && supervisorctl update` (see the update-app
-    skill):
+    skill). Its own file, not an append to the shared config, so enabling sync
+    never collides with an app being scaffolded at the same time:
 
     ```ini
     # Opt-in GitHub sync (added by the github-sync skill): keeps the gateway
@@ -171,14 +185,14 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
     stderr_logfile_backups=3
     ```
 
-10. **Commit the enablement** (`system/supervisord.conf`; the config file is
-    gitignored under `data/system/`). The now-active hook pushes the commit.
+10. **Commit the enablement** (`system/supervisord.conf.d/github-sync.conf`; the
+    config file is gitignored under `data/system/`). The now-active hook pushes
+    the commit.
 
 11. **Report**: the repo URL, that every commit now auto-pushes, that
     workspace data under `data/` stays out of GitHub (the restic host backup
-    covers it), and that pushes queue while their machine (the latchkey
-    gateway) is offline (on remote hosts the per-VPS secondary gateway
-    usually covers that).
+    covers it), and that pushes queue while the latchkey gateway is
+    unreachable and go out with the next commit once it is back.
 
 ## Status
 
@@ -205,8 +219,9 @@ via a restic backup restore, not via GitHub.
 Confirm with the user first, and ask separately whether to keep the remote
 repo (recommend keeping it -- it costs nothing and preserves history).
 
-1. `supervisorctl stop github-sync`, remove the `[program:github-sync]` block
-   from `system/supervisord.conf`, then `supervisorctl reread && supervisorctl update`.
+1. `supervisorctl stop github-sync`, delete
+   `system/supervisord.conf.d/github-sync.conf`, then
+   `supervisorctl reread && supervisorctl update`.
 2. `uv run github-sync unwire-git` (removes the gateway git config and the
    hooks path -- auto-push stops).
 3. Delete `data/system/github_sync.toml`.

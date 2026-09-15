@@ -26,7 +26,7 @@ import modal.exception
 from grpclib.exceptions import ProtocolError
 from grpclib.exceptions import StreamTerminatedError
 from modal.stream_type import StreamType as ModalStreamType
-from modal.volume import FileEntryType as ModalFileEntryType
+from modal.types import FileEntryType as ModalFileEntryType
 from pydantic import ConfigDict
 from pydantic import Field
 from tenacity import RetryCallState
@@ -34,6 +34,7 @@ from tenacity import retry
 from tenacity import retry_if_exception
 from tenacity import retry_if_exception_type
 from tenacity import stop_after_attempt
+from tenacity import stop_after_delay
 from tenacity import wait_exponential
 
 from imbue.modal_proxy.data_types import FileEntry
@@ -42,6 +43,7 @@ from imbue.modal_proxy.data_types import StreamType
 from imbue.modal_proxy.data_types import TunnelInfo
 from imbue.modal_proxy.errors import ModalProxyAppLockedError
 from imbue.modal_proxy.errors import ModalProxyAuthError
+from imbue.modal_proxy.errors import ModalProxyConnectionError
 from imbue.modal_proxy.errors import ModalProxyError
 from imbue.modal_proxy.errors import ModalProxyInternalError
 from imbue.modal_proxy.errors import ModalProxyInvalidError
@@ -50,6 +52,7 @@ from imbue.modal_proxy.errors import ModalProxyRateLimitError
 from imbue.modal_proxy.errors import ModalProxyRemoteError
 from imbue.modal_proxy.errors import ModalProxyTypeError
 from imbue.modal_proxy.errors import is_app_locked_error
+from imbue.modal_proxy.errors import is_deploy_function_vanished_error
 from imbue.modal_proxy.errors import is_environment_not_found_error
 from imbue.modal_proxy.interface import AppInterface
 from imbue.modal_proxy.interface import ExecOutput
@@ -89,6 +92,12 @@ def _translate_modal_error(e: modal.exception.Error) -> ModalProxyError:
         return ModalProxyRateLimitError(str(e))
     if isinstance(e, modal.exception.RemoteError):
         return ModalProxyRemoteError(str(e))
+    # The SDK raises this when it cannot open a connection to the control plane
+    # at all (it folds a connect timeout into the same class), so it is the one
+    # branch here that means "Modal was never reached" rather than "Modal said
+    # no". Callers act on that difference, so it must not fall through below.
+    if isinstance(e, modal.exception.ConnectionError):
+        return ModalProxyConnectionError(str(e))
     return ModalProxyError(str(e))
 
 
@@ -223,11 +232,24 @@ def _volume_wait(retry_state: RetryCallState) -> float:
 # persistent provider app) race and one fails with "The selected app is
 # locked". The lock clears as soon as the other deploy finishes, so retry with
 # backoff. min=2 because a deploy takes several seconds, so retrying sooner just
-# wastes attempts; max=15 and 6 attempts gives ~45s of headroom under the
-# 180s deploy subprocess timeout.
+# wastes attempts. The window is bounded by elapsed time rather than attempts
+# because contention is a queue: CI fans dozens of creates out against one
+# shared app name, and several CI runs can do so at once, so the lock can stay
+# held for minutes while the deploys behind it drain one by one. A deploy that
+# is merely queued must keep waiting rather than fail.
 _DEPLOY_LOCK_RETRY = retry_if_exception_type(ModalProxyAppLockedError)
-_DEPLOY_LOCK_STOP = stop_after_attempt(6)
-_DEPLOY_LOCK_WAIT = wait_exponential(multiplier=1, min=2, max=15)
+_DEPLOY_LOCK_RETRY_BUDGET_SECONDS = 300
+_DEPLOY_LOCK_MAX_BACKOFF_SECONDS = 15
+_DEPLOY_ATTEMPT_TIMEOUT_SECONDS = 180
+_DEPLOY_LOCK_STOP = stop_after_delay(_DEPLOY_LOCK_RETRY_BUDGET_SECONDS)
+_DEPLOY_LOCK_WAIT = wait_exponential(multiplier=1, min=2, max=_DEPLOY_LOCK_MAX_BACKOFF_SECONDS)
+# Upper bound on how long deploy() can block. The budget only gates whether
+# another attempt starts, so the last attempt can begin just under it (after a
+# full backoff) and still run to its own subprocess timeout. Callers that wait
+# on deploy() from another thread size their deadline from this.
+DEPLOY_MAX_DURATION_SECONDS = (
+    _DEPLOY_LOCK_RETRY_BUDGET_SECONDS + _DEPLOY_LOCK_MAX_BACKOFF_SECONDS + _DEPLOY_ATTEMPT_TIMEOUT_SECONDS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +368,14 @@ class DirectVolume(VolumeInterface):
 
     @_translate_exceptions
     @retry(retry=_VOLUME_RETRY, stop=_VOLUME_STOP, wait=_volume_wait, reraise=True)
+    def get_object_id(self) -> str:
+        # from_name hands back an unhydrated handle, so hydrating is what actually
+        # asks the server to resolve the name -- and raises NotFoundError if it cannot.
+        self.volume.hydrate()
+        return self.volume.object_id
+
+    @_translate_exceptions
+    @retry(retry=_VOLUME_RETRY, stop=_VOLUME_STOP, wait=_volume_wait, reraise=True)
     def listdir(self, path: str) -> list[FileEntry]:
         entries = self.volume.listdir(path)
         return [
@@ -427,8 +457,17 @@ class DirectSandbox(SandboxInterface):
         return DirectImage.model_construct(image=image)
 
     @_translate_exceptions
+    def poll(self) -> int | None:
+        return self.sandbox.poll()
+
+    @_translate_exceptions
     def terminate(self) -> None:
-        self.sandbox.terminate()
+        # wait=True blocks until the sandbox has actually terminated. Modal's V2
+        # terminate is otherwise fire-and-forget, so the sandbox keeps appearing
+        # in Sandbox.list and polling as running for a window afterward, which
+        # makes callers (e.g. start_host) mistake a just-terminated host for a
+        # live one. Synchronous termination also matches the FakeSandbox contract.
+        self.sandbox.terminate(wait=True)
 
 
 class DirectApp(AppInterface):
@@ -467,6 +506,14 @@ class DirectModalInterface(ModalInterface):
     """Implementation of ModalInterface that calls the real Modal Python SDK."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def model_post_init(self, context: Any) -> None:
+        # Opt every real Modal Sandbox operation into Modal's V2 Sandbox backend. Modal
+        # reads MODAL_SANDBOX_V2 from the environment live on each Sandbox call,
+        # and Sandbox.list only returns V2 sandboxes when it is set, so it must
+        # be process-wide rather than per-create. setdefault preserves an
+        # explicit MODAL_SANDBOX_V2=0 opt-out; GPU sandboxes fall back to V1.
+        os.environ.setdefault("MODAL_SANDBOX_V2", "1")
 
     # =====================================================================
     # Environment
@@ -654,7 +701,7 @@ class DirectModalInterface(ModalInterface):
             try:
                 result = subprocess.run(
                     cmd,
-                    timeout=180,
+                    timeout=_DEPLOY_ATTEMPT_TIMEOUT_SECONDS,
                     check=False,
                     capture_output=True,
                     text=True,
@@ -670,9 +717,11 @@ class DirectModalInterface(ModalInterface):
             output = (result.stdout + "\n" + result.stderr).strip()
             # A concurrent modification to the same app is transient: the lock
             # clears once the other operation finishes, so raise the retryable
-            # error type the deploy retry decorator rides through.
-            if is_app_locked_error(output):
-                raise ModalProxyAppLockedError(f"Failed to deploy {script_path} (app locked): {output}")
+            # error type the deploy retry decorator rides through. The race has
+            # two wire shapes -- the app lock, and the losing deploy's fresh
+            # function id vanishing when the winner finalizes a new version.
+            if is_app_locked_error(output) or is_deploy_function_vanished_error(output):
+                raise ModalProxyAppLockedError(f"Failed to deploy {script_path} (concurrent modification): {output}")
             raise ModalProxyError(f"Failed to deploy {script_path}: {output}")
 
     def enable_output_capture(

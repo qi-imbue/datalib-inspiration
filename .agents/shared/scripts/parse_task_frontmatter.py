@@ -6,11 +6,21 @@
 """Parse a worker task file's YAML frontmatter and emit its string fields.
 
 Pins the required schema so workers can't silently consume a task file
-whose `lead_agent` / `finish_report_path` was missing, misspelled, or the
-wrong type. Beyond those two, any additional top-level string fields
-the lead sets are passed through to the worker -- so leads can attach
-flow-specific context (a ticket id, a feature flag, a list of staged
-inputs) without each new key requiring a parser change.
+whose `finish_report_path` was missing, misspelled, or the wrong type.
+`lead_agent` is the dispatching agent's mngr id (an `agent-<hex>` value; older
+launchers stamped the lead's name, which a rename invalidates), normally
+stamped by `create_worker.py launch`; it is deliberately OPTIONAL here (absent
+-> warn on stderr, emit no line) because a task file can be authored by a
+*newer* flow than the launcher that provisioned the worker (update-self stages
+the target version's prose for an older lead), and a worker that finished its
+task must never be structurally unable to say so -- the delivery in
+`worker-reporting.md` is a write into the lead's work dir, falling back to
+the repo's main worktree. Beyond those, any additional top-level
+string fields the lead sets are passed through to the worker -- so leads
+can attach flow-specific context (a ticket id, a feature flag, a list of
+staged inputs) without each new key requiring a parser change. The launcher's
+`lead_work_dir` stamp (the lead's own checkout) reaches the worker that way,
+as `LEAD_WORK_DIR`, and is absent from the output when it was not stamped.
 
 The positional argument is a path that may contain a shell-style glob
 (e.g. ``data/.tasks/harden/*/task.md``). The helper resolves the
@@ -25,7 +35,7 @@ stdout (values quoted via ``shlex.quote`` so whitespace and shell
 metacharacters survive). The required fields come first in fixed
 order; any extra string fields follow alphabetically:
 
-    LEAD_AGENT=crystallize-test
+    LEAD_AGENT=agent-0123456789abcdef0123456789abcdef
     FINISH_REPORT_PATH=data/.tasks/harden/update-foo/reports/report.md
     TICKET_ID=task-42
 
@@ -54,7 +64,12 @@ from typing import Any
 
 import yaml
 
-_REQUIRED_FIELDS = ("lead_agent", "finish_report_path")
+_REQUIRED_FIELDS = ("finish_report_path",)
+# Optional address field: validated like a required field when present, but a
+# task file without it parses (with a stderr warning) -- see module docstring.
+_ADDRESS_FIELD = "lead_agent"
+# Fixed emission order for the well-known fields (address first when present).
+_ORDERED_KNOWN_FIELDS = (_ADDRESS_FIELD, *_REQUIRED_FIELDS)
 _SHELL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -101,21 +116,34 @@ def _split_frontmatter(text: str) -> dict[str, Any]:
 
 
 def parse(task_file: Path) -> dict[str, str]:
-    """Return all top-level string fields after validating the required ones.
+    """Return all top-level string fields after validating the well-known ones.
 
-    Required fields (``lead_agent``, ``finish_report_path``) must be present,
-    string-typed, and non-empty -- any violation raises ``ValueError``.
-    Beyond those, all other top-level string-valued keys are passed
-    through; non-string values are silently dropped. Extra keys must
-    also be valid POSIX shell identifiers (``[A-Za-z_][A-Za-z0-9_]*``)
-    so the downstream ``eval`` actually defines a variable rather than
-    silently parsing the rendered line as a command lookup.
+    Required fields (``finish_report_path``) must be present, string-typed,
+    and non-empty -- any violation raises ``ValueError``. ``lead_agent`` is
+    validated the same way when present, but its *absence* only warns on
+    stderr (see module docstring: a task file authored by a newer flow than
+    the launcher may legitimately lack it, and the worker then uses the
+    same-repo fallback delivery). Beyond those, all other top-level
+    string-valued keys are passed through; non-string values are silently
+    dropped. Extra keys must also be valid POSIX shell identifiers
+    (``[A-Za-z_][A-Za-z0-9_]*``) so the downstream ``eval`` actually defines
+    a variable rather than silently parsing the rendered line as a command
+    lookup.
     """
     if not task_file.is_file():
         raise ValueError(f"task file not found: {task_file}")
     frontmatter = _split_frontmatter(task_file.read_text(encoding="utf-8"))
-    for field in _REQUIRED_FIELDS:
+    for field in _REQUIRED_FIELDS + (_ADDRESS_FIELD,):
         if field not in frontmatter:
+            if field == _ADDRESS_FIELD:
+                print(
+                    f"warning: task frontmatter has no `{_ADDRESS_FIELD}` (the "
+                    "launcher predates launch-time stamping?); the lead's transcript "
+                    "cannot be read by id. Reporting is unaffected: write the report "
+                    "into the lead's work dir, per worker-reporting.md.",
+                    file=sys.stderr,
+                )
+                continue
             raise ValueError(f"frontmatter is missing required field `{field}`")
         value = frontmatter[field]
         if not isinstance(value, str):
@@ -130,7 +158,7 @@ def parse(task_file: Path) -> dict[str, str]:
         if isinstance(value, str) and value
     }
     for key in result:
-        if key in _REQUIRED_FIELDS:
+        if key in _ORDERED_KNOWN_FIELDS:
             continue
         if not _SHELL_IDENTIFIER_RE.match(key):
             raise ValueError(
@@ -143,8 +171,8 @@ def parse(task_file: Path) -> dict[str, str]:
 
 
 def _render(fields: dict[str, str]) -> str:
-    extras = sorted(key for key in fields if key not in _REQUIRED_FIELDS)
-    ordered = [*_REQUIRED_FIELDS, *extras]
+    extras = sorted(key for key in fields if key not in _ORDERED_KNOWN_FIELDS)
+    ordered = [*_ORDERED_KNOWN_FIELDS, *extras]
     lines = [
         f"{key.upper()}={shlex.quote(fields[key])}" for key in ordered if key in fields
     ]

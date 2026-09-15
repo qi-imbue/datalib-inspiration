@@ -379,7 +379,6 @@ def test_create_named_agent(e2e: E2eSession) -> None:
     )
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
@@ -539,7 +538,6 @@ def test_create_with_quiet_output(e2e: E2eSession) -> None:
 # in-process gRPC SDK inside the spawned `mngr` subprocess, which the resource
 # guard cannot track. With the mark, the guard's NEVER_INVOKED check fails the
 # test; without it there is no tracked Modal usage, so no violation.
-@pytest.mark.timeout(60)
 def test_create_copy(e2e: E2eSession) -> None:
     """Tutorial block:
         # you can create a full copy (an independent git mirror) instead of a worktree:
@@ -611,7 +609,6 @@ def test_create_copy(e2e: E2eSession) -> None:
 # This test also runs four sequential operations (pwd, create, list, and a
 # .git check), each performing full provider discovery, so it needs more than
 # the default 10s timeout.
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
@@ -732,7 +729,6 @@ def test_create_with_snapshot_fictional(e2e: E2eSession) -> None:
     )
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 # This test runs three sequential mngr operations (create, list, exec), each of

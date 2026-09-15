@@ -1,45 +1,68 @@
 """Unit tests for SSH key generation and management utilities."""
 
+import contextlib
 import socket
 import stat
+import subprocess
 import threading
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import paramiko
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.hazmat.primitives.serialization import PublicFormat
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.serialization import load_ssh_private_key
+from paramiko.common import AUTH_FAILED
+from paramiko.common import AUTH_SUCCESSFUL
+from paramiko.common import OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+from paramiko.common import OPEN_SUCCEEDED
 from pyinfra.api import Host as PyinfraHost
 
 from imbue.mngr.errors import MngrError
+from imbue.mngr.primitives import HostId
+from imbue.mngr.providers.host_key_store import HostKeyOrigin
+from imbue.mngr.providers.host_key_store import has_host_key_store
+from imbue.mngr.providers.host_key_store import load_host_key_record
+from imbue.mngr.providers.ssh_utils import SSH_BANNER_TIMEOUT_SECONDS
 from imbue.mngr.providers.ssh_utils import add_host_to_known_hosts
 from imbue.mngr.providers.ssh_utils import clear_host_from_known_hosts
 from imbue.mngr.providers.ssh_utils import create_pyinfra_host
+from imbue.mngr.providers.ssh_utils import ensure_per_host_known_hosts_link
 from imbue.mngr.providers.ssh_utils import format_as_known_hosts_address
 from imbue.mngr.providers.ssh_utils import generate_ed25519_host_keypair
 from imbue.mngr.providers.ssh_utils import generate_ssh_keypair
 from imbue.mngr.providers.ssh_utils import load_or_create_host_keypair
+from imbue.mngr.providers.ssh_utils import load_or_create_per_host_client_keypair
+from imbue.mngr.providers.ssh_utils import load_or_create_per_host_host_keypair
 from imbue.mngr.providers.ssh_utils import load_or_create_ssh_keypair
+from imbue.mngr.providers.ssh_utils import load_private_key_with_certificate_or_none
 from imbue.mngr.providers.ssh_utils import parse_openssh_public_key_blob
+from imbue.mngr.providers.ssh_utils import per_host_key_dir
+from imbue.mngr.providers.ssh_utils import read_host_public_key_with_legacy_fallback
+from imbue.mngr.providers.ssh_utils import read_served_host_key_or_none
+from imbue.mngr.providers.ssh_utils import resolve_per_host_client_keypair
+from imbue.mngr.providers.ssh_utils import resolve_per_host_host_keypair
 from imbue.mngr.providers.ssh_utils import save_ssh_keypair
+from imbue.mngr.providers.ssh_utils import ssh_certificate_path_for
 from imbue.mngr.providers.ssh_utils import wait_for_expected_host_key
 from imbue.mngr.providers.ssh_utils import wait_for_sshd
+from imbue.mngr.providers.ssh_utils import wait_for_sshd_with_retry
+from imbue.mngr.utils.testing import allow_warnings
 
 # =============================================================================
 # generate_ssh_keypair
 # =============================================================================
 
 
-def test_generate_ssh_keypair_rsa_4096_bits() -> None:
-    """The RSA key should be 4096 bits."""
-    private_pem, _ = generate_ssh_keypair()
-    private_key = load_pem_private_key(private_pem.encode("utf-8"), password=None)
-    assert isinstance(private_key, rsa.RSAPrivateKey)
-    assert private_key.key_size == 4096
+def test_generate_ssh_keypair_produces_ed25519_openssh_format() -> None:
+    """Client keypairs are Ed25519 (owner-exec envelope auth accepts only Ed25519)."""
+    private_pem, public_openssh = generate_ssh_keypair()
+    private_key = load_ssh_private_key(private_pem.encode("utf-8"), password=None)
+    assert isinstance(private_key, ed25519.Ed25519PrivateKey)
+    assert public_openssh.startswith("ssh-ed25519 ")
 
 
 def test_generate_ssh_keypair_each_call_produces_unique_keys() -> None:
@@ -55,15 +78,15 @@ def test_generate_ssh_keypair_each_call_produces_unique_keys() -> None:
 
 
 def test_save_ssh_keypair_writes_valid_keys_with_correct_permissions(tmp_path: Path) -> None:
-    """save_ssh_keypair should write PEM private key (0o600) and OpenSSH public key (0o644)."""
+    """save_ssh_keypair should write an OpenSSH private key (0o600) and OpenSSH public key (0o644)."""
     key_dir = tmp_path / "keys"
     private_path, public_path = save_ssh_keypair(key_dir)
 
     assert private_path == key_dir / "ssh_key"
     assert public_path == key_dir / "ssh_key.pub"
 
-    assert private_path.read_text().startswith("-----BEGIN RSA PRIVATE KEY-----")
-    assert public_path.read_text().startswith("ssh-rsa ")
+    assert private_path.read_text().startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
+    assert public_path.read_text().startswith("ssh-ed25519 ")
 
     assert stat.S_IMODE(private_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(public_path.stat().st_mode) == 0o644
@@ -72,11 +95,11 @@ def test_save_ssh_keypair_writes_valid_keys_with_correct_permissions(tmp_path: P
 def test_save_ssh_keypair_custom_key_name(tmp_path: Path) -> None:
     """save_ssh_keypair should use the provided key name."""
     key_dir = tmp_path / "keys"
-    private_path, public_path = save_ssh_keypair(key_dir, key_name="id_rsa")
-    assert private_path == key_dir / "id_rsa"
-    assert public_path == key_dir / "id_rsa.pub"
-    assert private_path.read_text().startswith("-----BEGIN RSA PRIVATE KEY-----")
-    assert public_path.read_text().startswith("ssh-rsa ")
+    private_path, public_path = save_ssh_keypair(key_dir, key_name="id_custom")
+    assert private_path == key_dir / "id_custom"
+    assert public_path == key_dir / "id_custom.pub"
+    assert private_path.read_text().startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
+    assert public_path.read_text().startswith("ssh-ed25519 ")
 
 
 def test_save_ssh_keypair_creates_parent_directories(tmp_path: Path) -> None:
@@ -98,7 +121,7 @@ def test_load_or_create_ssh_keypair_creates_keys_when_missing(tmp_path: Path) ->
     private_path, public_content = load_or_create_ssh_keypair(key_dir)
     assert private_path.exists()
     assert (key_dir / "ssh_key.pub").exists()
-    assert public_content.startswith("ssh-rsa ")
+    assert public_content.startswith("ssh-ed25519 ")
 
 
 def test_load_or_create_ssh_keypair_returns_existing_keys(tmp_path: Path) -> None:
@@ -179,7 +202,7 @@ def test_load_or_create_ssh_keypair_concurrent_first_creation_is_consistent(tmp_
 
     # The on-disk public key matches the private key (a real, parseable pair),
     # so no caller wrote a public key from a different generated keypair.
-    private_key = load_pem_private_key((key_dir / "vps_ssh_key").read_bytes(), password=None)
+    private_key = load_ssh_private_key((key_dir / "vps_ssh_key").read_bytes(), password=None)
     expected_public = (
         private_key.public_key().public_bytes(encoding=Encoding.OpenSSH, format=PublicFormat.OpenSSH).decode("utf-8")
     )
@@ -419,6 +442,190 @@ def test_add_host_to_known_hosts_preserves_different_key_types(tmp_path: Path) -
 
 
 # =============================================================================
+# store-backed shim behavior
+# =============================================================================
+
+
+def test_add_host_to_known_hosts_without_host_id_creates_no_pin_store(tmp_path: Path) -> None:
+    """Legacy callers (throwaway known_hosts files) must stay sidecar-free."""
+    known_hosts = tmp_path / "known_hosts"
+    add_host_to_known_hosts(known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza hostkey")
+    assert not has_host_key_store(known_hosts)
+
+
+def test_add_host_to_known_hosts_with_host_id_writes_through_the_store(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    host_id = HostId.generate()
+
+    add_host_to_known_hosts(known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza hostkey", host_id=host_id)
+
+    assert has_host_key_store(known_hosts)
+    assert known_hosts.read_text() == "example.com ssh-ed25519 AAAAC3Nza hostkey\n"
+    record = load_host_key_record(known_hosts, host_id)
+    assert record is not None
+    assert [pin.public_key for pin in record.pins] == ["ssh-ed25519 AAAAC3Nza hostkey"]
+
+
+def test_add_host_to_known_hosts_first_store_write_imports_existing_lines(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    add_host_to_known_hosts(known_hosts, "legacy.com", 22, "ssh-ed25519 AAAAC3Nza legacykey")
+
+    add_host_to_known_hosts(known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza newkey", host_id=HostId.generate())
+
+    content = known_hosts.read_text()
+    assert "legacy.com ssh-ed25519 AAAAC3Nza legacykey" in content
+    assert "example.com ssh-ed25519 AAAAC3Nza newkey" in content
+
+
+def test_add_host_to_known_hosts_routes_through_existing_store_without_host_id(tmp_path: Path) -> None:
+    """Once a file has a store, a host_id-less bootstrap add cannot displace a USER pin."""
+    known_hosts = tmp_path / "known_hosts"
+    host_id = HostId.generate()
+    add_host_to_known_hosts(
+        known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza userkey", host_id=host_id, origin=HostKeyOrigin.USER
+    )
+
+    add_host_to_known_hosts(known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza bootkey")
+
+    assert known_hosts.read_text() == "example.com ssh-ed25519 AAAAC3Nza userkey\n"
+
+
+def test_clear_host_from_known_hosts_drops_endpoint_pins_from_the_store(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    host_id = HostId.generate()
+    add_host_to_known_hosts(known_hosts, "example.com", 22, "ssh-ed25519 AAAAC3Nza hostkey", host_id=host_id)
+    add_host_to_known_hosts(known_hosts, "other.com", 22, "ssh-ed25519 AAAAC3Nza otherkey", host_id=host_id)
+
+    clear_host_from_known_hosts(known_hosts, "example.com", 22)
+
+    assert known_hosts.read_text() == "other.com ssh-ed25519 AAAAC3Nza otherkey\n"
+    record = load_host_key_record(known_hosts, host_id)
+    assert record is not None
+    assert [pin.address for pin in record.pins] == ["other.com"]
+
+
+# =============================================================================
+# per-host keypair helpers
+# =============================================================================
+
+
+def test_load_or_create_per_host_client_keypair_is_unique_per_host(tmp_path: Path) -> None:
+    first_host = HostId.generate()
+    second_host = HostId.generate()
+
+    first_path, first_public = load_or_create_per_host_client_keypair(
+        tmp_path, first_host, "docker_ssh_key", "known_hosts"
+    )
+    second_path, second_public = load_or_create_per_host_client_keypair(
+        tmp_path, second_host, "docker_ssh_key", "known_hosts"
+    )
+
+    assert first_path != second_path
+    assert first_public != second_public
+    assert first_path == per_host_key_dir(tmp_path, first_host) / "docker_ssh_key"
+
+
+def test_resolve_per_host_client_keypair_prefers_per_host_pair(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+    save_ssh_keypair(tmp_path, "docker_ssh_key")
+    per_host_path, per_host_public = load_or_create_per_host_client_keypair(
+        tmp_path, host_id, "docker_ssh_key", "known_hosts"
+    )
+
+    resolved_path, resolved_public = resolve_per_host_client_keypair(
+        tmp_path, host_id, "docker_ssh_key", "known_hosts"
+    )
+
+    assert resolved_path == per_host_path
+    assert resolved_public == per_host_public
+
+
+def test_resolve_per_host_client_keypair_falls_back_to_legacy_shared_pair(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+    legacy_path, legacy_public_path = save_ssh_keypair(tmp_path, "docker_ssh_key")
+
+    resolved_path, resolved_public = resolve_per_host_client_keypair(
+        tmp_path, host_id, "docker_ssh_key", "known_hosts"
+    )
+
+    assert resolved_path == legacy_path
+    assert resolved_public == legacy_public_path.read_text().strip()
+
+
+def test_resolve_per_host_client_keypair_creates_per_host_pair_when_neither_exists(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+
+    resolved_path, resolved_public = resolve_per_host_client_keypair(
+        tmp_path, host_id, "docker_ssh_key", "known_hosts"
+    )
+
+    assert resolved_path == per_host_key_dir(tmp_path, host_id) / "docker_ssh_key"
+    assert resolved_public.startswith("ssh-ed25519 ")
+
+
+def test_resolve_per_host_client_keypair_links_known_hosts_for_preexisting_per_host_pair(tmp_path: Path) -> None:
+    """A per-host pair minted before the sibling link existed gains the link on resolution."""
+    host_id = HostId.generate()
+    save_ssh_keypair(per_host_key_dir(tmp_path, host_id), "docker_ssh_key")
+
+    resolve_per_host_client_keypair(tmp_path, host_id, "docker_ssh_key", "known_hosts")
+
+    assert (per_host_key_dir(tmp_path, host_id) / "known_hosts").is_symlink()
+
+
+def test_resolve_per_host_host_keypair_falls_back_to_legacy_shared_pair(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+    legacy_path, legacy_public = load_or_create_host_keypair(tmp_path, "host_key")
+
+    resolved_path, resolved_public = resolve_per_host_host_keypair(tmp_path, host_id, "host_key")
+
+    assert resolved_path == legacy_path
+    assert resolved_public == legacy_public
+
+
+def test_read_host_public_key_with_legacy_fallback_prefers_per_host_key(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+    load_or_create_host_keypair(tmp_path, "host_key")
+    _, per_host_public = load_or_create_per_host_host_keypair(tmp_path, host_id, "host_key")
+
+    assert read_host_public_key_with_legacy_fallback(tmp_path, host_id, "host_key") == per_host_public
+
+
+def test_read_host_public_key_with_legacy_fallback_returns_none_when_neither_exists(tmp_path: Path) -> None:
+    assert read_host_public_key_with_legacy_fallback(tmp_path, HostId.generate(), "host_key") is None
+
+
+def test_ensure_per_host_known_hosts_link_reads_through_to_the_provider_file(tmp_path: Path) -> None:
+    """Key-sibling consumers (the forward tunnel) find the provider-wide pins next to a per-host key."""
+    host_id = HostId.generate()
+    add_host_to_known_hosts(tmp_path / "known_hosts", "example.com", 22, "ssh-ed25519 AAAAC3Nza hostkey")
+
+    ensure_per_host_known_hosts_link(tmp_path, host_id, "known_hosts")
+
+    sibling = per_host_key_dir(tmp_path, host_id) / "known_hosts"
+    assert sibling.is_symlink()
+    assert sibling.read_text() == "example.com ssh-ed25519 AAAAC3Nza hostkey\n"
+
+
+def test_ensure_per_host_known_hosts_link_sees_later_pins(tmp_path: Path) -> None:
+    """The link never goes stale: pins added after linking are visible through it."""
+    host_id = HostId.generate()
+    ensure_per_host_known_hosts_link(tmp_path, host_id, "known_hosts")
+
+    add_host_to_known_hosts(tmp_path / "known_hosts", "example.com", 22, "ssh-ed25519 AAAAC3Nza hostkey")
+
+    sibling = per_host_key_dir(tmp_path, host_id) / "known_hosts"
+    assert sibling.read_text() == "example.com ssh-ed25519 AAAAC3Nza hostkey\n"
+
+
+def test_ensure_per_host_known_hosts_link_is_idempotent(tmp_path: Path) -> None:
+    host_id = HostId.generate()
+    ensure_per_host_known_hosts_link(tmp_path, host_id, "known_hosts")
+    ensure_per_host_known_hosts_link(tmp_path, host_id, "known_hosts")
+    assert (per_host_key_dir(tmp_path, host_id) / "known_hosts").is_symlink()
+
+
+# =============================================================================
 # wait_for_sshd
 # =============================================================================
 
@@ -432,6 +639,128 @@ def test_wait_for_sshd_raises_on_non_listening_port() -> None:
 
     with pytest.raises(MngrError, match="SSH server not ready after"):
         wait_for_sshd("127.0.0.1", unused_port, timeout_seconds=0.0)
+
+
+# =============================================================================
+# wait_for_sshd_with_retry
+# =============================================================================
+
+# A username that never matches the local OS user, so a probe that forgot to
+# pass its username through (paramiko then defaults to getpass.getuser())
+# reliably fails these tests instead of accidentally passing.
+_TEST_SSH_USERNAME: str = "mngr-test-ssh-user"
+
+
+class _ConfigurableSshServer(paramiko.ServerInterface):
+    """In-process SSH server that accepts only a fixed username and public key."""
+
+    def __init__(self, allowed_username: str, allowed_public_key_blob: str, allow_sessions: bool) -> None:
+        self._allowed_username = allowed_username
+        self._allowed_public_key_blob = allowed_public_key_blob
+        self._allow_sessions = allow_sessions
+
+    def check_auth_publickey(self, username: str, key: paramiko.PKey) -> int:
+        if username == self._allowed_username and key.get_base64() == self._allowed_public_key_blob:
+            return AUTH_SUCCESSFUL
+        return AUTH_FAILED
+
+    def get_allowed_auths(self, username: str) -> str:
+        return "publickey"
+
+    def check_channel_request(self, kind: str, chanid: int) -> int:
+        if kind == "session" and self._allow_sessions:
+            return OPEN_SUCCEEDED
+        return OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+
+def _handle_test_ssh_connection(
+    client_sock: socket.socket,
+    host_key: paramiko.RSAKey,
+    server: paramiko.ServerInterface,
+) -> None:
+    transport = paramiko.Transport(client_sock)
+    transport.add_server_key(host_key)
+    try:
+        transport.start_server(server=server)
+    except (paramiko.SSHException, EOFError, OSError):
+        transport.close()
+
+
+def _accept_test_ssh_connections(
+    listening_sock: socket.socket,
+    host_key: paramiko.RSAKey,
+    allowed_username: str,
+    allowed_public_key_blob: str,
+    allow_sessions: bool,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            client_sock, _ = listening_sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            return
+        server = _ConfigurableSshServer(allowed_username, allowed_public_key_blob, allow_sessions)
+        threading.Thread(target=_handle_test_ssh_connection, args=(client_sock, host_key, server), daemon=True).start()
+
+
+@contextlib.contextmanager
+def _run_test_ssh_server(
+    allowed_username: str,
+    allowed_public_key_blob: str,
+    allow_sessions: bool,
+) -> Generator[int, None, None]:
+    """Run a loopback SSH server in a background thread, yielding its port."""
+    host_key = paramiko.RSAKey.generate(bits=1024)
+    listening_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listening_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listening_sock.bind(("127.0.0.1", 0))
+    listening_sock.listen(16)
+    listening_sock.settimeout(0.1)
+    stop_event = threading.Event()
+    accept_thread = threading.Thread(
+        target=_accept_test_ssh_connections,
+        args=(listening_sock, host_key, allowed_username, allowed_public_key_blob, allow_sessions, stop_event),
+        daemon=True,
+    )
+    accept_thread.start()
+    try:
+        yield listening_sock.getsockname()[1]
+    finally:
+        stop_event.set()
+        listening_sock.close()
+        accept_thread.join(timeout=2.0)
+
+
+def test_wait_for_sshd_with_retry_succeeds_when_server_accepts_auth_and_sessions(tmp_path: Path) -> None:
+    """The probe must authenticate as the given username (not the local OS user) and open a session."""
+    private_key_path, public_key_path = save_ssh_keypair(tmp_path)
+    public_key_blob = public_key_path.read_text().split()[1]
+
+    with _run_test_ssh_server(_TEST_SSH_USERNAME, public_key_blob, allow_sessions=True) as port:
+        wait_for_sshd_with_retry("127.0.0.1", port, 10.0, private_key_path, username=_TEST_SSH_USERNAME)
+
+
+def test_wait_for_sshd_with_retry_times_out_when_username_is_rejected(tmp_path: Path) -> None:
+    """A server that rejects the probe's username must produce the session-open timeout error."""
+    private_key_path, public_key_path = save_ssh_keypair(tmp_path)
+    public_key_blob = public_key_path.read_text().split()[1]
+
+    with _run_test_ssh_server(_TEST_SSH_USERNAME, public_key_blob, allow_sessions=True) as port:
+        with pytest.raises(MngrError, match="could not open sessions"):
+            wait_for_sshd_with_retry("127.0.0.1", port, 1.0, private_key_path, username="mngr-wrong-ssh-user")
+
+
+def test_wait_for_sshd_with_retry_times_out_when_sessions_are_refused(tmp_path: Path) -> None:
+    """Auth succeeding is not enough: a server that refuses session channels must time out."""
+    private_key_path, public_key_path = save_ssh_keypair(tmp_path)
+    public_key_blob = public_key_path.read_text().split()[1]
+
+    with _run_test_ssh_server(_TEST_SSH_USERNAME, public_key_blob, allow_sessions=False) as port:
+        with allow_warnings(match="Administratively prohibited"):
+            with pytest.raises(MngrError, match="could not open sessions"):
+                wait_for_sshd_with_retry("127.0.0.1", port, 1.0, private_key_path, username=_TEST_SSH_USERNAME)
 
 
 # =============================================================================
@@ -485,6 +814,9 @@ def test_create_pyinfra_host_configures_all_ssh_data(tmp_path: Path) -> None:
     assert host.data.get("ssh_user") == "root"
     assert host.data.get("ssh_key") == str(private_key_path)
     assert host.data.get("ssh_known_hosts_file") == str(known_hosts_path)
+    # The widened banner window must reach paramiko: a slow-but-working tunnel
+    # (e.g. a degraded Modal sandbox) needs more than paramiko's 15s default.
+    assert host.data.get("ssh_paramiko_connect_kwargs") == {"banner_timeout": SSH_BANNER_TIMEOUT_SECONDS}
 
 
 def test_create_pyinfra_host_uses_custom_ssh_user(tmp_path: Path) -> None:
@@ -501,3 +833,55 @@ def test_create_pyinfra_host_uses_custom_ssh_user(tmp_path: Path) -> None:
     )
 
     assert host.data.get("ssh_user") == "ubuntu"
+
+
+def test_read_served_host_key_or_none_is_none_for_a_closed_port() -> None:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+    assert read_served_host_key_or_none("127.0.0.1", closed_port, timeout_seconds=1.0) is None
+
+
+def _generate_certified_key(tmp_path: Path) -> Path:
+    """A fresh ed25519 key with a ``-cert.pub`` signed by a throwaway CA beside it."""
+    ca_path = tmp_path / "ca"
+    key_path = tmp_path / "id"
+    for path in (ca_path, key_path):
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)], check=True)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-s", str(ca_path), "-I", "test-identity", "-n", "mngr-vm", str(key_path) + ".pub"],
+        check=True,
+    )
+    return key_path
+
+
+def test_load_private_key_with_certificate_attaches_the_sibling_cert(tmp_path: Path) -> None:
+    key_path = _generate_certified_key(tmp_path)
+    assert ssh_certificate_path_for(key_path) == tmp_path / "id-cert.pub"
+    certified = load_private_key_with_certificate_or_none(key_path)
+    assert certified is not None
+    # paramiko records the loaded certificate as the key's public blob, which is
+    # what it offers the server in place of the raw public key.
+    assert certified.public_blob is not None
+    assert certified.public_blob.key_type == "ssh-ed25519-cert-v01@openssh.com"
+
+
+def test_load_private_key_with_certificate_returns_none_without_a_cert(tmp_path: Path) -> None:
+    key_path = tmp_path / "id"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)], check=True)
+    assert load_private_key_with_certificate_or_none(key_path) is None
+
+
+def test_create_pyinfra_host_hands_pyinfra_the_certified_key_through_its_connect_kwargs(tmp_path: Path) -> None:
+    key_path = _generate_certified_key(tmp_path)
+    known_hosts_path = tmp_path / "known_hosts"
+    known_hosts_path.write_text("")
+    pyinfra_host = create_pyinfra_host(
+        hostname="203.0.113.7", port=22001, private_key_path=key_path, known_hosts_path=known_hosts_path
+    )
+    connect_kwargs = pyinfra_host.data.ssh_paramiko_connect_kwargs
+    assert connect_kwargs["pkey"].public_blob.key_type == "ssh-ed25519-cert-v01@openssh.com"
+    # The plain key path still rides along for the OpenSSH-driven paths (rsync's
+    # ``-i``), which pick the ``-cert.pub`` up on their own.
+    assert pyinfra_host.data.ssh_key == str(key_path)

@@ -1,5 +1,6 @@
 import pytest
 
+from imbue.mngr_latchkey.core import HIDDEN_BUILTIN_SERVICES
 from imbue.mngr_latchkey.services_catalog import ServiceCatalogError
 from imbue.mngr_latchkey.services_catalog import ServicesCatalog
 from imbue.mngr_latchkey.store import LatchkeyPermissionsConfig
@@ -180,6 +181,20 @@ def test_default_catalog_reads_the_bundled_file() -> None:
     assert slack.name == "slack"
 
 
+def test_default_catalog_omits_hidden_builtin_services() -> None:
+    """Drift guard: services hidden from agents must not appear in the generated catalog.
+
+    ``scripts/generate_services_json.py`` skips them, so a regeneration that let
+    one back in would offer the user grants for a service whose credentials
+    latchkey never injects (and, for ``notion``, resurrect the confusion with
+    the separate ``notion-mcp`` integration).
+    """
+    service_names = ServicesCatalog().all_service_names()
+    assert len(HIDDEN_BUILTIN_SERVICES) > 0
+    for hidden_service_name in HIDDEN_BUILTIN_SERVICES:
+        assert hidden_service_name not in service_names
+
+
 # -- Additional (custom) services merged into the bundled catalog -------------
 
 
@@ -199,3 +214,18 @@ def test_additional_service_scope_resolves_to_its_service_name() -> None:
     """A granted additional-service scope maps back to its service name (credential-sync path)."""
     config = LatchkeyPermissionsConfig(rules=({"claude-ai": ["everything"]},))
     assert ServicesCatalog().services_for_permissions(config) == frozenset({"claude-ai"})
+
+
+# -- Service-level display names ----------------------------------------------
+
+
+def test_service_display_name_names_the_service_not_one_of_its_scopes() -> None:
+    catalog = ServicesCatalog()
+    # ``github`` exposes REST / GraphQL / git, each label disambiguated by a
+    # parenthetical; the connection spanning them carries the service's name.
+    assert [info.display_name for info in catalog.get("github")][0] == "GitHub (REST API)"
+    assert {info.service_display_name for info in catalog.get("github")} == {"GitHub"}
+    # A service the catalog gives no name of its own takes its scope's label,
+    # parenthetical and all -- there it is part of the name, not a scope marker.
+    assert catalog.get("notion-mcp")[0].service_display_name == "Notion (MCP)"
+    assert catalog.get("slack")[0].service_display_name == "Slack"

@@ -1,4 +1,5 @@
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -20,6 +21,7 @@ from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.concurrency_group.errors import ProcessError
 from imbue.concurrency_group.executor import ConcurrencyGroupExecutor
 from imbue.imbue_common.logging import log_span
+from imbue.imbue_common.pure import pure
 from imbue.mngr.errors import MngrError
 from imbue.mngr.interfaces.host import OuterHostInterface
 from imbue.mngr.primitives import DockerBuilder
@@ -31,7 +33,10 @@ from imbue.mngr.providers.ssh_host_setup import build_check_and_install_packages
 from imbue.mngr.providers.ssh_host_setup import build_configure_ssh_command
 from imbue.mngr.providers.ssh_host_setup import build_self_healing_host_entrypoint_command
 from imbue.mngr.providers.ssh_host_setup import build_start_sshd_command
+from imbue.mngr.providers.ssh_utils import clear_host_from_known_hosts
 from imbue.mngr.utils.git_utils import rsync_worktree_over_clone
+from imbue.mngr.utils.ssh import quote_ssh_option_value_for_shell
+from imbue.mngr_vps.data_types import ContainerFile
 from imbue.mngr_vps.errors import ContainerSetupError
 from imbue.mngr_vps.errors import VpsProvisioningError
 from imbue.mngr_vps.host_store import AGENTS_SUBPATH
@@ -59,6 +64,9 @@ HOST_DIR_SUBPATH: Final[str] = "host_dir"
 # the provider's ``volume_home_path`` is configured (e.g. /home/user symlinks
 # to <volume>/home and host_dir lives inside it as a plain directory).
 HOME_SUBPATH: Final[str] = "home"
+# Where that home subdirectory appears inside the container: the target of the
+# container home symlink ``setup_container_ssh`` creates.
+HOST_VOLUME_HOME_PATH: Final[str] = f"{HOST_VOLUME_MOUNT_PATH}/{HOME_SUBPATH}"
 
 # Shell command for the agent container's PID 1. Self-heals sshd on every
 # (re)start once mngr has provisioned a host key, so the container is reachable
@@ -134,6 +142,10 @@ def ensure_depot_token_available(builder: DockerBuilder) -> None:
 # attempts can resume rather than re-uploading completed bytes.
 _RSYNC_PARTIAL_DIR_REMOTE: Final[str] = "/tmp/mngr-rsync-partial"
 
+# How many trailing lines of EACH stream a failed docker build reports (the two
+# streams are tailed separately so one stream's noise cannot hide the other's error).
+_BUILD_FAILURE_TAIL_LINE_COUNT: Final[int] = 50
+
 # Backoff between attempts (entry N is the wait *before* attempt N+1). There is
 # one entry per retry gap; the total attempt count is derived from its length so
 # the two can never drift (the loop indexes this tuple on every non-last attempt).
@@ -160,13 +172,8 @@ _RETRYABLE_RSYNC_PATTERNS: Final[tuple[str, ...]] = (
 
 
 def remove_host_from_known_hosts(known_hosts_path: Path, hostname: str, port: int) -> None:
-    """Remove a host entry from the known_hosts file."""
-    if not known_hosts_path.exists():
-        return
-    host_pattern = hostname if port == 22 else f"[{hostname}]:{port}"
-    lines = known_hosts_path.read_text().splitlines(keepends=True)
-    filtered = [line for line in lines if not line.startswith(f"{host_pattern} ")]
-    known_hosts_path.write_text("".join(filtered))
+    """Remove a host entry from the known_hosts file (store-aware; see the shared shim)."""
+    clear_host_from_known_hosts(known_hosts_path, hostname, port)
 
 
 def redact_secret_env(remote_command: str) -> str:
@@ -305,6 +312,15 @@ def is_path_mounted_on_outer(outer: OuterHostInterface, path: Path) -> bool:
     """Return True iff ``path`` is currently a mountpoint on the outer."""
     result = outer.execute_idempotent_command(
         f"mountpoint -q {shlex.quote(str(path))}",
+        timeout_seconds=10.0,
+    )
+    return result.success
+
+
+def is_path_symlink_on_outer(outer: OuterHostInterface, path: Path) -> bool:
+    """Return True iff ``path`` is a symlink on the outer."""
+    result = outer.execute_idempotent_command(
+        f"test -L {shlex.quote(str(path))}",
         timeout_seconds=10.0,
     )
     return result.success
@@ -478,11 +494,14 @@ def provision_snapshot_helper_on_outer(
     enabled and active; the ``docker volume create`` is no-op-with-warning
     when the volume already exists.
 
-    Assumes ``inotify-tools`` and ``jq`` are already installed. The cloud-init
-    and SSH host-setup paths install both via the shared ``host_setup``
-    base-packages step; the slice path installs them in its lima VM provisioning
-    (``mngr_imbue_cloud.slices.lima_slice``: ``jq`` via the base lima script,
-    ``inotify-tools`` via its own provision step).
+    Assumes ``inotify-tools``, ``jq``, and ``perl`` are already installed. The
+    cloud-init and SSH host-setup paths install the first two via the shared
+    ``host_setup`` base-packages step; the slice path installs them in its lima
+    VM provisioning (``mngr_imbue_cloud.slices.lima_slice``: ``jq`` via the base
+    lima script, ``inotify-tools`` via its own provision step). ``perl`` (used by
+    the helper for its no-follow reads and writes of the trigger directory) is
+    ``perl-base``, Essential on every Debian-family image, so nothing installs
+    it explicitly.
     """
     helper_script = load_resource_text("snapshot_helper.sh")
     helper_service = load_resource_text("snapshot_helper.service")
@@ -634,9 +653,27 @@ def prepare_btrfs_on_outer(
     suitable for use as the ``device=`` value of a bind-options docker volume.
 
     Raises ``VpsProvisioningError`` if free space on ``/`` (after subtracting
-    ``outer_disk_reserved_gb``) is not positive, or if any setup step fails.
+    ``outer_disk_reserved_gb``) is not positive, if the mount path is a symlink
+    with nothing mounted at its target yet (the pre-mounted slice layout before
+    the VM's data-disk provisioning finishes), or if any setup step fails.
     """
     subvolume_path = btrfs_mount_path / host_id.get_uuid().hex
+
+    # Guard the slice case: a symlink at the mount path is the signature of a
+    # pre-mounted data disk (the VM's lima ``additionalDisk``, mounted elsewhere
+    # and symlinked here by guest provisioning). If nothing is mounted at its
+    # target yet, the pre-mounted branch below would not match and we would
+    # silently fall through to building a loop file on the VM's root disk -- a
+    # wrong-but-working state that masks the real volume (and its content) from
+    # then on. Refuse loudly instead; the caller retries once the VM's data-disk
+    # provisioning finishes.
+    is_mounted = is_path_mounted_on_outer(outer, btrfs_mount_path)
+    if not is_mounted and is_path_symlink_on_outer(outer, btrfs_mount_path):
+        raise VpsProvisioningError(
+            f"The btrfs mount path {btrfs_mount_path} is a symlink (pre-mounted data-disk layout) but "
+            f"nothing is mounted at its target yet; refusing to fall back to a loop file on the root "
+            f"disk. Wait for the VM's data-disk provisioning to finish and retry."
+        )
 
     # Pre-mounted-btrfs case (slices): the btrfs filesystem is already mounted at
     # ``btrfs_mount_path`` -- it's the VM's lima ``additionalDisk``, not a loop
@@ -644,7 +681,7 @@ def prepare_btrfs_on_outer(
     # "mount present AND our loop file absent" so a normal loop-backed VPS re-run
     # (loop file present) still takes the full path below. Just ensure btrfs-progs
     # and the per-host subvolume, then return.
-    if is_path_mounted_on_outer(outer, btrfs_mount_path) and not check_file_exists_on_outer(outer, loop_file_path):
+    if is_mounted and not check_file_exists_on_outer(outer, loop_file_path):
         with log_span("Using pre-mounted btrfs at {} (no loop image)", btrfs_mount_path):
             if not is_btrfs_progs_installed_on_outer(outer):
                 install_btrfs_progs_on_outer(outer)
@@ -720,18 +757,34 @@ def prepare_btrfs_on_outer(
     return subvolume_path
 
 
+# The btrfs qgroup that holds everything an agent host writes on a gen-2 slice's
+# data disk (its home subvolume and containerd's image/container layers), limited by the
+# guest's grow oneshot to the disk minus a system reserve. A data filesystem
+# without quotas (gen-1 boxes, plain VPS hosts) has no such group, and
+# subvolumes are then created unassigned.
+HOST_QUOTA_QGROUP: Final[str] = "1/0"
+
+
 def ensure_btrfs_subvolume_on_outer(outer: OuterHostInterface, subvolume_path: Path) -> None:
     """Create a btrfs subvolume at ``subvolume_path`` if it does not already exist.
 
     Idempotent: a re-run on an already-provisioned outer is a no-op. Raises
-    ``VpsProvisioningError`` if the create fails.
+    ``VpsProvisioningError`` if the create fails. On a quota-enabled filesystem the
+    subvolume joins :data:`HOST_QUOTA_QGROUP`.
     """
     if check_directory_exists_on_outer(outer, subvolume_path):
         return
+    quoted_path = shlex.quote(str(subvolume_path))
+    quoted_parent = shlex.quote(str(subvolume_path.parent))
     with log_span("Creating btrfs subvolume {}", subvolume_path):
+        # Join the host quota group when the filesystem has one (gen-2
+        # slices), so the new subvolume's usage counts against the host's
+        # single disk limit from its first write.
         _run_provisioning_step(
             outer,
-            f"btrfs subvolume create {shlex.quote(str(subvolume_path))}",
+            f"if btrfs qgroup show {quoted_parent} 2>/dev/null | grep -q '^{HOST_QUOTA_QGROUP} '; "
+            f"then btrfs subvolume create -i {HOST_QUOTA_QGROUP} {quoted_path}; "
+            f"else btrfs subvolume create {quoted_path}; fi",
             error_prefix=f"Failed to create btrfs subvolume at {subvolume_path}",
             timeout_seconds=30.0,
         )
@@ -818,6 +871,33 @@ def run_container(
     return container_id
 
 
+@pure
+def build_home_volume_symlink_command(container_home_path: str, volume_home_path: str) -> str:
+    """The in-container command that points the home directory at the host volume's home subdirectory.
+
+    ``ln -sfn`` alone would link *inside* an existing home directory, so the
+    image's (empty) directory is removed first; an existing symlink is left for
+    ``ln`` to replace, which keeps a re-run idempotent.
+    """
+    return " && ".join(
+        [
+            f"mkdir -p {shlex.quote(volume_home_path)}",
+            f"( [ -L {shlex.quote(container_home_path)} ] || rm -rf {shlex.quote(container_home_path)} )",
+            f"ln -sfn {shlex.quote(volume_home_path)} {shlex.quote(container_home_path)}",
+        ]
+    )
+
+
+@pure
+def build_write_container_file_command(container_file: ContainerFile) -> str:
+    """A shell command that writes ``container_file`` (creating its directory) with the given mode."""
+    directory = posixpath.dirname(container_file.path)
+    return (
+        f"mkdir -p {shlex.quote(directory)} && printf '%s' {shlex.quote(container_file.content)} > "
+        f"{shlex.quote(container_file.path)} && chmod {container_file.mode} {shlex.quote(container_file.path)}"
+    )
+
+
 def setup_container_ssh(
     outer: OuterHostInterface,
     container_name: str,
@@ -830,14 +910,15 @@ def setup_container_ssh(
     known_hosts_entries: tuple[str, ...],
     authorized_keys_entries: tuple[str, ...],
     home_volume_symlink: tuple[str, str] | None = None,
+    extra_ssh_config_files: Sequence[ContainerFile] = (),
 ) -> None:
     """Set up SSH inside the container via docker exec.
 
     Installs the required packages, points the container's mngr host_dir at
     the mounted volume, installs the client/host SSH keys, seeds known_hosts
-    and authorized_keys, and starts sshd. Pure-ish orchestration over
-    ``exec_in_container`` so both the VPS and Lima providers share it; the
-    caller supplies the keypairs it manages.
+    and authorized_keys, installs any extra sshd config files (CA trust), and
+    starts sshd. Pure-ish orchestration over ``exec_in_container`` so both the
+    VPS and Lima providers share it; the caller supplies the keypairs it manages.
 
     When ``home_volume_symlink`` is provided as ``(container_home_path,
     volume_home_path)``, the container home path is symlinked onto the
@@ -847,14 +928,9 @@ def setup_container_ssh(
     if home_volume_symlink is not None:
         container_home_path, volume_home_path = home_volume_symlink
         with log_span("Linking container home onto host volume"):
-            symlink_cmd = " && ".join(
-                [
-                    f"mkdir -p {shlex.quote(volume_home_path)}",
-                    f"( [ -L {shlex.quote(container_home_path)} ] || rm -rf {shlex.quote(container_home_path)} )",
-                    f"ln -sfn {shlex.quote(volume_home_path)} {shlex.quote(container_home_path)}",
-                ]
+            exec_in_container(
+                outer, container_name, build_home_volume_symlink_command(container_home_path, volume_home_path)
             )
-            exec_in_container(outer, container_name, symlink_cmd)
 
     with log_span("Installing packages in container"):
         install_cmd = build_check_and_install_packages_command(
@@ -879,6 +955,9 @@ def setup_container_ssh(
     auth_keys_cmd = build_add_authorized_keys_command("root", authorized_keys_entries)
     if auth_keys_cmd is not None:
         exec_in_container(outer, container_name, auth_keys_cmd)
+
+    for ssh_config_file in extra_ssh_config_files:
+        exec_in_container(outer, container_name, build_write_container_file_command(ssh_config_file))
 
     start_container_sshd(outer, container_name)
 
@@ -914,6 +993,7 @@ def build_ssh_transport_for_outer(outer: OuterHostInterface) -> tuple[str, str, 
     # so rsync's ssh subprocess uses the same trust store as the outer host.
     host_data = outer.connector.host.data
     known_hosts = host_data.get("ssh_known_hosts_file", "")
+    quoted_known_hosts = quote_ssh_option_value_for_shell(known_hosts)
     # Pass the SSH port explicitly. VPS outers listen on 22, but the lima
     # docker-mode outer is the VM reached via a Lima-forwarded port on
     # 127.0.0.1 (e.g. 38519). Without -p, rsync's ssh would connect to
@@ -922,7 +1002,7 @@ def build_ssh_transport_for_outer(outer: OuterHostInterface) -> tuple[str, str, 
     ssh_cmd = (
         f"ssh -i {shlex.quote(str(key_path))} "
         f"-p {port} "
-        f"-o UserKnownHostsFile={shlex.quote(str(known_hosts))} "
+        f"-o UserKnownHostsFile={quoted_known_hosts} "
         f"-o StrictHostKeyChecking=yes "
         f"-o BatchMode=yes "
         f"-o ConnectTimeout=15 "
@@ -1141,8 +1221,19 @@ def build_image_on_outer(
         timeout_seconds=timeout_seconds,
     )
     if not result.success:
-        tail = "\n".join((result.stdout + "\n" + result.stderr).splitlines()[-50:])
-        raise MngrError(f"Remote docker build failed: {tail}")
+        # Tail each stream separately: concatenating stdout+stderr and tailing the
+        # combination lets one stream's noise (e.g. buildkit progress on stderr)
+        # push the other stream's error text out of the window entirely. The exit
+        # code distinguishes "the build script really failed" from output that just
+        # stopped arriving.
+        stderr_tail = "\n".join(result.stderr.splitlines()[-_BUILD_FAILURE_TAIL_LINE_COUNT:])
+        stdout_tail = "\n".join(result.stdout.splitlines()[-_BUILD_FAILURE_TAIL_LINE_COUNT:])
+        exit_code_note = f"exit code {result.exit_code}" if result.exit_code is not None else "exit code unknown"
+        raise MngrError(
+            f"Remote docker build failed ({exit_code_note}).\n"
+            f"--- stderr tail ---\n{stderr_tail}\n"
+            f"--- stdout tail ---\n{stdout_tail}"
+        )
     return tag
 
 
@@ -1215,6 +1306,37 @@ def _clone_build_context_for_self_contained_git(local_context: Path, git_depth: 
     return clone_target
 
 
+def _raise_if_cwd_deleted_for_relative_context(docker_build_args: tuple[str, ...]) -> None:
+    """Fail legibly when a relative build context has no working directory to resolve against.
+
+    A relative context -- every ``[create_templates.*]`` block passes ``"."`` --
+    resolves against THIS process's cwd, so a deleted cwd makes the build
+    unsalvageable, and unrecognisably so. ``Path(".").exists()`` still returns
+    True (the process holds an open fd on the unlinked directory), so ``"."``
+    survives the is-it-a-path filter in the caller and then dies inside
+    ``Path.resolve()``'s ``os.getcwd()`` with a bare ``FileNotFoundError`` raised
+    from posixpath, naming nothing the operator can act on.
+
+    Resolving cwd-independently instead of raising would be strictly worse: the
+    context would filter out as nonexistent, ``context_args`` would come back
+    empty, and we would upload an *empty* build context and fail minutes later on
+    a missing Dockerfile, with nothing pointing at the real cause.
+
+    Scoped to relative contexts on purpose: an absolute context needs no cwd and
+    builds fine without one, so it must not be blocked here.
+    """
+    if not any(not arg.startswith("-") and not os.path.isabs(arg) for arg in docker_build_args):
+        return
+    try:
+        os.getcwd()
+    except FileNotFoundError as e:
+        raise MngrError(
+            "Cannot resolve a relative Docker build context: this process's working directory no longer "
+            "exists (it was deleted while create was running). The build context is resolved relative to "
+            "it, so the build cannot proceed."
+        ) from e
+
+
 def build_image_on_outer_from_build_args(
     outer: OuterHostInterface,
     cg: ConcurrencyGroup,
@@ -1242,6 +1364,8 @@ def build_image_on_outer_from_build_args(
     build_tag = f"mngr-build-{host_id}"
     remote_build_dir = f"/tmp/mngr-build-{host_id.get_uuid().hex}"
 
+    _raise_if_cwd_deleted_for_relative_context(docker_build_args)
+
     # Separate the build context path from other docker build args.
     # Docker build expects the last positional arg to be the context path.
     # We scan for args that look like local paths (not starting with --)
@@ -1259,6 +1383,10 @@ def build_image_on_outer_from_build_args(
     # _clone_build_context_for_self_contained_git for why.
     local_clone_dir: Path | None = None
     if context_args:
+        # A live cwd is guaranteed by the check at the top of this function, so
+        # resolve() is safe here. Note it must stay resolve() rather than
+        # normpath(): normpath collapses ".." lexically, which walks through a
+        # symlink to the wrong directory.
         local_context = Path(context_args[-1]).resolve()
         clone_target = _clone_build_context_for_self_contained_git(local_context, git_depth)
         if clone_target is not None:

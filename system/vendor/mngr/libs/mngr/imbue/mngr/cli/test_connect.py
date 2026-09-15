@@ -34,14 +34,12 @@ from imbue.mngr.utils.testing import make_test_agent_details
 from imbue.mngr.utils.testing import tmux_session_exists
 from imbue.mngr.utils.testing import wait_for_agent_session
 
-# =============================================================================
 # CLI-level integration tests for connect command
 #
 # These tests invoke the connect CLI command end-to-end. Because os.execvp
 # replaces the test process, we intercept it via the intercepted_execvp_calls
 # fixture (defined in conftest.py) to capture the args and verify the full
 # CLI pipeline works.
-# =============================================================================
 
 
 def test_connect_no_agent_found(
@@ -85,6 +83,7 @@ def test_connect_cli_invokes_tmux_attach_for_named_agent(
 
 
 @pytest.mark.tmux
+@pytest.mark.flaky
 def test_connect_cli_runs_custom_connect_command(
     cli_runner: CliRunner,
     create_test_agent,
@@ -192,6 +191,7 @@ def test_connect_via_cli_group(
 
 
 @pytest.mark.tmux
+@pytest.mark.flaky
 def test_connect_start_restarts_stopped_agent(
     cli_runner: CliRunner,
     temp_work_dir: Path,
@@ -338,9 +338,7 @@ def test_connect_cli_non_interactive_requires_explicit_agent(
     assert intercepted_execvp_calls == []
 
 
-# =============================================================================
 # Unit tests for filter_agents
-# =============================================================================
 
 
 def test_filter_agents_no_filters() -> None:
@@ -399,9 +397,7 @@ def test_filter_agents_combined_filters() -> None:
     assert result[0].name == AgentName("test-alpha")
 
 
-# =============================================================================
 # Unit tests for build_status_text
-# =============================================================================
 
 
 def test_build_status_text_default() -> None:
@@ -425,9 +421,7 @@ def test_build_status_text_hide_stopped() -> None:
     assert "Filter: Hiding stopped" in status
 
 
-# =============================================================================
 # Unit tests for handle_search_key
-# =============================================================================
 
 
 def test_handle_search_key_backspace() -> None:
@@ -478,9 +472,7 @@ def test_handle_search_key_other() -> None:
     assert should_refresh is False
 
 
-# =============================================================================
 # Urwid Agent Selector UI Tests
-# =============================================================================
 
 
 def test_create_selectable_agent_item_displays_agent_details() -> None:

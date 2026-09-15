@@ -1,7 +1,10 @@
 import os
 import platform
+import re
+import shlex
 import tempfile
 from pathlib import Path
+from typing import Final
 
 import yaml
 from loguru import logger
@@ -181,7 +184,7 @@ def _build_provisioning_script(
     """
     host_key_block = _build_host_key_block(host_private_key_pem, host_public_key_openssh)
     host_data_disk_block = _build_host_data_disk_block(host_data_disk_name, host_dir, volume_home_path)
-    root_authorized_keys_block = _build_root_authorized_keys_block(root_authorized_public_key)
+    root_authorized_keys_block = build_root_authorized_keys_block(root_authorized_public_key)
     # Permit key-based root login only when the agent runs as root; the default
     # (non-root) path leaves sshd's PermitRootLogin untouched.
     permit_root_login_line = "\nPermitRootLogin prohibit-password" if root_authorized_public_key is not None else ""
@@ -227,6 +230,19 @@ if ! grep -q '^MaxSessions' /etc/ssh/sshd_config 2>/dev/null; then
 MaxSessions 100
 MaxStartups 100:30:200{permit_root_login_line}
 SSHD_EOF
+    SSHD_CONFIG_CHANGED=1
+fi
+
+# OpenSSH >= 9.8 (e.g. Debian 13 guests) enables per-source penalties by
+# default. Under qemu user-mode networking every host-side connection reaches
+# the guest from the single NAT gateway address, so one authentication timeout
+# during a CPU-starved boot penalizes ALL of mngr's connections at once -- and
+# the resulting reconnect attempts keep the penalty window alive indefinitely,
+# leaving the VM permanently unreachable while perfectly healthy inside. The
+# keyword is fatal to older sshds (unknown options abort startup), so only set
+# it where this sshd already understands it.
+if sshd -T 2>/dev/null | grep -qi '^persourcepenalties' && ! grep -q '^PerSourcePenalties' /etc/ssh/sshd_config 2>/dev/null; then
+    echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config
     SSHD_CONFIG_CHANGED=1
 fi
 
@@ -279,18 +295,89 @@ fi
 """
 
 
-def _build_root_authorized_keys_block(root_authorized_public_key: str | None) -> str:
-    """Return a bash block that authorizes ``root_authorized_public_key`` for the VM's root user, or an inert comment."""
+def build_root_authorized_keys_block(root_authorized_public_key: str | None) -> str:
+    """Return a bash block that authorizes ``root_authorized_public_key`` for the VM's root user, or an inert comment.
+
+    Appends if absent rather than writing the file, because this block does not
+    own ``authorized_keys`` -- it only owns its own line in it. Other writers add
+    keys after the carve (the imbue_cloud connector injects the leasing user's
+    key at lease time), and lima re-runs provisioning on *every* start: a start
+    regenerates cidata with a fresh cloud-init instance-id, so cloud-init treats
+    the VM as new and replays every per-instance module. A truncating write here
+    therefore silently dropped the owner's key on the first restart after their
+    lease, leaving the VM reachable but rejecting them -- with no way back except
+    recreating the machine (see the slice-restart-wipes-owner-ssh-key runbook in the deploy docs).
+
+    Public (not ``_``-prefixed) because the operator key-repair sweep
+    (``repair-keys``) renders this same block when patching
+    existing slices' lima.yaml.
+    """
     if root_authorized_public_key is None:
         return "# (no client key to authorize for root)"
+    quoted_key = shlex.quote(root_authorized_public_key.strip())
     return f"""\
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-cat > /root/.ssh/authorized_keys <<'MNGR_LIMA_ROOT_KEY'
-{root_authorized_public_key.strip()}
-MNGR_LIMA_ROOT_KEY
-chmod 600 /root/.ssh/authorized_keys
+MNGR_LIMA_AK=/root/.ssh/authorized_keys
+touch "$MNGR_LIMA_AK"
+# A file not ending in a newline would otherwise absorb our key onto its last
+# line, corrupting both. Command substitution strips trailing newlines, so this
+# is non-empty only when the final byte is not one.
+if [ -n "$(tail -c1 "$MNGR_LIMA_AK")" ]; then printf '\\n' >> "$MNGR_LIMA_AK"; fi
+grep -qxF {quoted_key} "$MNGR_LIMA_AK" || printf '%s\\n' {quoted_key} >> "$MNGR_LIMA_AK"
+chmod 600 "$MNGR_LIMA_AK"
 chown -R root:root /root/.ssh"""
+
+
+# The truncating root-key step the pre-fix generator wrote into every VM's
+# provision script (see build_root_authorized_keys_block's docstring for the
+# incident it caused). The key line is captured so the patched block
+# re-asserts exactly the same key.
+_TRUNCATING_ROOT_KEY_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
+    r"mkdir -p /root/\.ssh\n"
+    r"chmod 700 /root/\.ssh\n"
+    r"cat > /root/\.ssh/authorized_keys <<'MNGR_LIMA_ROOT_KEY'\n"
+    r"(?P<key>[^\n]+)\n"
+    r"MNGR_LIMA_ROOT_KEY\n"
+    r"chmod 600 /root/\.ssh/authorized_keys\n"
+    r"chown -R root:root /root/\.ssh"
+)
+
+
+def patch_root_authorized_keys_block_in_lima_yaml(lima_yaml_text: str) -> str | None:
+    """Rewrite a stored lima.yaml's truncating root-key step to the current append-if-absent form.
+
+    Returns the patched YAML text, or None when nothing needed patching (the VM
+    was created after the generator fix, or a previous patch already ran). The
+    provision scripts are edited inside the parsed config and re-dumped with the
+    same settings :func:`write_lima_yaml` uses, so ``limactl`` keeps reading a
+    well-formed file. Used by the operator key-repair sweep
+    (``repair-keys``) to fix existing slices' stored configs in
+    place.
+    """
+    parsed = yaml.safe_load(lima_yaml_text)
+    if not isinstance(parsed, dict):
+        return None
+    provision_entries = parsed.get("provision")
+    if not isinstance(provision_entries, list):
+        return None
+    is_changed = False
+    updated_entries = []
+    for entry in provision_entries:
+        script = entry.get("script") if isinstance(entry, dict) else None
+        if isinstance(script, str) and _TRUNCATING_ROOT_KEY_BLOCK_RE.search(script):
+            patched_script = _TRUNCATING_ROOT_KEY_BLOCK_RE.sub(
+                lambda match: build_root_authorized_keys_block(match.group("key")),
+                script,
+            )
+            updated_entries.append({**entry, "script": patched_script})
+            is_changed = True
+        else:
+            updated_entries.append(entry)
+    if not is_changed:
+        return None
+    patched_config = {**parsed, "provision": updated_entries}
+    return yaml.dump(patched_config, default_flow_style=False, sort_keys=False)
 
 
 def _build_host_data_disk_block(
@@ -406,7 +493,22 @@ def _build_host_key_block(
     host_private_key_pem: str | None,
     host_public_key_openssh: str | None,
 ) -> str:
-    """Return a bash block that installs the given keypair as the guest's ed25519 sshd host key, or an inert comment when either argument is ``None``."""
+    """Return a bash block that installs the given keypair as the guest's ed25519 sshd host key, or an inert comment when either argument is ``None``.
+
+    The install deliberately reruns on EVERY boot, never at most once. Lima
+    regenerates cidata with a fresh instance-id on every ``limactl start``, so
+    cloud-init replays every per-instance module on every boot -- including its
+    ``ssh`` module (cc_ssh), whose default ``ssh_deletekeys: true`` deletes
+    ``/etc/ssh/ssh_host_*key*`` and regenerates random keys early in each boot
+    (the Debian genericcloud images ship no override). This block runs in the
+    final stage, after cc_ssh, and is what puts the pinned key back; guarding it
+    with a run-once marker leaves the VM serving an unpinned random key from its
+    second start on, which mngr's strict host-key pinning (correctly) refuses.
+    A host key the VM's owner rotated after first boot (e.g. imbue_cloud slice
+    adoption's user-origin key) is NOT this block's concern: cc_ssh has already
+    deleted it by the time this runs, and the adoption reconciler -- ordered
+    after cloud-final -- reinstalls it at the end of every boot.
+    """
     if host_private_key_pem is None or host_public_key_openssh is None:
         return "# (no pre-injected host key)"
     return f"""\

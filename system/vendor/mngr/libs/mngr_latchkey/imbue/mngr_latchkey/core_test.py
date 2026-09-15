@@ -3,30 +3,46 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
+import paramiko
 import psutil
 import pytest
 from loguru import logger
+from pydantic import Field
 from pydantic import PrivateAttr
-from watchdog.events import FileModifiedEvent
-from watchdog.observers import Observer
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
+from imbue.imbue_common.mutable_model import MutableModel
 from imbue.mngr.config.data_types import MngrContext
+from imbue.mngr.config.data_types import ProviderInstanceConfig
+from imbue.mngr.errors import HostAuthenticationError
+from imbue.mngr.errors import HostConnectionError
+from imbue.mngr.errors import HostNotFoundError
+from imbue.mngr.interfaces.host import OuterHostInterface
+from imbue.mngr.interfaces.provider_instance import ProviderInstanceInterface
 from imbue.mngr.primitives import AgentId
 from imbue.mngr.primitives import HostId
 from imbue.mngr.primitives import HostState
+from imbue.mngr.primitives import ProviderBackendName
+from imbue.mngr.primitives import ProviderInstanceName
+from imbue.mngr.utils.polling import wait_for
 from imbue.mngr_forward.ssh_tunnel import RemoteSSHInfo
 from imbue.mngr_forward.ssh_tunnel import SSHTunnelError
 from imbue.mngr_forward.ssh_tunnel import SSHTunnelManager
-from imbue.mngr_latchkey.additional_services import load_additional_service_registrations
+from imbue.mngr_forward.ssh_tunnel import SSHTunnelPhase
+from imbue.mngr_latchkey.additional_services import additional_service_registration_entries
 from imbue.mngr_latchkey.cli import _run_gateway_health_check_loop
 from imbue.mngr_latchkey.core import AGENT_SIDE_LATCHKEY_PORT
 from imbue.mngr_latchkey.core import CONFIG_FILENAME
 from imbue.mngr_latchkey.core import CredentialStatus
 from imbue.mngr_latchkey.core import HIDDEN_BUILTIN_SERVICES
+from imbue.mngr_latchkey.core import LATCHKEY_CREDENTIAL_TYPE_OAUTH
 from imbue.mngr_latchkey.core import LATCHKEY_MIN_VERSION
 from imbue.mngr_latchkey.core import Latchkey
 from imbue.mngr_latchkey.core import LatchkeyBinaryNotFoundError
@@ -38,21 +54,34 @@ from imbue.mngr_latchkey.core import MINDS_GOOGLE_OAUTH_CLIENT_ID
 from imbue.mngr_latchkey.core import MINDS_GOOGLE_OAUTH_CLIENT_SECRET
 from imbue.mngr_latchkey.core import MINDS_GOOGLE_OAUTH_SERVICES
 from imbue.mngr_latchkey.core import _log_gateway_output_line
-from imbue.mngr_latchkey.core import merge_hidden_builtin_services
+from imbue.mngr_latchkey.core import merge_minds_latchkey_config
+from imbue.mngr_latchkey.core import summarize_latchkey_failure
 from imbue.mngr_latchkey.discovery import LatchkeyDestructionHandler
 from imbue.mngr_latchkey.discovery import LatchkeyDiscoveryHandler
-from imbue.mngr_latchkey.discovery import _LatchkeyStateChangeHandler
+from imbue.mngr_latchkey.discovery import TRANSIENT_FAILURE_REPORT_THRESHOLD
+from imbue.mngr_latchkey.discovery import _ContainerEndpoint
+from imbue.mngr_latchkey.discovery import _GatewayRoute
+from imbue.mngr_latchkey.discovery import _RemoteWiringStep
+from imbue.mngr_latchkey.discovery import is_transient_remote_wiring_error
 from imbue.mngr_latchkey.encryption_key import load_or_create_encryption_key
-from imbue.mngr_latchkey.remote_gateway import RemoteGatewayError
-from imbue.mngr_latchkey.remote_gateway import local_credentials_path
+from imbue.mngr_latchkey.remote.errors import RemoteGatewayError
+from imbue.mngr_latchkey.remote.provisioning import DESKTOP_GATEWAY_VPS_PORT
 from imbue.mngr_latchkey.store import admin_permissions_path
 from imbue.mngr_latchkey.store import default_permissions_path
 from imbue.mngr_latchkey.store import ensure_browser_log_path
-from imbue.mngr_latchkey.store import permissions_path_for_host
-from imbue.mngr_latchkey.store import shared_schemas_path
-from imbue.mngr_latchkey.testing import FakeLatchkey
 
 _POLL_INTERVAL_SECONDS = 0.05
+
+
+@contextmanager
+def _captured_log_records() -> Iterator[list[tuple[str, str]]]:
+    """Collect every loguru record emitted inside the block as ``(level name, message)``."""
+    captured: list[tuple[str, str]] = []
+    sink_id = logger.add(lambda m: captured.append((m.record["level"].name, m.record["message"])), level=0)
+    try:
+        yield captured
+    finally:
+        logger.remove(sink_id)
 
 
 def test_gateway_output_is_routed_through_loguru() -> None:
@@ -61,17 +90,8 @@ def test_gateway_output_is_routed_through_loguru() -> None:
     This is what folds the gateway's otherwise-unstructured output into the
     supervisor's standard rotating, timestamped JSONL log.
     """
-    captured: list[tuple[str, str]] = []
-
-    def _sink(message: object) -> None:
-        record = message.record  # ty: ignore[unresolved-attribute]
-        captured.append((record["level"].name, record["message"]))
-
-    handler_id = logger.add(_sink, level="DEBUG", format="{message}")
-    try:
+    with _captured_log_records() as captured:
         _log_gateway_output_line("hello from the gateway\n", is_stdout=True)
-    finally:
-        logger.remove(handler_id)
 
     assert ("DEBUG", "[latchkey gateway] hello from the gateway") in captured
 
@@ -126,12 +146,10 @@ def test_start_gateway_raises_when_binary_disappears_after_initialize(tmp_path: 
 
 
 def _make_version_binary(tmp_path: Path, version_output: str, exit_code: int = 0) -> Path:
-    """Build a stub ``latchkey`` that responds to ``--version`` (and the no-op ``services`` calls).
+    """Build a stub ``latchkey`` that responds to ``--version``.
 
-    Sufficient for the ``initialize`` version-gate tests. The version-failure
-    tests never drive the manager past the version check; the version-success
-    tests proceed to additional-service registration, so ``services list`` /
-    ``services register`` are handled as no-ops to keep those clean.
+    Sufficient for the ``initialize`` version-gate tests: nothing else
+    ``initialize`` does runs the binary.
     """
     script = tmp_path / "latchkey"
     script.write_text(
@@ -140,11 +158,6 @@ def _make_version_binary(tmp_path: Path, version_output: str, exit_code: int = 0
         'if sys.argv[1] == "--version":\n'
         f"    print({version_output!r})\n"
         f"    sys.exit({exit_code})\n"
-        'if sys.argv[1:3] == ["services", "list"]:\n'
-        "    print('[]')\n"
-        "    sys.exit(0)\n"
-        'if sys.argv[1:3] == ["services", "register"]:\n'
-        "    sys.exit(0)\n"
         'raise AssertionError(f"unexpected argv: {sys.argv[1:]!r}")\n'
     )
     script.chmod(0o755)
@@ -201,79 +214,46 @@ def test_initialize_raises_when_version_command_exits_nonzero(tmp_path: Path) ->
 # -- initialize() additional-service registration ----------------------------
 
 
-def _make_registration_recording_binary(
-    tmp_path: Path,
-    existing_services: tuple[str, ...],
-    register_log_path: Path,
-) -> Path:
-    """Build a stub ``latchkey`` that records ``services register`` invocations.
+def test_initialize_registers_additional_services_in_latchkey_config(tmp_path: Path) -> None:
+    """``initialize`` registers the bundled additional services in latchkey's own config.json.
 
-    ``--version`` reports the minimum version; ``services list`` returns
-    ``existing_services`` as JSON; each ``services register <name>
-    --base-api-url <url>`` appends ``<name> <url>`` to ``register_log_path``.
-    Enough to assert which additional services ``initialize`` registers.
+    The registration is what lets a gateway resolve a request to a custom
+    service and inject its credentials, so it must be in place before anything
+    runs the CLI against this directory.
     """
-    script = tmp_path / "latchkey"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        'if sys.argv[1] == "--version":\n'
-        f"    print({LATCHKEY_MIN_VERSION!r})\n"
-        "    sys.exit(0)\n"
-        'if sys.argv[1:3] == ["services", "list"]:\n'
-        f"    print(json.dumps({list(existing_services)!r}))\n"
-        "    sys.exit(0)\n"
-        'if sys.argv[1:3] == ["services", "register"]:\n'
-        "    name = sys.argv[3]\n"
-        "    base_api_url = sys.argv[sys.argv.index('--base-api-url') + 1]\n"
-        f"    open({str(register_log_path)!r}, 'a').write(name + ' ' + base_api_url + '\\n')\n"
-        "    sys.exit(0)\n"
-        'raise AssertionError(f"unexpected argv: {sys.argv[1:]!r}")\n'
-    )
-    script.chmod(0o755)
-    return script
-
-
-def test_initialize_registers_additional_service_when_absent(tmp_path: Path) -> None:
-    """A bundled additional service not yet known to latchkey is registered at init."""
-    register_log = tmp_path / "register.log"
-    binary = _make_registration_recording_binary(tmp_path, existing_services=(), register_log_path=register_log)
+    binary = _make_version_binary(tmp_path, version_output=LATCHKEY_MIN_VERSION)
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
 
     manager.initialize()
 
-    # ``claude-ai`` is the seed additional service; it must be registered with
-    # its bundled base API URL.
-    assert "claude-ai https://claude.ai/\n" in register_log.read_text()
+    config = json.loads((tmp_path / CONFIG_FILENAME).read_text())
+    assert config["registeredServices"] == additional_service_registration_entries()
+    # ``claude-ai`` is the seed additional service, registered with its bundled
+    # base API URL and its browser sign-in.
+    assert config["registeredServices"]["claude-ai"]["baseApiUrl"] == "https://claude.ai/"
+    assert config["registeredServices"]["claude-ai"]["loginFlow"]["name"] == "cookie-capture"
 
 
-def test_initialize_skips_registration_when_service_already_present(tmp_path: Path) -> None:
-    """Registration is skipped for services latchkey already knows (register is not idempotent)."""
-    register_log = tmp_path / "register.log"
-    already_registered = tuple(registration.name for registration in load_additional_service_registrations())
-    binary = _make_registration_recording_binary(
-        tmp_path, existing_services=already_registered, register_log_path=register_log
+def test_initialize_preserves_a_users_own_latchkey_config(tmp_path: Path) -> None:
+    """Registering minds' services leaves everything else latchkey wrote in place."""
+    config_path = tmp_path / CONFIG_FILENAME
+    config_path.write_text(
+        json.dumps(
+            {
+                "browser": {"executablePath": "/usr/bin/chrome"},
+                "registeredServices": {"my-gitlab": {"baseApiUrl": "https://gitlab.example.com/api/v4/"}},
+            }
+        )
     )
+    binary = _make_version_binary(tmp_path, version_output=LATCHKEY_MIN_VERSION)
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
 
     manager.initialize()
 
-    assert not register_log.exists()
-
-
-def test_initialize_materializes_shared_schemas_file(tmp_path: Path) -> None:
-    """``initialize`` writes the shared additional-services schemas file the host baselines include."""
-    fake_binary = _make_fake_latchkey_binary(tmp_path)
-    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
-
-    manager.initialize()
-
-    shared_path = shared_schemas_path(manager.plugin_data_dir)
-    assert shared_path.is_file()
-    parsed = json.loads(shared_path.read_text())
-    # It is a schemas-only detent config carrying the additional-service schemas.
-    assert set(parsed.keys()) == {"schemas"}
-    assert "claude-ai" in parsed["schemas"]
+    config = json.loads(config_path.read_text())
+    assert config["browser"] == {"executablePath": "/usr/bin/chrome"}
+    assert config["registeredServices"]["my-gitlab"] == {"baseApiUrl": "https://gitlab.example.com/api/v4/"}
+    assert "claude-ai" in config["registeredServices"]
 
 
 def _make_fake_latchkey_binary(tmp_path: Path) -> Path:
@@ -326,15 +306,6 @@ def _make_fake_latchkey_binary(tmp_path: Path) -> Path:
         "    args = [a for a in sys.argv[3:] if not a.startswith('--')]\n"
         "    print(f'fake-jwt-for:{args[0]}' if args else 'fake-jwt')\n"
         "    sys.exit(0)\n"
-        # ``services list`` / ``services register`` are what
-        # ``Latchkey.initialize`` runs to register the additional (custom)
-        # services. Report an empty service list and accept every
-        # registration so initialize() completes cleanly.
-        'if sys.argv[1:3] == ["services", "list"]:\n'
-        "    print('[]')\n"
-        "    sys.exit(0)\n"
-        'if sys.argv[1:3] == ["services", "register"]:\n'
-        "    sys.exit(0)\n"
         # ``auth re-encrypt <destination> [service ...]`` writes a fake
         # filtered store as ``credentials.json.enc`` into the <destination>
         # directory, recording the requested services (and that stdin was
@@ -344,9 +315,13 @@ def _make_fake_latchkey_binary(tmp_path: Path) -> Path:
         "    import json as _json, os as _os\n"
         "    destination = sys.argv[3]\n"
         "    rest = sys.argv[4:]\n"
+        "    account = None\n"
+        "    if '--account' in rest:\n"
+        "        account = rest[rest.index('--account') + 1]\n"
+        "        rest = rest[: rest.index('--account')]\n"
         "    services = rest[1:] if rest[:1] == ['--services'] else []\n"
         "    stdin_key = sys.stdin.read()\n"
-        "    payload = {'services': services, 'reused_key': stdin_key == ''}\n"
+        "    payload = {'services': services, 'account': account, 'reused_key': stdin_key == ''}\n"
         "    out = _os.path.join(destination, 'credentials.json.enc')\n"
         "    open(out, 'w').write(_json.dumps(payload))\n"
         "    sys.exit(0)\n"
@@ -440,12 +415,15 @@ def test_start_gateway_drops_bundled_extensions(tmp_path: Path) -> None:
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
     manager.initialize()
     extensions_dir = tmp_path / "extensions"
-    assert not extensions_dir.exists()
+    extensions_dir.mkdir()
+    stale_remote_proxy = extensions_dir / "desktop_gateway_proxy.mjs"
+    stale_remote_proxy.write_text("// must not load on desktop\n")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
         port = manager.start_gateway(cg)
         assert _wait_for_listening("127.0.0.1", port)
         mjs_files = sorted(p.name for p in extensions_dir.iterdir() if p.suffix == ".mjs")
         assert mjs_files == ["minds_api_proxy.mjs", "permission_requests.mjs", "permissions.mjs"]
+        assert not stale_remote_proxy.exists()
         # The destination files must be non-empty -- ``importlib.resources``
         # silently produces empty reads if the wheel does not actually
         # ship the .mjs payloads.
@@ -489,58 +467,90 @@ def test_start_gateway_drops_bundled_extensions(tmp_path: Path) -> None:
         manager.stop_gateway()
 
 
-def test_merge_hidden_builtin_services_creates_config_when_absent() -> None:
-    merged = json.loads(merge_hidden_builtin_services(None))
-    assert merged == {"settings": {"hideBuiltinServices": list(HIDDEN_BUILTIN_SERVICES)}}
+def test_merge_minds_latchkey_config_creates_config_when_absent() -> None:
+    merged = json.loads(merge_minds_latchkey_config(None))
+    assert merged["settings"]["hideBuiltinServices"] == list(HIDDEN_BUILTIN_SERVICES)
     assert "notion" in merged["settings"]["hideBuiltinServices"]
+    # Every bundled additional service is registered with latchkey by this merge.
+    assert merged["registeredServices"] == additional_service_registration_entries()
 
 
-def test_merge_hidden_builtin_services_preserves_other_settings_and_keys() -> None:
+def test_merge_minds_latchkey_config_registers_claude_ai_with_its_browser_login() -> None:
+    """claude.ai is registered with the cookie-capture sign-in latchkey runs for it."""
+    merged = json.loads(merge_minds_latchkey_config(None))
+    claude = merged["registeredServices"]["claude-ai"]
+    assert claude["baseApiUrl"] == "https://claude.ai/"
+    assert claude["loginUrl"] == "https://claude.ai/login"
+    assert claude["loginFlow"] == {
+        "name": "cookie-capture",
+        "params": {"cookieKeys": ["sessionKey"], "cookieUrl": "https://claude.ai/"},
+    }
+
+
+def test_merge_minds_latchkey_config_preserves_other_settings_and_keys() -> None:
     existing = json.dumps(
         {
             "version": 3,
             "settings": {"someOtherSetting": True, "hideBuiltinServices": ["already-hidden"]},
+            "registeredServices": {"my-gitlab": {"baseApiUrl": "https://gitlab.example.com/api/v4/"}},
         }
     )
-    merged = json.loads(merge_hidden_builtin_services(existing))
+    merged = json.loads(merge_minds_latchkey_config(existing))
     # Unrelated top-level keys and unrelated settings are preserved verbatim.
     assert merged["version"] == 3
     assert merged["settings"]["someOtherSetting"] is True
     # Existing hidden entries are kept (in order) and the new ones appended.
     assert merged["settings"]["hideBuiltinServices"] == ["already-hidden", "notion"]
+    # A service the user registered themselves survives alongside minds' own.
+    assert merged["registeredServices"]["my-gitlab"] == {"baseApiUrl": "https://gitlab.example.com/api/v4/"}
+    assert "claude-ai" in merged["registeredServices"]
 
 
-def test_merge_hidden_builtin_services_is_idempotent() -> None:
-    once = merge_hidden_builtin_services(None)
-    twice = merge_hidden_builtin_services(once)
+def test_merge_minds_latchkey_config_rewrites_a_stale_registration() -> None:
+    """An install carrying an older definition of a minds service is updated, not left alone."""
+    existing = json.dumps({"registeredServices": {"claude-ai": {"baseApiUrl": "https://claude.ai/"}}})
+    merged = json.loads(merge_minds_latchkey_config(existing))
+    # The browser sign-in the older definition lacked is now present.
+    assert merged["registeredServices"]["claude-ai"]["loginFlow"]["name"] == "cookie-capture"
+
+
+def test_merge_minds_latchkey_config_is_idempotent() -> None:
+    once = merge_minds_latchkey_config(None)
+    twice = merge_minds_latchkey_config(once)
     assert json.loads(once) == json.loads(twice)
     # Applying it again does not duplicate the hidden entry.
     assert json.loads(twice)["settings"]["hideBuiltinServices"] == list(HIDDEN_BUILTIN_SERVICES)
 
 
-def test_merge_hidden_builtin_services_rejects_invalid_json() -> None:
+def test_merge_minds_latchkey_config_rejects_invalid_json() -> None:
     with pytest.raises(LatchkeyError, match="not valid JSON"):
-        merge_hidden_builtin_services("{not json")
+        merge_minds_latchkey_config("{not json")
 
 
-def test_merge_hidden_builtin_services_rejects_non_object_json() -> None:
+def test_merge_minds_latchkey_config_rejects_non_object_json() -> None:
     with pytest.raises(LatchkeyError, match="must be a JSON object"):
-        merge_hidden_builtin_services("[1, 2, 3]")
+        merge_minds_latchkey_config("[1, 2, 3]")
 
 
 def test_start_gateway_hides_builtin_services_in_config(tmp_path: Path) -> None:
-    """The gateway spawn step must merge the hidden built-in services into config.json."""
+    """The gateway spawn step must merge minds' config.json state in again.
+
+    ``initialize`` already wrote it; re-applying at spawn is what keeps a
+    directory current when the bundled definitions change under a long-lived
+    latchkey directory.
+    """
     fake_binary = _make_fake_latchkey_binary(tmp_path)
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
     manager.initialize()
     config_path = tmp_path / CONFIG_FILENAME
-    assert not config_path.exists()
+    config_path.unlink()
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
         port = manager.start_gateway(cg)
         assert _wait_for_listening("127.0.0.1", port)
         assert config_path.is_file()
         config = json.loads(config_path.read_text())
         assert "notion" in config["settings"]["hideBuiltinServices"]
+        assert "claude-ai" in config["registeredServices"]
         manager.stop_gateway()
 
 
@@ -916,8 +926,25 @@ def test_export_credentials_subset_passes_sorted_services_and_reuses_key(tmp_pat
     payload = json.loads((destination / "credentials.json.enc").read_text())
     # Sorted for a deterministic command line.
     assert payload["services"] == ["discord", "github", "slack"]
+    # No account filter unless one is asked for.
+    assert payload["account"] is None
     # Empty stdin (DEVNULL) means the same encryption key is reused.
     assert payload["reused_key"] is True
+
+
+def test_export_credentials_subset_narrows_to_one_account_when_asked(tmp_path: Path) -> None:
+    """``account`` scopes the bundle to one account of the selected services (``--account``)."""
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    manager.initialize()
+    destination = tmp_path / "subset"
+    destination.mkdir()
+
+    manager.export_credentials_subset(destination, {"slack"}, account="me@example.com")
+
+    payload = json.loads((destination / "credentials.json.enc").read_text())
+    assert payload["services"] == ["slack"]
+    assert payload["account"] == "me@example.com"
 
 
 def test_export_credentials_subset_rejects_empty_service_set(tmp_path: Path) -> None:
@@ -1089,11 +1116,22 @@ def test_discovery_handler_spawns_shared_gateway_for_every_provider(
             tunnel_manager.cleanup()
 
 
+def _instance_tag(agent_id: AgentId, host_id: HostId) -> str:
+    """The instance key string (reverse-tunnel tag / pending key) for one agent instance.
+
+    Deliberately not ``AgentInstanceKey.build``: the tests spell out the
+    serialized ``<agent_id>@<host_id>`` form independently of the production
+    helper.
+    """
+    return f"{agent_id}@{host_id}"
+
+
 class _RecordingTunnelManager(SSHTunnelManager):
     """SSHTunnelManager that records setup/remove calls instead of doing SSH."""
 
     _calls: list[tuple[RemoteSSHInfo, int, int, str | None]] = PrivateAttr(default_factory=list)
     _removed_agent_ids: list[str] = PrivateAttr(default_factory=list)
+    _removed_endpoints: list[tuple[RemoteSSHInfo, int]] = PrivateAttr(default_factory=list)
 
     def setup_reverse_tunnel(
         self,
@@ -1109,9 +1147,15 @@ class _RecordingTunnelManager(SSHTunnelManager):
         self._removed_agent_ids.append(agent_id)
         return 0
 
+    def remove_reverse_tunnel(self, ssh_info: RemoteSSHInfo, local_port: int) -> bool:
+        self._removed_endpoints.append((ssh_info, local_port))
+        return False
 
-class _RaisingTunnelManager(SSHTunnelManager):
-    """SSHTunnelManager whose reverse-tunnel setup always fails (no SSH)."""
+
+class _ConfigurableFailureTunnelManager(_RecordingTunnelManager):
+    """Recording tunnel manager whose setups raise whatever error the test sets, and succeed otherwise."""
+
+    _error_to_raise: BaseException | None = PrivateAttr(default=None)
 
     def setup_reverse_tunnel(
         self,
@@ -1120,10 +1164,9 @@ class _RaisingTunnelManager(SSHTunnelManager):
         remote_port: int = 0,
         agent_id: str | None = None,
     ) -> int:
-        raise SSHTunnelError("simulated reverse-tunnel failure")
-
-    def remove_reverse_tunnels_for_agent(self, agent_id: str) -> int:
-        return 0
+        if self._error_to_raise is not None:
+            raise self._error_to_raise
+        return super().setup_reverse_tunnel(ssh_info, local_port, remote_port, agent_id)
 
 
 def test_discovery_handler_sets_up_reverse_tunnel_when_ssh_info_given(
@@ -1134,6 +1177,7 @@ def test_discovery_handler_sets_up_reverse_tunnel_when_ssh_info_given(
     manager.initialize()
     tunnel_manager = _RecordingTunnelManager()
     agent_id = AgentId()
+    host_id = HostId()
     # The ``local`` provider has no outer host, so the handler falls back to the
     # desktop-side reverse tunnel (rather than the VPS-resident gateway path).
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=22, key_path=tmp_path / "k")
@@ -1149,7 +1193,7 @@ def test_discovery_handler_sets_up_reverse_tunnel_when_ssh_info_given(
             concurrency_group=cg,
             mngr_ctx=temp_mngr_ctx,
         )
-        handler(agent_id, HostId(), ssh_info, "local", HostState.RUNNING)
+        handler(agent_id, host_id, ssh_info, "local", HostState.RUNNING)
 
         assert manager.is_gateway_running
         # ``start_gateway`` is idempotent and returns the bound port even
@@ -1167,10 +1211,12 @@ def test_discovery_handler_sets_up_reverse_tunnel_when_ssh_info_given(
 
         # Exactly one reverse tunnel, bridging the dynamic host-side gateway port
         # to the fixed agent-side port on the container's loopback. The tunnel
-        # must also be tagged with the owning agent's id, so the destruction
+        # must also be tagged with the owning agent instance, so the destruction
         # handler can find and tear it down via remove_reverse_tunnels_for_agent;
         # without that tag the original CPU leak would re-surface.
-        assert tunnel_manager._calls == [(ssh_info, host_side_port, AGENT_SIDE_LATCHKEY_PORT, str(agent_id))]
+        assert tunnel_manager._calls == [
+            (ssh_info, host_side_port, AGENT_SIDE_LATCHKEY_PORT, _instance_tag(agent_id, host_id))
+        ]
 
         manager.stop_gateway()
 
@@ -1223,36 +1269,592 @@ def test_discovery_handler_swallows_gateway_errors(tmp_path: Path, temp_mngr_ctx
     assert tunnel_manager._calls == []
 
 
+# The VPS endpoint the stub handlers below resolve every host to.
+_VPS_OUTER_SSH_INFO = RemoteSSHInfo(user="root", host="vps.example.test", port=22, key_path=Path("/tmp/vps-key"))
+# The container endpoint discovery reports for a host in the route-resolution tests below.
+_CONTAINER_SSH_INFO = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=Path("/tmp/k"))
+
+
 class _ProvisionRecordingHandler(LatchkeyDiscoveryHandler):
-    """Handler stub that forces the VPS branch and records provisioning instead of running it."""
+    """Handler stub that records VPS gateway provisioning passes instead of running them."""
 
     _provisioned: list[tuple[AgentId, HostId]] = PrivateAttr(default_factory=list)
 
-    def _host_has_outer_host(self, host_id: HostId, provider_name: str) -> bool:
-        return True
-
-    def _run_remote_gateway_provisioning(
+    def _provision_remote_gateway_for_agent(
         self,
         agent_id: AgentId,
         host_id: HostId,
         ssh_info: RemoteSSHInfo,
         provider_name: str,
     ) -> None:
-        try:
-            self._provisioned.append((agent_id, host_id))
-            with self._remote_hosts_lock:
-                self._provisioned_hosts.add(str(host_id))
-        finally:
-            with self._remote_hosts_lock:
-                self._provisioning_hosts.discard(str(host_id))
-            with self._pending_lock:
-                self._pending_remote_agents.discard(str(agent_id))
+        del ssh_info, provider_name
+        self._provisioned.append((agent_id, host_id))
+        with self._remote_hosts_lock:
+            self._provisioned_hosts.add(str(host_id))
+        self._record_wiring_step_success(host_id, _RemoteWiringStep.VPS_GATEWAY_PROVISIONING)
 
 
-def test_discovery_handler_dispatches_vps_provisioning_in_addition_to_desktop_tunnel(
+class _FixedVpsRouteHandler(_ProvisionRecordingHandler):
+    """Recording handler that resolves every host to the same VPS outer endpoint, forcing the VPS branch."""
+
+    def _resolve_gateway_route(
+        self, host_id: HostId, provider_name: str, ssh_info: RemoteSSHInfo
+    ) -> _GatewayRoute | None:
+        del host_id, provider_name
+        return _GatewayRoute(
+            outer_ssh_info=_VPS_OUTER_SSH_INFO, container_endpoint=_ContainerEndpoint.from_ssh_info(ssh_info)
+        )
+
+
+def test_discovery_does_not_cache_an_unresolvable_gateway_route(tmp_path: Path, temp_mngr_ctx: MngrContext) -> None:
+    """An unresolvable route must be retried, never remembered as "use the desktop gateway".
+
+    A provider the supervisor cannot resolve (e.g. registered in settings after
+    it started) previously pinned the workspace to the desktop gateway for the
+    supervisor's whole lifetime, so its VPS gateway was never provisioned.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    host_id = HostId()
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+
+        assert handler._resolve_gateway_route(host_id, "not-a-configured-provider", _CONTAINER_SSH_INFO) is None
+        assert handler._gateway_route_by_host_id == {}
+        # Still unresolved (and still not cached) on the next cycle.
+        assert handler._resolve_gateway_route(host_id, "not-a-configured-provider", _CONTAINER_SSH_INFO) is None
+        assert handler._gateway_route_by_host_id == {}
+
+
+class _StubProvider(MutableModel):
+    """Provider stub whose host lives at whatever outer endpoint the test currently says.
+
+    Assigning ``outer_ssh_info`` models a workspace restored onto new coordinates
+    by someone other than this client: the outer endpoint changes under a host id
+    that stays the same. Counts how often its listing is reset and its outer host
+    opened, so a test can tell one re-resolution from a re-resolution on every
+    cycle.
+    """
+
+    outer_ssh_info: RemoteSSHInfo = Field(description="The outer endpoint the host is currently reached at")
+    _reset_count: int = PrivateAttr(default=0)
+    _outer_host_open_count: int = PrivateAttr(default=0)
+    # Called on every reset, so a test can observe the handler's state at that moment.
+    _on_reset: Callable[[], None] | None = PrivateAttr(default=None)
+
+    def reset_caches(self) -> None:
+        self._reset_count += 1
+        if self._on_reset is not None:
+            self._on_reset()
+
+    @contextmanager
+    def outer_host_for(self, host_id: HostId) -> Iterator[OuterHostInterface | None]:
+        del host_id
+        self._outer_host_open_count += 1
+        yield cast(OuterHostInterface, _StubOuterHost(ssh_connection_info=self.outer_ssh_info))
+
+
+class _StaleListingProvider(_StubProvider):
+    """Stub provider whose host listing is stale until ``reset_caches`` is called.
+
+    Models the shape of ``imbue_cloud``'s ``_leased_hosts_cache``: a whole-listing
+    cache with no expiry, so a host leased after the listing was taken is
+    invisible (``HostNotFoundError``) until the cache is dropped.
+    """
+
+    _is_listing_fresh: bool = PrivateAttr(default=False)
+
+    def reset_caches(self) -> None:
+        super().reset_caches()
+        self._is_listing_fresh = True
+
+    @contextmanager
+    def outer_host_for(self, host_id: HostId) -> Iterator[OuterHostInterface | None]:
+        if not self._is_listing_fresh:
+            raise HostNotFoundError(ProviderInstanceName("stale"), host_id)
+        with super().outer_host_for(host_id) as outer:
+            yield outer
+
+
+class _StubOuterHost(MutableModel):
+    """Minimal non-local outer host exposing only what route resolution reads."""
+
+    ssh_connection_info: RemoteSSHInfo = Field(description="Endpoint returned by get_ssh_connection_info")
+
+    @property
+    def is_local(self) -> bool:
+        return False
+
+    def get_ssh_connection_info(self) -> tuple[str, str, int, Path]:
+        info = self.ssh_connection_info
+        return info.user, info.host, info.port, info.key_path
+
+    def get_ssh_known_hosts_path(self) -> Path | None:
+        return self.ssh_connection_info.known_hosts_path
+
+
+class _StubProviderHandler(_ProvisionRecordingHandler):
+    """Recording handler that resolves routes through a single stub provider."""
+
+    provider: _StubProvider = Field(description="The stub provider every lookup returns")
+
+    def _provider_for_route(self, provider_name: str) -> ProviderInstanceInterface:
+        del provider_name
+        return cast(ProviderInstanceInterface, self.provider)
+
+
+def test_discovery_refreshes_a_stale_provider_listing_before_giving_up(
     tmp_path: Path, temp_mngr_ctx: MngrContext
 ) -> None:
-    """A VPS agent gets BOTH the desktop reverse tunnel and the VPS-resident gateway provisioning."""
+    """A host missing from the provider's cached listing must trigger a refresh, not a fallback.
+
+    The supervisor keeps one long-lived provider instance, and some providers
+    cache their entire host listing on it with no expiry. Every workspace created
+    after that listing was taken then looked non-existent, so it was served by
+    the desktop gateway and never got a VPS gateway at all -- until the app was
+    restarted.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    host_id = HostId()
+    outer_ssh_info = RemoteSSHInfo(user="root", host="vps.example.test", port=22, key_path=tmp_path / "vps-key")
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _StubProviderHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+            provider=_StaleListingProvider(outer_ssh_info=outer_ssh_info),
+        )
+
+        route = handler._resolve_gateway_route(host_id, "imbue_cloud", _CONTAINER_SSH_INFO)
+
+        assert route is not None
+        assert route.outer_ssh_info == outer_ssh_info
+        assert handler.provider._reset_count == 1
+        # The now-known VPS route is cached, so the refresh happens once.
+        assert handler._gateway_route_by_host_id == {str(host_id): route}
+
+
+def test_discovery_caches_the_desktop_route_for_a_provider_without_an_outer_host(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """A provider with no outer host at all is a static answer, so it is cached."""
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    host_id = HostId()
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+
+        route = handler._resolve_gateway_route(host_id, "local", _CONTAINER_SSH_INFO)
+        assert route is not None
+        assert route.outer_ssh_info is None
+        assert handler._gateway_route_by_host_id == {str(host_id): route}
+
+
+def test_discovery_warns_once_per_host_and_rearms_after_a_resolution(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """The unresolved-route warning is per host, and re-arms once the route resolves.
+
+    A workspace served by the desktop gateway without a permissions override is
+    denied everything, so this must be visible -- but not once per discovery
+    cycle forever.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    host_id = HostId()
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+
+        handler._warn_unresolved_gateway_route(host_id, "not-a-configured-provider")
+        handler._warn_unresolved_gateway_route(host_id, "not-a-configured-provider")
+        assert handler._unresolved_route_hosts == {str(host_id)}
+
+        # A successful resolution re-arms the warning for a later failure.
+        assert handler._resolve_gateway_route(host_id, "local", _CONTAINER_SSH_INFO) is not None
+        assert handler._unresolved_route_hosts == set()
+
+
+class _ReloadingHandler(LatchkeyDiscoveryHandler):
+    """Handler whose provider-config reload returns a fixed synthetic provider set."""
+
+    def _load_provider_instance_configs(self) -> dict[ProviderInstanceName, ProviderInstanceConfig] | None:
+        return {
+            ProviderInstanceName("vultr-added-later"): ProviderInstanceConfig(backend=ProviderBackendName("vultr"))
+        }
+
+
+def test_reload_provider_config_picks_up_a_new_provider_and_forgets_routes(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """SIGHUP must refresh the supervisor's own provider view, not just the observe child.
+
+    Otherwise a workspace on a provider the desktop client registered mid-session
+    is unresolvable until the whole app restarts.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    host_id = HostId()
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _ReloadingHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        # A route resolved against the previous provider set.
+        assert handler._resolve_gateway_route(host_id, "local", _CONTAINER_SSH_INFO) is not None
+        original_host_dir = handler.mngr_ctx.config.default_host_dir
+
+        handler.reload_provider_config()
+
+        assert ProviderInstanceName("vultr-added-later") in handler.mngr_ctx.config.providers
+        # Stale route verdicts are dropped so the new provider set is consulted.
+        assert handler._gateway_route_by_host_id == {}
+        # Only the provider mapping is replaced; the rest of the config survives.
+        assert handler.mngr_ctx.config.default_host_dir == original_host_dir
+
+
+def _wait_for_provisioning_passes(handler: _ProvisionRecordingHandler, expected_count: int) -> None:
+    """Wait for ``expected_count`` provisioning passes to have run *and* released the in-flight guard."""
+
+    def is_done() -> bool:
+        with handler._remote_hosts_lock:
+            is_idle = not handler._provisioning_hosts
+        return len(handler._provisioned) >= expected_count and is_idle
+
+    wait_for(
+        is_done, poll_interval=_POLL_INTERVAL_SECONDS, error_message="the handler's worker did not finish in time"
+    )
+
+
+@contextmanager
+def _relocatable_handler(
+    tmp_path: Path, temp_mngr_ctx: MngrContext, tunnel_manager: SSHTunnelManager
+) -> Iterator[tuple[_StubProviderHandler, _StubProvider, int]]:
+    """A running gateway plus a handler whose host starts at ``_VPS_OUTER_SSH_INFO``; yields the host-side port too.
+
+    Workers are awaited by the test inside the block, so the gateway is stopped
+    before the CG exits and joins them.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    manager.initialize()
+    provider = _StubProvider(outer_ssh_info=_VPS_OUTER_SSH_INFO)
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _StubProviderHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+            provider=provider,
+        )
+        try:
+            yield handler, provider, manager.start_gateway(cg)
+        finally:
+            manager.stop_gateway()
+
+
+# Where the host in the relocation tests is restored to: a new box, so a new
+# address and freshly picked ports for both the VM-root and the container sshd.
+_MOVED_VPS_OUTER_SSH_INFO = RemoteSSHInfo(
+    user="root", host="vps-2.example.test", port=22004, key_path=Path("/tmp/vps-key")
+)
+_MOVED_CONTAINER_SSH_INFO = RemoteSSHInfo(user="root", host="vps-2.example.test", port=22005, key_path=Path("/tmp/k"))
+
+
+def test_discovery_follows_a_host_restored_onto_new_coordinates(tmp_path: Path, temp_mngr_ctx: MngrContext) -> None:
+    """A host whose container endpoint moves is re-resolved, re-tunneled and re-provisioned on that same cycle.
+
+    An operator migration or a start from another device recreates the VM at a
+    new address and ports under the same host id. Every cached decision -- the
+    gateway route, the provider's lease listing, the desktop-to-VPS tunnel and
+    the provisioned marker -- still describes the old VM, so latchkey stayed
+    broken until the app was restarted. The container endpoint discovery reports
+    each cycle is already correct after the move, so it is what invalidates them.
+    """
+    tunnel_manager = _RecordingTunnelManager()
+    agent_id = AgentId()
+    host_id = HostId()
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+        calls_before_move = list(tunnel_manager._calls)
+
+        # The workspace is restored elsewhere: the provider now answers with the
+        # new outer endpoint, and discovery reports the new container endpoint.
+        provider.outer_ssh_info = _MOVED_VPS_OUTER_SSH_INFO
+        handler._run_remote_setup(agent_id, host_id, _MOVED_CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 2)
+
+    tag = _instance_tag(agent_id, host_id)
+    assert calls_before_move == [(_VPS_OUTER_SSH_INFO, host_side_port, DESKTOP_GATEWAY_VPS_PORT, tag)]
+    # Exactly one re-resolution, on fresh provider data.
+    assert provider._reset_count == 1
+    assert provider._outer_host_open_count == 2
+    # The new desktop->VPS tunnel targets the new outer endpoint, and the tunnel
+    # to the old one is removed by its exact key rather than by agent tag.
+    assert tunnel_manager._calls == [
+        *calls_before_move,
+        (_MOVED_VPS_OUTER_SSH_INFO, host_side_port, DESKTOP_GATEWAY_VPS_PORT, tag),
+    ]
+    assert (_VPS_OUTER_SSH_INFO, host_side_port) in tunnel_manager._removed_endpoints
+    assert tunnel_manager._removed_agent_ids == []
+    # One fresh provisioning pass restores the recreated VM's gateway.
+    assert handler._provisioned == [(agent_id, host_id), (agent_id, host_id)]
+    cached_route = handler._gateway_route_by_host_id[str(host_id)]
+    assert cached_route.outer_ssh_info == _MOVED_VPS_OUTER_SSH_INFO
+    assert cached_route.container_endpoint == _ContainerEndpoint.from_ssh_info(_MOVED_CONTAINER_SSH_INFO)
+
+
+def test_discovery_keeps_the_cached_route_while_the_host_stays_put(tmp_path: Path, temp_mngr_ctx: MngrContext) -> None:
+    """A host discovered again at the same container endpoint costs no provider call and no re-provisioning."""
+    tunnel_manager = _RecordingTunnelManager()
+    agent_id = AgentId()
+    host_id = HostId()
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+        # The second cycle dispatches nothing new, so there is no worker to wait
+        # on; the assertions below are on the synchronous part of the cycle.
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+
+    tag = _instance_tag(agent_id, host_id)
+    assert provider._reset_count == 0
+    assert provider._outer_host_open_count == 1
+    # The desktop->VPS tunnel is (idempotently) ensured on every cycle, always
+    # against the same outer endpoint; nothing is torn down by outer endpoint.
+    assert tunnel_manager._calls == [(_VPS_OUTER_SSH_INFO, host_side_port, DESKTOP_GATEWAY_VPS_PORT, tag)] * 2
+    assert (_VPS_OUTER_SSH_INFO, host_side_port) not in tunnel_manager._removed_endpoints
+    assert handler._provisioned == [(agent_id, host_id)]
+
+
+def test_outer_tunnel_failure_marks_the_cached_route_stale_so_the_next_cycle_re_resolves(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """Failing to reach the cached outer endpoint stops the route being reused instead of retrying it forever.
+
+    Guards the case the endpoint comparison cannot see: the next cycle asks the
+    provider (on refreshed data) where the host is now, rather than streaking
+    against an endpoint that may no longer exist.
+    """
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = SSHTunnelError("Unable to connect to port 22002", SSHTunnelPhase.HOST_CONNECT)
+    agent_id = AgentId()
+    host_id = HostId()
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+        with handler._remote_hosts_lock:
+            routes_after_failure = dict(handler._gateway_route_by_host_id)
+        reset_count_after_failure = provider._reset_count
+
+        tunnel_manager._error_to_raise = None
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+
+    # The failed cycle marked the route stale and refreshed the provider's listing.
+    assert routes_after_failure[str(host_id)].is_stale
+    assert reset_count_after_failure == 1
+    # The next cycle re-resolved (one more outer open), cached the fresh route
+    # and wired the tunnel.
+    assert provider._outer_host_open_count == 2
+    assert len(tunnel_manager._calls) == 1
+    assert handler._gateway_route_by_host_id[str(host_id)] == _GatewayRoute(
+        outer_ssh_info=_VPS_OUTER_SSH_INFO, container_endpoint=_ContainerEndpoint.from_ssh_info(_CONTAINER_SSH_INFO)
+    )
+
+
+def test_outer_tunnel_failure_of_this_devices_own_end_keeps_the_cached_route(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """A LOCAL_SETUP tunnel failure says nothing about where the host is, so the route (and listing) stay.
+
+    Such a failure (trust material missing on this device) persists, so
+    forgetting the route would re-list the provider's hosts on every cycle.
+    """
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = SSHTunnelError("No known_hosts file at /tmp/kh", SSHTunnelPhase.LOCAL_SETUP)
+    agent_id = AgentId()
+    host_id = HostId()
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+
+    assert provider._reset_count == 0
+    assert provider._outer_host_open_count == 1
+    assert handler._gateway_route_by_host_id[str(host_id)] == _GatewayRoute(
+        outer_ssh_info=_VPS_OUTER_SSH_INFO, container_endpoint=_ContainerEndpoint.from_ssh_info(_CONTAINER_SSH_INFO)
+    )
+
+
+def test_retiring_a_route_refreshes_the_provider_listing_before_it_stops_being_reused(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """The retired route is still cached, and still fresh, when the provider's caches are reset, on both paths.
+
+    The other agents on a host run their own workers in the same cycle; one that
+    re-resolves the instant the entry is gone must already find fresh data, or
+    it re-caches the old outer endpoint under the new container endpoint and the
+    move becomes invisible to the endpoint comparison.
+    """
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    agent_id = AgentId()
+    host_id = HostId()
+    routes_at_reset: list[dict[str, _GatewayRoute]] = []
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+
+        def snapshot_routes() -> None:
+            with handler._remote_hosts_lock:
+                routes_at_reset.append(dict(handler._gateway_route_by_host_id))
+
+        provider._on_reset = snapshot_routes
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+        route_before_move = handler._gateway_route_by_host_id[str(host_id)]
+
+        # Retire path 1: the host moved.
+        provider.outer_ssh_info = _MOVED_VPS_OUTER_SSH_INFO
+        handler._run_remote_setup(agent_id, host_id, _MOVED_CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 2)
+        route_after_move = handler._gateway_route_by_host_id[str(host_id)]
+
+        # Retire path 2: the tunnel to the (re-resolved) outer endpoint fails.
+        tunnel_manager._error_to_raise = SSHTunnelError("Unable to connect to port 22004", SSHTunnelPhase.HOST_CONNECT)
+        handler._run_remote_setup(agent_id, host_id, _MOVED_CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+
+    assert routes_at_reset == [{str(host_id): route_before_move}, {str(host_id): route_after_move}]
+    assert route_before_move != route_after_move
+
+
+def test_a_move_reported_after_an_outer_tunnel_failure_is_still_followed(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """The route a tunnel failure marks stale still identifies the move discovery reports on a later cycle.
+
+    A migration takes the old VM down before the connector reports the new
+    coordinates, so the desktop-to-VPS tunnel fails first. The stale route must
+    stay cached as the comparison's baseline: without it, the cycle that reports
+    the new coordinates would resolve them as if the host had always been
+    there, so the recreated VM's gateway would never be provisioned and the
+    tunnel to the old VM never removed.
+    """
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    agent_id = AgentId()
+    host_id = HostId()
+    with _relocatable_handler(tmp_path, temp_mngr_ctx, tunnel_manager) as (handler, provider, host_side_port):
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+
+        # The old VM is gone, but discovery still reports its coordinates.
+        tunnel_manager._error_to_raise = SSHTunnelError("Unable to connect to port 22", SSHTunnelPhase.HOST_CONNECT)
+        handler._run_remote_setup(agent_id, host_id, _CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        with handler._remote_hosts_lock:
+            route_after_failure = handler._gateway_route_by_host_id[str(host_id)]
+
+        # The workspace is restored elsewhere and discovery catches up.
+        tunnel_manager._error_to_raise = None
+        provider.outer_ssh_info = _MOVED_VPS_OUTER_SSH_INFO
+        handler._run_remote_setup(agent_id, host_id, _MOVED_CONTAINER_SSH_INFO, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 2)
+
+    tag = _instance_tag(agent_id, host_id)
+    assert route_after_failure == _GatewayRoute(
+        outer_ssh_info=_VPS_OUTER_SSH_INFO,
+        container_endpoint=_ContainerEndpoint.from_ssh_info(_CONTAINER_SSH_INFO),
+        is_stale=True,
+    )
+    # The move was recognized against the stale route: one fresh provisioning
+    # pass, and the tunnel to the old outer endpoint removed by its exact key.
+    assert handler._provisioned == [(agent_id, host_id), (agent_id, host_id)]
+    assert (_VPS_OUTER_SSH_INFO, host_side_port) in tunnel_manager._removed_endpoints
+    assert tunnel_manager._calls[-1] == (_MOVED_VPS_OUTER_SSH_INFO, host_side_port, DESKTOP_GATEWAY_VPS_PORT, tag)
+    assert handler._gateway_route_by_host_id[str(host_id)] == _GatewayRoute(
+        outer_ssh_info=_MOVED_VPS_OUTER_SSH_INFO,
+        container_endpoint=_ContainerEndpoint.from_ssh_info(_MOVED_CONTAINER_SSH_INFO),
+    )
+
+
+class _RetryingProvisionRecordingHandler(_FixedVpsRouteHandler):
+    """Handler whose first route lookup fails and whose second resolves remote."""
+
+    _resolve_calls: int = PrivateAttr(default=0)
+
+    def _resolve_gateway_route(
+        self, host_id: HostId, provider_name: str, ssh_info: RemoteSSHInfo
+    ) -> _GatewayRoute | None:
+        self._resolve_calls += 1
+        if self._resolve_calls == 1:
+            return None
+        return super()._resolve_gateway_route(host_id, provider_name, ssh_info)
+
+
+def test_discovery_route_resolution_failure_wires_nothing_then_retries(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """An unresolved route wires no gateway at all, and the next cycle still resolves.
+
+    Guessing the desktop gateway would half-work (only its unchecked
+    ``/latchkey/`` RPC succeeds without a permissions override), expose it to a
+    workspace not entitled to it, and squat the container port the VPS tunnel
+    needs.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    manager.initialize()
+    tunnel_manager = _RecordingTunnelManager()
+    agent_id = AgentId()
+    host_id = HostId()
+    agent_ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _RetryingProvisionRecordingHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        host_side_port = manager.start_gateway(cg)
+
+        handler._run_remote_setup(agent_id, host_id, agent_ssh_info, "imbue_cloud", host_side_port)
+        assert tunnel_manager._calls == []
+
+        handler._run_remote_setup(agent_id, host_id, agent_ssh_info, "imbue_cloud", host_side_port)
+        _wait_for_provisioning_passes(handler, 1)
+
+        assert handler._resolve_calls == 2
+        # The stale-tunnel cleanup is keyed by the container endpoint, never by
+        # the agent tag: an agent-keyed removal would also drop the
+        # desktop->VPS tunnel set up on the same cycle.
+        assert tunnel_manager._removed_agent_ids == []
+        assert tunnel_manager._removed_endpoints == [(agent_ssh_info, host_side_port)]
+        # The only tunnel ever opened is the desktop->VPS one, once the route resolved.
+        assert tunnel_manager._calls == [
+            (_VPS_OUTER_SSH_INFO, host_side_port, DESKTOP_GATEWAY_VPS_PORT, _instance_tag(agent_id, host_id))
+        ]
+        assert handler._provisioned == [(agent_id, host_id)]
+        manager.stop_gateway()
+
+
+def test_discovery_handler_routes_remote_workspace_only_through_vps_gateway(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """A VPS agent gets the remote gateway plus a desktop-to-VPS extension tunnel."""
     fake_binary = _make_fake_latchkey_binary(tmp_path)
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
     manager.initialize()
@@ -1261,7 +1863,7 @@ def test_discovery_handler_dispatches_vps_provisioning_in_addition_to_desktop_tu
     host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _ProvisionRecordingHandler(
+        handler = _FixedVpsRouteHandler(
             latchkey=manager,
             tunnel_manager=tunnel_manager,
             concurrency_group=cg,
@@ -1270,37 +1872,42 @@ def test_discovery_handler_dispatches_vps_provisioning_in_addition_to_desktop_tu
         handler(agent_id, host_id, ssh_info, "imbue_cloud", HostState.RUNNING)
         host_side_port = manager.start_gateway(cg)
 
-        # Provisioning runs on its own fire-and-forget CG thread; poll for it.
-        poll_event = threading.Event()
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and not handler._provisioned:
-            poll_event.wait(timeout=_POLL_INTERVAL_SECONDS)
+        _wait_for_provisioning_passes(handler, 1)
 
-        # Both paths ran: the desktop gateway is reverse-tunneled onto the
-        # agent-side port AND the VPS-resident gateway provisioning was dispatched.
-        assert tunnel_manager._calls == [(ssh_info, host_side_port, AGENT_SIDE_LATCHKEY_PORT, str(agent_id))]
+        # No desktop->container tunnel is opened. The only desktop tunnel lands
+        # on the VPS loopback where the remote extension can reach it, and is
+        # tagged with the agent id so normal stop/destruction cleanup removes it.
+        assert tunnel_manager._calls == [
+            (
+                _VPS_OUTER_SSH_INFO,
+                host_side_port,
+                DESKTOP_GATEWAY_VPS_PORT,
+                _instance_tag(agent_id, host_id),
+            )
+        ]
+        # Any stale desktop->container tunnel is cleared by endpoint, not by
+        # agent tag -- the agent-keyed removal would take the desktop->VPS
+        # tunnel above down with it on every discovery cycle.
+        assert tunnel_manager._removed_agent_ids == []
+        assert tunnel_manager._removed_endpoints == [(ssh_info, host_side_port)]
         assert handler._provisioned == [(agent_id, host_id)]
         manager.stop_gateway()
 
 
-def test_discovery_handler_dispatches_vps_provisioning_when_desktop_tunnel_fails(
+def test_discovery_handler_dispatches_vps_provisioning_when_desktop_to_vps_tunnel_fails(
     tmp_path: Path, temp_mngr_ctx: MngrContext
 ) -> None:
-    """A desktop-side reverse-tunnel failure must not prevent VPS-resident gateway provisioning.
-
-    The two paths are independent (the agent reaches the desktop gateway on
-    ``AGENT_SIDE_LATCHKEY_PORT`` and the VPS gateway on ``INNER_PORT`` at once),
-    so a failing desktop tunnel still leaves the VPS provisioning dispatched.
-    """
+    """A desktop-to-VPS tunnel failure must not prevent third-party gateway provisioning."""
     fake_binary = _make_fake_latchkey_binary(tmp_path)
     manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
     manager.initialize()
-    tunnel_manager = _RaisingTunnelManager()
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = SSHTunnelError("simulated reverse-tunnel failure", SSHTunnelPhase.HOST_CONNECT)
     agent_id = AgentId()
     host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _ProvisionRecordingHandler(
+        handler = _FixedVpsRouteHandler(
             latchkey=manager,
             tunnel_manager=tunnel_manager,
             concurrency_group=cg,
@@ -1308,11 +1915,7 @@ def test_discovery_handler_dispatches_vps_provisioning_when_desktop_tunnel_fails
         )
         handler(agent_id, host_id, ssh_info, "imbue_cloud", HostState.RUNNING)
 
-        # Provisioning runs on its own fire-and-forget CG thread; poll for it.
-        poll_event = threading.Event()
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and not handler._provisioned:
-            poll_event.wait(timeout=_POLL_INTERVAL_SECONDS)
+        _wait_for_provisioning_passes(handler, 1)
 
         # The desktop tunnel raised, yet the VPS provisioning was still dispatched.
         assert handler._provisioned == [(agent_id, host_id)]
@@ -1332,6 +1935,7 @@ def test_discovery_handler_tears_down_tunnel_for_stopped_host(tmp_path: Path, te
     manager.initialize()
     tunnel_manager = _RecordingTunnelManager()
     agent_id = AgentId()
+    host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=22, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
         handler = LatchkeyDiscoveryHandler(
@@ -1340,11 +1944,11 @@ def test_discovery_handler_tears_down_tunnel_for_stopped_host(tmp_path: Path, te
             concurrency_group=cg,
             mngr_ctx=temp_mngr_ctx,
         )
-        handler(agent_id, HostId(), ssh_info, "local", HostState.STOPPED)
+        handler(agent_id, host_id, ssh_info, "local", HostState.STOPPED)
 
         assert manager.is_gateway_running
         assert tunnel_manager._calls == []
-        assert tunnel_manager._removed_agent_ids == [str(agent_id)]
+        assert tunnel_manager._removed_agent_ids == [_instance_tag(agent_id, host_id)]
         manager.stop_gateway()
 
 
@@ -1366,7 +1970,7 @@ def test_stopped_host_skips_provisioning_and_clears_provisioned_marker(
     host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _ProvisionRecordingHandler(
+        handler = _FixedVpsRouteHandler(
             latchkey=manager,
             tunnel_manager=tunnel_manager,
             concurrency_group=cg,
@@ -1379,7 +1983,63 @@ def test_stopped_host_skips_provisioning_and_clears_provisioned_marker(
         handler(agent_id, host_id, ssh_info, "imbue_cloud", HostState.STOPPED)
 
         assert handler._provisioned == []
-        assert tunnel_manager._removed_agent_ids == [str(agent_id)]
+        assert tunnel_manager._removed_agent_ids == [_instance_tag(agent_id, host_id)]
+        with handler._remote_hosts_lock:
+            assert str(host_id) not in handler._provisioned_hosts
+        manager.stop_gateway()
+
+
+def test_unauthenticated_host_warns_once_instead_of_skipping_silently(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """An UNAUTHENTICATED host skips provisioning *loudly*, and only once per episode.
+
+    UNAUTHENTICATED means the machine is up and its container is very likely
+    serving the workspace normally -- only the outer sshd rejected our key. So the
+    skip is correct, but it used to be silent, and nothing else reports it: the
+    workspace kept loading while every latchkey call from that host's agents failed
+    with connection-refused, with no log line anywhere tying the two together.
+    Repeating the warning on every discovery cycle would flood the log, so later
+    cycles drop to debug -- but a host that authenticates again and is then
+    rejected again is a fresh outage and warns afresh (e.g. a repair restored the
+    key and a slice VM carved before the lima fix wiped it again on its next
+    restart).
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    manager.initialize()
+    tunnel_manager = _RecordingTunnelManager()
+    host_id = HostId()
+    ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _FixedVpsRouteHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        # Provisioned earlier this session, back when the key still worked.
+        with handler._remote_hosts_lock:
+            handler._provisioned_hosts.add(str(host_id))
+
+        with _captured_log_records() as captured:
+            handler(AgentId(), host_id, ssh_info, "imbue_cloud", HostState.UNAUTHENTICATED)
+            handler(AgentId(), host_id, ssh_info, "imbue_cloud", HostState.UNAUTHENTICATED)
+            repeat_warnings = [
+                message for level, message in captured if level == "WARNING" and str(host_id) in message
+            ]
+            # The key is repaired (RUNNING is only reachable over outer SSH for
+            # imbue_cloud), then the next VM restart wipes it again.
+            handler(AgentId(), host_id, None, "imbue_cloud", HostState.RUNNING)
+            handler(AgentId(), host_id, ssh_info, "imbue_cloud", HostState.UNAUTHENTICATED)
+
+        assert len(repeat_warnings) == 1, f"expected exactly one warning for {host_id}, got {repeat_warnings}"
+        assert "UNAUTHENTICATED" in repeat_warnings[0]
+        warnings = [message for level, message in captured if level == "WARNING" and str(host_id) in message]
+        assert len(warnings) == 2, f"expected the second episode to warn again for {host_id}, got {warnings}"
+        # Nothing is wired against a host we cannot reach over its outer sshd, and
+        # the marker is cleared so a repaired key re-provisions on a later cycle.
+        assert handler._provisioned == []
         with handler._remote_hosts_lock:
             assert str(host_id) not in handler._provisioned_hosts
         manager.stop_gateway()
@@ -1400,7 +2060,7 @@ def test_provisioning_coalesces_when_host_pass_already_in_flight(tmp_path: Path,
     host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _ProvisionRecordingHandler(
+        handler = _FixedVpsRouteHandler(
             latchkey=manager,
             tunnel_manager=tunnel_manager,
             concurrency_group=cg,
@@ -1420,8 +2080,14 @@ def test_provisioning_coalesces_when_host_pass_already_in_flight(tmp_path: Path,
             assert handler._provisioning_hosts == {str(host_id)}
 
 
+@pytest.mark.flaky
 def test_provisioning_skips_host_already_provisioned_this_session(tmp_path: Path, temp_mngr_ctx: MngrContext) -> None:
     """A host already provisioned this supervisor lifetime is not re-provisioned.
+
+    Marked flaky: seen failing once under a full parallel run and not reproduced
+    since (passing alone, in file order, and across five parallel runs of this
+    file). The state it asserts on is per-handler, so it is not cross-test
+    leakage; the cause is still unidentified rather than understood-and-accepted.
 
     The discovery stream re-emits the full agent set every cycle; re-running the
     expensive idempotent provisioning each time is wasteful, so an
@@ -1434,7 +2100,7 @@ def test_provisioning_skips_host_already_provisioned_this_session(tmp_path: Path
     host_id = HostId()
     ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _ProvisionRecordingHandler(
+        handler = _FixedVpsRouteHandler(
             latchkey=manager,
             tunnel_manager=tunnel_manager,
             concurrency_group=cg,
@@ -1453,114 +2119,314 @@ def test_provisioning_skips_host_already_provisioned_this_session(tmp_path: Path
             assert handler._provisioning_hosts == set()
 
 
-class _SyncRecordingHandler(LatchkeyDiscoveryHandler):
-    """Handler stub that records ``_sync_state_to_host`` calls instead of opening VPS connections."""
-
-    _synced: list[tuple[str, bool, bool]] = PrivateAttr(default_factory=list)
-
-    def _sync_state_to_host(
-        self,
-        host_id_str: str,
-        provider_name: str,
-        *,
-        do_permissions: bool,
-        do_credentials: bool,
-    ) -> None:
-        self._synced.append((host_id_str, do_permissions, do_credentials))
+# -- Transient-failure reporting for the per-host wiring steps --
 
 
-def _make_sync_recording_handler(
-    tmp_path: Path, temp_mngr_ctx: MngrContext, cg: ConcurrencyGroup
-) -> _SyncRecordingHandler:
-    return _SyncRecordingHandler(
-        latchkey=FakeLatchkey(latchkey_directory=tmp_path),
-        tunnel_manager=SSHTunnelManager(),
-        concurrency_group=cg,
-        mngr_ctx=temp_mngr_ctx,
-    )
+def _raised_from(error: BaseException, cause: BaseException) -> BaseException:
+    """Return ``error`` chained as if it had been ``raise``d ``from cause``."""
+    error.__cause__ = cause
+    return error
 
 
-def test_remote_state_sync_initial_pass_does_permissions_then_credentials_for_known_hosts(
+@pytest.mark.parametrize(
+    ("error", "is_transient"),
+    [
+        pytest.param(ConnectionResetError(54, "Connection reset by peer"), True, id="connection-reset"),
+        pytest.param(paramiko.SSHException("No existing session"), True, id="no-existing-session"),
+        pytest.param(paramiko.AuthenticationException("Authentication timeout."), True, id="auth-timeout"),
+        pytest.param(EOFError(), True, id="eof"),
+        pytest.param(TimeoutError("timed out"), True, id="timeout"),
+        pytest.param(HostConnectionError("Failed to connect to host"), True, id="host-connection-error"),
+        pytest.param(
+            _raised_from(RemoteGatewayError("Failed to read the permissions"), HostConnectionError("closed")),
+            True,
+            id="wrapped-host-connection-error",
+        ),
+        pytest.param(
+            _raised_from(RemoteGatewayError("Failed to push"), ConnectionResetError(54, "Connection reset by peer")),
+            True,
+            id="wrapped-connection-reset",
+        ),
+        pytest.param(
+            SSHTunnelError("SSH transport is not active", SSHTunnelPhase.HOST_CONNECT), True, id="tunnel-host-connect"
+        ),
+        pytest.param(HostAuthenticationError("Authentication failed"), False, id="host-authentication-error"),
+        pytest.param(SSHTunnelError("No SSH key file", SSHTunnelPhase.LOCAL_SETUP), False, id="tunnel-local-setup"),
+        pytest.param(ConnectionRefusedError(61, "Connection refused"), False, id="connection-refused"),
+        pytest.param(RemoteGatewayError("Malformed permissions file"), False, id="remote-gateway-error-alone"),
+        pytest.param(HostNotFoundError(ProviderInstanceName("p"), HostId()), False, id="host-not-found"),
+    ],
+)
+def test_is_transient_remote_wiring_error_classifies_by_error_and_cause_chain(
+    error: BaseException, is_transient: bool
+) -> None:
+    """Transient SSH shapes are recognized wherever they sit in the chain; misconfiguration is not."""
+    assert is_transient_remote_wiring_error(error) is is_transient
+
+
+def _error_messages_mentioning(captured: list[tuple[str, str]], host_id: HostId) -> list[str]:
+    return [message for level, message in captured if level == "ERROR" and str(host_id) in message]
+
+
+def test_transient_tunnel_failures_report_an_error_only_once_the_streak_reaches_the_threshold(
     tmp_path: Path, temp_mngr_ctx: MngrContext
 ) -> None:
-    host_id_str = str(HostId())
-    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _make_sync_recording_handler(tmp_path, temp_mngr_ctx, cg)
-        with handler._remote_hosts_lock:
-            handler._remote_host_provider_by_id[host_id_str] = "imbue_cloud"
-        handler._sync_all_known_hosts()
-        # Full initial sync requests both permissions and credentials for the host.
-        assert handler._synced == [(host_id_str, True, True)]
+    """A transient tunnel failure is noted at info, then debug, and escalated to one error at the threshold.
 
-
-def test_remote_state_watch_handler_routes_credential_and_permission_changes(
-    tmp_path: Path, temp_mngr_ctx: MngrContext
-) -> None:
+    Every discovery cycle retries the desktop-to-VPS tunnel, so a blip heals by
+    itself and must not be reported as an error. A host that keeps failing while
+    it reports as running is a misconfiguration we still want to learn about, so
+    the streak is reported exactly once when it reaches the threshold. A success
+    forgets the streak, so a later outage reports afresh.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = paramiko.SSHException("No existing session")
+    agent_id = AgentId()
     host_id = HostId()
-    host_id_str = str(host_id)
+    host_side_port = 41989
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _make_sync_recording_handler(tmp_path, temp_mngr_ctx, cg)
-        with handler._remote_hosts_lock:
-            handler._remote_host_provider_by_id[host_id_str] = "imbue_cloud"
-
-        credentials_path = local_credentials_path(tmp_path)
-        permissions_path = permissions_path_for_host(handler.latchkey.plugin_data_dir, host_id)
-        event_handler = _LatchkeyStateChangeHandler(
-            credentials_path=credentials_path,
-            plugin_data_dir=handler.latchkey.plugin_data_dir,
-            known_remote_host_ids=handler._known_remote_host_ids,
-            on_credentials_changed=handler._sync_credentials_to_all_known_hosts,
-            on_host_permissions_changed=handler._sync_full_state_to_host,
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
         )
+        with _captured_log_records() as captured:
+            for _ in range(TRANSIENT_FAILURE_REPORT_THRESHOLD - 1):
+                handler._setup_desktop_gateway_reachability_on_vps(
+                    agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+                )
+            levels_before_threshold = [level for level, message in captured if str(host_id) in message]
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
+            errors_at_threshold = _error_messages_mentioning(captured, host_id)
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
+            errors_past_threshold = _error_messages_mentioning(captured, host_id)
 
-        # A change to the credentials file pushes credentials (only) to all hosts.
-        event_handler.dispatch(FileModifiedEvent(str(credentials_path)))
-        assert handler._synced == [(host_id_str, False, True)]
+            tunnel_manager._error_to_raise = None
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
+            with handler._remote_hosts_lock:
+                streaks_after_success = dict(handler._transient_failure_streak_by_key)
 
-        # A change to a host's permissions file pushes the full state
-        # (permissions, then credentials) to that host: the permissions
-        # determine which services' credentials ship, so a grant/revocation
-        # must also refresh the VPS credential store.
-        handler._synced.clear()
-        event_handler.dispatch(FileModifiedEvent(str(permissions_path)))
-        assert handler._synced == [(host_id_str, True, True)]
+            tunnel_manager._error_to_raise = paramiko.SSHException("No existing session")
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
 
-        # An unrelated path (e.g. the forward supervisor record) is ignored.
-        handler._synced.clear()
-        event_handler.dispatch(FileModifiedEvent(str(tmp_path / "mngr_latchkey" / "latchkey_forward.json")))
-        assert handler._synced == []
-
-        # A permissions file for an unknown host is ignored.
-        handler._synced.clear()
-        unknown_permissions = permissions_path_for_host(handler.latchkey.plugin_data_dir, HostId())
-        event_handler.dispatch(FileModifiedEvent(str(unknown_permissions)))
-        assert handler._synced == []
-
-        # Regression: the watchdog observer stores handlers in a set, so the
-        # handler must be hashable and schedulable (a MutableModel would raise
-        # ``TypeError: unhashable type`` here).
-        assert hash(event_handler) is not None
-        Observer().schedule(event_handler, str(tmp_path), recursive=False)
+    # Below the threshold: the first failure of the streak is noted at info and
+    # the rest at debug, and nothing is reported as an error.
+    assert levels_before_threshold.count("INFO") == 1
+    assert levels_before_threshold.count("DEBUG") == TRANSIENT_FAILURE_REPORT_THRESHOLD - 2
+    assert "ERROR" not in levels_before_threshold
+    assert "WARNING" not in levels_before_threshold
+    # At the threshold: exactly one error, naming the streak length; past it: no more.
+    assert len(errors_at_threshold) == 1, errors_at_threshold
+    assert f"{TRANSIENT_FAILURE_REPORT_THRESHOLD} consecutive discovery cycles" in errors_at_threshold[0]
+    assert errors_past_threshold == errors_at_threshold
+    # A success forgets the streak, and the next failure starts a new one at info.
+    assert len(tunnel_manager._calls) == 1
+    assert streaks_after_success == {}
+    info_messages = [message for level, message in captured if level == "INFO" and str(host_id) in message]
+    assert len(info_messages) == 2, info_messages
+    assert _error_messages_mentioning(captured, host_id) == errors_at_threshold
 
 
-def test_remote_state_watch_sentinel_fails_loudly_when_observer_dies(
+def test_non_transient_tunnel_failure_is_reported_as_an_error_at_once(
     tmp_path: Path, temp_mngr_ctx: MngrContext
 ) -> None:
+    """Trust material missing on this device cannot be fixed by retrying, so it is an error immediately."""
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = SSHTunnelError("No SSH key file at /nowhere", SSHTunnelPhase.LOCAL_SETUP)
+    agent_id = AgentId()
+    host_id = HostId()
+    ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
     with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
-        handler = _make_sync_recording_handler(tmp_path, temp_mngr_ctx, cg)
-        # A stopped observer that did NOT stop because of shutdown is a watcher
-        # failure -- the sentinel must raise loudly.
-        observer = Observer()
-        observer.start()
-        observer.stop()
-        observer.join()
-        shutdown_event = threading.Event()
-        with pytest.raises(RemoteGatewayError, match="stopped unexpectedly"):
-            handler._fail_loudly_if_observer_dies(observer, shutdown_event)
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        with _captured_log_records() as captured:
+            handler._setup_desktop_gateway_reachability(agent_id, host_id, ssh_info, 41989)
+        with handler._remote_hosts_lock:
+            streaks = dict(handler._transient_failure_streak_by_key)
 
-        # When the observer stops *because* of shutdown, that is expected -- no raise.
-        shutdown_event.set()
-        handler._fail_loudly_if_observer_dies(observer, shutdown_event)
+    error_messages = [message for level, message in captured if level == "ERROR" and str(agent_id) in message]
+    assert len(error_messages) == 1, captured
+    assert "No SSH key file at /nowhere" in error_messages[0]
+    assert streaks == {}
+
+
+def test_stopping_a_host_forgets_its_transient_failure_streaks(tmp_path: Path, temp_mngr_ctx: MngrContext) -> None:
+    """A streak counts consecutive cycles while the host runs, so a stop ends it and a restart starts afresh.
+
+    Only the stopped host's streaks are forgotten; another host mid-streak keeps
+    counting.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    tunnel_manager = _ConfigurableFailureTunnelManager()
+    tunnel_manager._error_to_raise = paramiko.SSHException("No existing session")
+    agent_id = AgentId()
+    host_id = HostId()
+    other_agent_id = AgentId()
+    other_host_id = HostId()
+    host_side_port = 41989
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = LatchkeyDiscoveryHandler(
+            latchkey=manager,
+            tunnel_manager=tunnel_manager,
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        for _ in range(TRANSIENT_FAILURE_REPORT_THRESHOLD - 1):
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
+        handler._setup_desktop_gateway_reachability_on_vps(
+            other_agent_id, other_host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+        )
+        handler._tear_down_stopped_agent(agent_id, host_id)
+        with handler._remote_hosts_lock:
+            streaks_after_stop = dict(handler._transient_failure_streak_by_key)
+        with _captured_log_records() as captured:
+            handler._setup_desktop_gateway_reachability_on_vps(
+                agent_id, host_id, _VPS_OUTER_SSH_INFO, host_side_port, "local"
+            )
+
+    assert {key.host_id for key in streaks_after_stop} == {other_host_id}
+    levels_after_restart = [level for level, message in captured if str(host_id) in message]
+    assert levels_after_restart == ["INFO"], captured
+
+
+class _ProvisionFailureHandler(_FixedVpsRouteHandler):
+    """Recording handler whose provisioning pass raises whatever error the test sets, and succeeds otherwise."""
+
+    _error_to_raise: BaseException | None = PrivateAttr(default=None)
+
+    def _provision_remote_gateway_for_agent(
+        self,
+        agent_id: AgentId,
+        host_id: HostId,
+        ssh_info: RemoteSSHInfo,
+        provider_name: str,
+    ) -> None:
+        if self._error_to_raise is not None:
+            raise self._error_to_raise
+        super()._provision_remote_gateway_for_agent(agent_id, host_id, ssh_info, provider_name)
+
+
+def _mark_provisioning_in_flight(handler: LatchkeyDiscoveryHandler, agent_id: AgentId, host_id: HostId) -> None:
+    """Set the flags ``_maybe_dispatch_remote_gateway_provisioning`` sets before handing off to the worker."""
+    with handler._remote_hosts_lock:
+        handler._provisioning_hosts.add(str(host_id))
+    with handler._pending_lock:
+        handler._pending_remote_agents.add(_instance_tag(agent_id, host_id))
+
+
+def test_transient_provisioning_failure_is_retried_by_the_next_cycle_and_reported_at_the_threshold(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """A transient provisioning failure does not escape the worker, leaves the host retryable, and escalates late.
+
+    An exception escaping the unchecked worker is logged by the concurrency
+    group at error level. A transient failure is instead noted and the pass
+    left for the next discovery cycle: the in-flight and pending flags are
+    cleared, and the host is not recorded as provisioned. Only a streak as long
+    as the threshold is reported as an error.
+    """
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    agent_id = AgentId()
+    host_id = HostId()
+    ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _ProvisionFailureHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        handler._error_to_raise = _raised_from(
+            RemoteGatewayError("Failed to hand the machine its permissions"),
+            HostConnectionError("Connection was closed while running command"),
+        )
+        with _captured_log_records() as captured:
+            _mark_provisioning_in_flight(handler, agent_id, host_id)
+            handler._run_remote_gateway_provisioning(agent_id, host_id, ssh_info, "imbue_cloud")
+            with handler._remote_hosts_lock:
+                provisioning_hosts_after_failure = set(handler._provisioning_hosts)
+                provisioned_hosts_after_failure = set(handler._provisioned_hosts)
+            with handler._pending_lock:
+                pending_after_failure = set(handler._pending_remote_agents)
+            errors_after_first_failure = _error_messages_mentioning(captured, host_id)
+
+            for _ in range(TRANSIENT_FAILURE_REPORT_THRESHOLD - 1):
+                _mark_provisioning_in_flight(handler, agent_id, host_id)
+                handler._run_remote_gateway_provisioning(agent_id, host_id, ssh_info, "imbue_cloud")
+            errors_at_threshold = _error_messages_mentioning(captured, host_id)
+
+            handler._error_to_raise = None
+            _mark_provisioning_in_flight(handler, agent_id, host_id)
+            handler._run_remote_gateway_provisioning(agent_id, host_id, ssh_info, "imbue_cloud")
+            with handler._remote_hosts_lock:
+                streaks_after_success = dict(handler._transient_failure_streak_by_key)
+                provisioned_hosts_after_success = set(handler._provisioned_hosts)
+
+    # The first failure is noted at info, not error, and leaves the host retryable.
+    assert errors_after_first_failure == []
+    assert any(level == "INFO" and str(host_id) in message for level, message in captured)
+    assert provisioning_hosts_after_failure == set()
+    assert pending_after_failure == set()
+    assert provisioned_hosts_after_failure == set()
+    # The streak is reported exactly once, at the threshold, with the wrapped error's text.
+    assert len(errors_at_threshold) == 1, errors_at_threshold
+    assert "Failed to hand the machine its permissions" in errors_at_threshold[0]
+    # A later success provisions normally and forgets the streak.
+    assert handler._provisioned == [(agent_id, host_id)]
+    assert provisioned_hosts_after_success == {str(host_id)}
+    assert streaks_after_success == {}
+
+
+def test_non_transient_provisioning_failure_still_escapes_the_worker(
+    tmp_path: Path, temp_mngr_ctx: MngrContext
+) -> None:
+    """A failure retrying cannot fix propagates out of the worker (so the CG reports it), flags still cleared."""
+    fake_binary = _make_fake_latchkey_binary(tmp_path)
+    manager = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(fake_binary))
+    agent_id = AgentId()
+    host_id = HostId()
+    ssh_info = RemoteSSHInfo(user="root", host="192.0.2.1", port=2222, key_path=tmp_path / "k")
+    with ConcurrencyGroup(name=f"test-{uuid4().hex}") as cg:
+        handler = _ProvisionFailureHandler(
+            latchkey=manager,
+            tunnel_manager=_RecordingTunnelManager(),
+            concurrency_group=cg,
+            mngr_ctx=temp_mngr_ctx,
+        )
+        handler._error_to_raise = RemoteGatewayError("Malformed permissions file")
+        _mark_provisioning_in_flight(handler, agent_id, host_id)
+        with pytest.raises(RemoteGatewayError, match="Malformed permissions file"):
+            handler._run_remote_gateway_provisioning(agent_id, host_id, ssh_info, "imbue_cloud")
+        with handler._remote_hosts_lock:
+            provisioning_hosts = set(handler._provisioning_hosts)
+            streaks = dict(handler._transient_failure_streak_by_key)
+        with handler._pending_lock:
+            pending = set(handler._pending_remote_agents)
+
+    assert provisioning_hosts == set()
+    assert pending == set()
+    assert streaks == {}
 
 
 def _make_fake_latchkey_binary_with_ensure_browser_counter(tmp_path: Path, counter_path: Path) -> Path:
@@ -1667,8 +2533,9 @@ def test_destruction_handler_removes_reverse_tunnels_for_destroyed_agent() -> No
     tunnel_manager = _RecordingTunnelManager()
     handler = LatchkeyDestructionHandler(tunnel_manager=tunnel_manager)
     agent_id = AgentId()
-    handler(agent_id)
-    assert tunnel_manager._removed_agent_ids == [str(agent_id)]
+    host_id = HostId()
+    handler(agent_id, host_id)
+    assert tunnel_manager._removed_agent_ids == [_instance_tag(agent_id, host_id)]
 
 
 # -- services_info / auth_browser --
@@ -1734,8 +2601,10 @@ def test_services_info_returns_valid_when_status_is_valid(tmp_path: Path) -> Non
     binary = _make_services_info_binary(tmp_path, credential_status="valid")
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
     info = latchkey.services_info("slack")
+    assert info is not None
     assert info.credential_status == CredentialStatus.VALID
     assert info.auth_options == frozenset({"browser", "set"})
+    assert info.is_browser_auth_supported is True
     assert info.set_credentials_example == "..."
 
 
@@ -1745,6 +2614,7 @@ def test_services_info_returns_missing_when_no_accounts_are_stored(tmp_path: Pat
     binary = _make_services_info_binary(tmp_path, credential_status="")
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
     info = latchkey.services_info("slack")
+    assert info is not None
     assert info.credential_status == CredentialStatus.MISSING
     assert info.accounts == ()
 
@@ -1762,6 +2632,7 @@ def test_services_info_parses_multiple_accounts_and_aggregates_status(tmp_path: 
     script.chmod(0o755)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(script))
     info = latchkey.services_info("slack")
+    assert info is not None
     # One VALID account makes the aggregate VALID even though another is INVALID.
     assert info.credential_status == CredentialStatus.VALID
     assert {account.account for account in info.accounts} == {"hynek@imbue-ai", "hynek@glebs-corner"}
@@ -1773,42 +2644,37 @@ def test_services_info_parses_multiple_accounts_and_aggregates_status(tmp_path: 
 def test_services_info_returns_invalid_when_status_is_invalid(tmp_path: Path) -> None:
     binary = _make_services_info_binary(tmp_path, credential_status="invalid")
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
-    assert latchkey.services_info("slack").credential_status == CredentialStatus.INVALID
+    info = latchkey.services_info("slack")
+    assert info is not None
+    assert info.credential_status == CredentialStatus.INVALID
 
 
-def test_services_info_returns_unknown_when_process_fails(tmp_path: Path) -> None:
+def test_services_info_returns_none_when_process_fails(tmp_path: Path) -> None:
     binary = _make_services_info_binary(tmp_path, exit_code=1)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
-    info = latchkey.services_info("slack")
-    assert info.credential_status == CredentialStatus.UNKNOWN
-    assert info.auth_options == frozenset()
-    assert info.set_credentials_example is None
+    assert latchkey.services_info("slack") is None
 
 
-def test_services_info_returns_unknown_when_binary_does_not_exist(tmp_path: Path) -> None:
-    """Missing latchkey binary must degrade to UNKNOWN, not crash callers (e.g. dialog render)."""
+def test_services_info_returns_none_when_binary_does_not_exist(tmp_path: Path) -> None:
+    """A missing latchkey binary must degrade to None, not crash callers (e.g. dialog render)."""
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(tmp_path / "does-not-exist"))
-    info = latchkey.services_info("slack")
-    assert info.credential_status == CredentialStatus.UNKNOWN
-    assert info.auth_options == frozenset()
-    assert info.set_credentials_example is None
+    assert latchkey.services_info("slack") is None
 
 
-def test_services_info_returns_unknown_when_output_is_not_json(tmp_path: Path) -> None:
+def test_services_info_returns_none_when_output_is_not_json(tmp_path: Path) -> None:
     script = tmp_path / "latchkey"
     script.write_text("#!/usr/bin/env python3\nprint('not json')\n")
     script.chmod(0o755)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(script))
-    info = latchkey.services_info("slack")
-    assert info.credential_status == CredentialStatus.UNKNOWN
-    assert info.auth_options == frozenset()
-    assert info.set_credentials_example is None
+    assert latchkey.services_info("slack") is None
 
 
 def test_services_info_returns_unknown_for_unrecognized_status(tmp_path: Path) -> None:
     binary = _make_services_info_binary(tmp_path, credential_status="totally-new")
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
-    assert latchkey.services_info("slack").credential_status == CredentialStatus.UNKNOWN
+    info = latchkey.services_info("slack")
+    assert info is not None
+    assert info.credential_status == CredentialStatus.UNKNOWN
 
 
 def test_services_info_returns_empty_auth_options_when_field_is_missing(tmp_path: Path) -> None:
@@ -1817,9 +2683,12 @@ def test_services_info_returns_empty_auth_options_when_field_is_missing(tmp_path
     script.chmod(0o755)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(script))
     info = latchkey.services_info("coolify")
+    assert info is not None
     assert info.credential_status == CredentialStatus.MISSING
     assert info.auth_options == frozenset()
     assert info.set_credentials_example is None
+    # No auth options at all means "we don't know": keep offering the browser flow.
+    assert info.is_browser_auth_supported is True
 
 
 def test_services_info_returns_set_only_auth_options_for_set_only_service(tmp_path: Path) -> None:
@@ -1836,8 +2705,10 @@ def test_services_info_returns_set_only_auth_options_for_set_only_service(tmp_pa
     script.chmod(0o755)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(script))
     info = latchkey.services_info("coolify")
+    assert info is not None
     assert info.credential_status == CredentialStatus.MISSING
     assert info.auth_options == frozenset({"set"})
+    assert info.is_browser_auth_supported is False
     assert info.set_credentials_example is not None
     assert "latchkey auth set coolify" in info.set_credentials_example
 
@@ -1852,6 +2723,7 @@ def test_services_info_skips_malformed_auth_options(tmp_path: Path) -> None:
     script.chmod(0o755)
     latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(script))
     info = latchkey.services_info("slack")
+    assert info is not None
     assert info.credential_status == CredentialStatus.MISSING
     assert info.auth_options == frozenset()
 
@@ -1933,6 +2805,30 @@ def test_auth_list_parses_accounts_keyed_by_service(tmp_path: Path) -> None:
     assert [a.account for a in result["github"]] == [""]
     # ``--offline`` is forwarded (and omitted when not requested).
     assert json.loads((tmp_path / "argv_report").read_text()) == ["auth", "list", "--offline"]
+
+
+def test_auth_list_reports_the_credential_kind_so_callers_can_find_expiring_ones(tmp_path: Path) -> None:
+    """Only an OAuth credential can expire, so the kind has to survive parsing."""
+    payload = json.dumps(
+        {
+            "google-gmail": {"someone@example.com": {"credentialType": "oauth", "credentialStatus": "unknown"}},
+            "github": {"": {"credentialType": "authorizationBearer", "credentialStatus": "unknown"}},
+            # A kind this parser has never heard of, and one latchkey omitted entirely.
+            "newthing": {"": {"credentialType": "somethingNew", "credentialStatus": "unknown"}},
+            "typeless": {"": {"credentialStatus": "unknown"}},
+        }
+    )
+    binary = _make_auth_list_binary(tmp_path, payload_json=payload)
+    latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
+
+    result = latchkey.auth_list(is_offline=True)
+
+    assert result["google-gmail"][0].credential_type == LATCHKEY_CREDENTIAL_TYPE_OAUTH
+    assert result["github"][0].credential_type == "authorizationBearer"
+    # An unrecognized kind reads through unchanged rather than being flattened,
+    # so it is simply "not OAuth" instead of needing a parser update first.
+    assert result["newthing"][0].credential_type == "somethingNew"
+    assert result["typeless"][0].credential_type is None
 
 
 def test_auth_list_without_offline_omits_flag(tmp_path: Path) -> None:
@@ -2183,6 +3079,37 @@ def test_auth_clear_account_passes_account_flag(tmp_path: Path) -> None:
     assert argv_calls == [["auth", "clear", "-y", "slack", "--account", "hynek@imbue-ai"]]
 
 
+# -- auth_set_credentials --
+
+
+def test_auth_set_credentials_passes_the_argv_through_verbatim(tmp_path: Path) -> None:
+    binary = _make_recording_binary(tmp_path, exit_code=0)
+    latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
+
+    is_success, detail = latchkey.auth_set_credentials(
+        "aws",
+        ("--account", "alice@x", "auth", "set-nocurl", "aws", "AKIA-6612", "shh-4093"),
+    )
+
+    assert is_success is True
+    assert detail == ""
+    assert [record["argv"] for record in _read_recording_report(tmp_path)] == [
+        ["--account", "alice@x", "auth", "set-nocurl", "aws", "AKIA-6612", "shh-4093"]
+    ]
+    # The credential command must run against the pinned credential store.
+    assert _read_recording_report(tmp_path)[0]["env_LATCHKEY_DIRECTORY"] == str(tmp_path)
+
+
+def test_auth_set_credentials_reports_the_failure_detail(tmp_path: Path) -> None:
+    binary = _make_recording_binary(tmp_path, exit_code=1, stderr="Error: Unknown service: aws")
+    latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
+
+    is_success, detail = latchkey.auth_set_credentials("aws", ("auth", "set-nocurl", "aws", "x", "y"))
+
+    assert is_success is False
+    assert detail == "Error: Unknown service: aws"
+
+
 # -- add_account --
 
 
@@ -2237,6 +3164,50 @@ def test_add_account_non_google_failure_surfaces_error(tmp_path: Path) -> None:
     # The prepare step fails, so the sign-in is never attempted and there is no
     # Minds Google OAuth client registration for a non-Google service.
     assert [record["argv"] for record in _read_recording_report(tmp_path)] == [["auth", "browser-prepare", "slack"]]
+
+
+def test_add_account_failure_detail_is_condensed_to_the_error_line(tmp_path: Path) -> None:
+    """A latchkey CLI crash dump is condensed to its meaningful line for the UI.
+
+    The detail travels verbatim into the settings page / permission dialogs,
+    so a raw Node.js uncaught-exception dump (internal frames, ``Call log:``,
+    the stack) must not surface there -- only the error message itself.
+    """
+    crash_dump = (
+        "node:internal/process/promises:394\n"
+        "          triggerUncaughtException(err, true /* fromPromise */);\n"
+        "          ^\n"
+        'page.goto: Navigation to "https://app.todoist.com/x" is interrupted\n'
+        "Call log:\n"
+        '- navigating to "https://app.todoist.com/x", waiting until "load"\n'
+        "    at TodoistServiceSession.performBrowserFollowup (/x/todoist.js:43:20)\n"
+        " { name: 'Error' }\n"
+        "Node.js v24.15.0"
+    )
+    binary = _make_env_recording_binary(tmp_path, exit_code=1, stderr=crash_dump)
+    latchkey = Latchkey(latchkey_directory=tmp_path, latchkey_binary=str(binary))
+
+    is_success, detail = latchkey.add_account("todoist")
+
+    assert is_success is False
+    assert detail == 'page.goto: Navigation to "https://app.todoist.com/x" is interrupted'
+
+
+def test_summarize_latchkey_failure_prefers_explicit_error_lines() -> None:
+    dump = "some noise line\nError: No credentials found for todoist\nmore noise"
+    assert summarize_latchkey_failure(dump, fallback="f") == "Error: No credentials found for todoist"
+
+
+def test_summarize_latchkey_failure_falls_back_when_only_noise() -> None:
+    dump = "node:internal/process/promises:394\n    at foo (/x.js:1:1)\n^\nNode.js v24.15.0"
+    assert summarize_latchkey_failure(dump, fallback="latchkey auth browser failed") == "latchkey auth browser failed"
+
+
+def test_summarize_latchkey_failure_caps_the_summary_length() -> None:
+    long_line = "Error: " + "x" * 500
+    summary = summarize_latchkey_failure(long_line, fallback="f")
+    assert len(summary) <= 300
+    assert summary.endswith("…")
 
 
 def test_add_account_google_falls_back_to_browser_prepare_when_official_client_fails(tmp_path: Path) -> None:

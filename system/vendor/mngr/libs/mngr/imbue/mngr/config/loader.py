@@ -27,7 +27,6 @@ from imbue.mngr.config.consts import ROOT_CONFIG_FILENAME
 from imbue.mngr.config.data_types import AgentTypeConfig
 from imbue.mngr.config.data_types import CommandDefaults
 from imbue.mngr.config.data_types import ConfigScope
-from imbue.mngr.config.data_types import CreateCliOptions
 from imbue.mngr.config.data_types import CreateTemplate
 from imbue.mngr.config.data_types import CreateTemplateName
 from imbue.mngr.config.data_types import MngrConfig
@@ -38,14 +37,15 @@ from imbue.mngr.config.data_types import RetryConfig
 from imbue.mngr.config.data_types import TmuxConfig
 from imbue.mngr.config.data_types import split_cli_args_string
 from imbue.mngr.config.host_dir import read_default_host_dir
+from imbue.mngr.config.host_dir import read_root_name
 from imbue.mngr.config.key_resolver import resolve_extends
 from imbue.mngr.config.key_resolver import set_at_path
 from imbue.mngr.config.overlay_merge import build_settings_narrowing_message
 from imbue.mngr.config.overlay_merge import suffix_remediation
 from imbue.mngr.config.plugin_registry import get_plugin_config_class
+from imbue.mngr.config.pre_readers import derive_project_config_dir
 from imbue.mngr.config.pre_readers import read_config_layers
 from imbue.mngr.config.pre_readers import read_disabled_plugins
-from imbue.mngr.config.pre_readers import resolve_project_config_dir
 from imbue.mngr.config.pre_readers import try_load_toml
 from imbue.mngr.config.provider_config_registry import get_provider_config_class
 from imbue.mngr.config.provider_config_registry import list_registered_provider_backend_names
@@ -180,7 +180,7 @@ def load_config(
     """
 
     # Read MNGR_ROOT_NAME early to use for config file discovery
-    root_name = os.environ.get("MNGR_ROOT_NAME", "mngr")
+    root_name = read_root_name()
 
     # Determine base directory (may be overridden by env var)
     base_dir = read_default_host_dir()
@@ -208,14 +208,18 @@ def load_config(
     if strict is None:
         strict = resolve_strict_from_env()
 
+    # Resolve the cwd's git worktree root once, up here: both the config layers below and
+    # the MngrContext returned at the end need it, and it costs a git subprocess.
+    project_root = find_git_worktree_root(start=None, cg=concurrency_group)
+
     # Read the user/project/local config layers (in precedence order) through
     # read_config_layers -- the single chokepoint that applies the pytest config
     # guard -- so a real (non-test) config can never be loaded here during a test
-    # run. The project root is resolved from the cwd's git worktree root (or
-    # MNGR_PROJECT_CONFIG_DIR). Each layer carries its resolved path and its
+    # run. The project config dir comes from MNGR_PROJECT_CONFIG_DIR, else the project
+    # root just resolved. Each layer carries its resolved path and its
     # ``config set --scope`` value so narrowing diagnostics can name the actual
     # file rather than an opaque layer label.
-    project_config_dir = resolve_project_config_dir(root_name, concurrency_group)
+    project_config_dir = derive_project_config_dir(root_name, project_root)
     loaded_layers = read_config_layers(profile_dir, project_config_dir)
 
     # Merge config files in precedence order (user, project, local). Narrowing
@@ -336,9 +340,11 @@ def load_config(
     config_dict["is_allowed_in_pytest"] = config.is_allowed_in_pytest
     config_dict["pre_command_scripts"] = config.pre_command_scripts
     config_dict["work_dir_extra_paths"] = config.work_dir_extra_paths
+    config_dict["strict_host_record_parsing"] = config.strict_host_record_parsing
     config_dict["default_destroyed_host_persisted_seconds"] = config.default_destroyed_host_persisted_seconds
     config_dict["default_min_online_host_age_seconds"] = config.default_min_online_host_age_seconds
     config_dict["agent_ready_timeout"] = config.agent_ready_timeout
+    config_dict["host_detail_read_timeout_seconds"] = config.host_detail_read_timeout_seconds
     config_dict["allow_settings_key_assignment_narrowing"] = config.allow_settings_key_assignment_narrowing
 
     # Allow plugins to modify config_dict before validation
@@ -347,12 +353,9 @@ def load_config(
     # Validate and apply defaults using normal constructor
     final_config = MngrConfig.model_validate(config_dict)
 
-    # Resolve project root for use as cwd in pre-command scripts.
-    # Note: MNGR_PROJECT_CONFIG_DIR is NOT used here because it points to the config
-    # directory (containing settings.toml), not the project root.
-    project_root = find_git_worktree_root(start=None, cg=concurrency_group)
-
-    # Return MngrContext containing both config and plugin manager
+    # Return MngrContext containing both config and plugin manager. project_root is the cwd
+    # for pre-command scripts; MNGR_PROJECT_CONFIG_DIR does not stand in for it, because
+    # that points at the config directory (containing settings.toml), not the project root.
     return MngrContext(
         config=final_config,
         pm=pm,
@@ -393,9 +396,7 @@ def get_or_create_profile_dir(base_dir: Path) -> Path:
     return profile_dir
 
 
-# =============================================================================
 # Config Loading
-# =============================================================================
 
 
 def _assigned_paths(parsed_layer: MngrConfig) -> list[str]:
@@ -725,6 +726,34 @@ _PLAIN_TUPLE_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _normalize_submodel_fields_for_construct(
+    raw_config: dict[str, Any],
+    config_class: type[BaseModel],
+    *,
+    prefix: str,
+) -> dict[str, Any]:
+    """Coerce nested dicts to their declared BaseModel field instances before model_construct.
+
+    This ensures that sub-model fields (such as ContextCompactionConfig) are real
+    BaseModel instances with their own model_fields_set populated, so that
+    merge_models_via_overlay detects them as submodels and merges them properly.
+    """
+    result = dict(raw_config)
+    for field_name, value in raw_config.items():
+        if not isinstance(value, dict):
+            continue
+        field_info = config_class.model_fields.get(field_name)
+        if field_info is None:
+            continue
+        annotation = field_info.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            try:
+                result[field_name] = annotation.model_validate(value)
+            except ValidationError as e:
+                raise ConfigParseError(f"Invalid config for '{prefix}.{field_name}': {e}") from e
+    return result
+
+
 def _normalize_tuple_fields_for_construct(raw_config: dict[str, Any]) -> dict[str, Any]:
     """Normalize tuple fields from str or list to tuple before model_construct (which bypasses validators).
 
@@ -830,7 +859,7 @@ def _parse_agent_types(
     for name, raw_config in raw_types.items():
         # Custom types with a parent_type should use the parent's config class,
         # since the parent type defines the valid fields (e.g., ClaudeAgentConfig
-        # has auto_dismiss_dialogs). Without this, unregistered custom type names
+        # has auto_dismiss_dialogs_at_startup). Without this, unregistered custom type names
         # fall back to the base AgentTypeConfig which rejects parent-specific fields.
         # A parent_type may itself be an alias (e.g. parent_type = "agy"), so
         # resolve it to the canonical type before looking up the config class.
@@ -874,6 +903,11 @@ def _parse_agent_types(
             extra_hint=extra_hint,
         )
         normalized_config = _normalize_tuple_fields_for_construct(cleaned_config)
+        normalized_config = _normalize_submodel_fields_for_construct(
+            normalized_config,
+            config_class,
+            prefix=f"agent_types.{name}",
+        )
         # Persist the alias-resolved parent_type so downstream resolution sees
         # the canonical type rather than the alias the user wrote.
         if parent_type is not None:
@@ -1073,16 +1107,14 @@ def _parse_create_templates(raw_templates: dict[str, dict[str, Any]]) -> dict[Cr
 
     for template_name, raw_options in raw_templates.items():
         raw_options = _normalize_field_keys(raw_options, f"create_templates.{template_name}")
-        # make sure the options don't define anything that cannot be handled
-        # (an ``__extend`` suffix is a valid operator on any CLI option key, so
-        # strip it before checking against the CreateCliOptions schema).
-        for field in raw_options.keys():
-            base_field = bare_key(field) if is_extend_key(field) else field
-            if base_field not in CreateCliOptions.model_fields:
-                raise ConfigParseError(
-                    f"Unknown field '{field}' in create_templates.{template_name}. Valid fields: {sorted(CreateCliOptions.model_fields.keys())}"
-                )
-        # fine, add the template
+        # Deliberately NOT rejecting keys that are not `mngr create` options here. A template
+        # may also set a field on the agent type the create resolves to -- how a role states
+        # harness behaviour (`output_style`, `append_system_prompt`) without naming a harness.
+        # Judging those requires the agent-type config registry, which the harness plugins
+        # populate only after config parsing, so any check here would see an empty registry and
+        # reject every such key. `apply_create_template` does the rejecting instead, once the
+        # type is resolved and the plugins are loaded, and its message can name the type and
+        # which types support the key.
         templates[CreateTemplateName(template_name)] = CreateTemplate.model_construct(options=raw_options)
 
     return templates
@@ -1146,9 +1178,11 @@ def parse_config(
     kwargs["is_allowed_in_pytest"] = raw.pop("is_allowed_in_pytest", None)
     kwargs["pre_command_scripts"] = raw.pop("pre_command_scripts", None)
     kwargs["work_dir_extra_paths"] = raw.pop("work_dir_extra_paths", None)
+    kwargs["strict_host_record_parsing"] = raw.pop("strict_host_record_parsing", None)
     kwargs["default_destroyed_host_persisted_seconds"] = raw.pop("default_destroyed_host_persisted_seconds", None)
     kwargs["default_min_online_host_age_seconds"] = raw.pop("default_min_online_host_age_seconds", None)
     kwargs["agent_ready_timeout"] = raw.pop("agent_ready_timeout", None)
+    kwargs["host_detail_read_timeout_seconds"] = raw.pop("host_detail_read_timeout_seconds", None)
     kwargs["allow_settings_key_assignment_narrowing"] = raw.pop("allow_settings_key_assignment_narrowing", None)
 
     if len(raw) > 0:
@@ -1161,9 +1195,7 @@ def parse_config(
     return MngrConfig.model_construct(**kwargs)
 
 
-# =============================================================================
 # Environment Variable Overrides
-# =============================================================================
 
 
 def _env_segments_to_key_path(segments: list[str]) -> list[str]:

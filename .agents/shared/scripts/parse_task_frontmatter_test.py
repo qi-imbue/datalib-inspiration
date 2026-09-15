@@ -97,19 +97,28 @@ def test_invalid_yaml(tmp_path: Path) -> None:
         parse_task_frontmatter.parse(task)
 
 
-@pytest.mark.parametrize("missing", ["lead_agent", "finish_report_path"])
-def test_missing_required_field(tmp_path: Path, missing: str) -> None:
-    lines = [
-        "---",
-        "lead_agent: a",
-        "finish_report_path: b",
-        "---",
-        "body",
-    ]
-    lines = [line for line in lines if not line.startswith(f"{missing}:")]
-    task = _write_task(tmp_path, "\n".join(lines) + "\n")
-    with pytest.raises(ValueError, match=f"missing required field `{missing}`"):
+def test_missing_finish_report_path_fails_loud(tmp_path: Path) -> None:
+    task = _write_task(tmp_path, "---\nlead_agent: a\n---\nbody\n")
+    with pytest.raises(ValueError, match="missing required field `finish_report_path`"):
         parse_task_frontmatter.parse(task)
+
+
+def test_missing_lead_agent_warns_but_parses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A task file without `lead_agent` (old launcher, newer flow) still parses.
+
+    The worker then has no push address, so the parser warns and emits no
+    LEAD_AGENT line -- the worker falls back to the same-repo delivery in
+    worker-reporting.md instead of being structurally unable to report.
+    """
+    task = _write_task(tmp_path, "---\nfinish_report_path: b\n---\nbody\n")
+    fields = parse_task_frontmatter.parse(task)
+    assert fields == {"finish_report_path": "b"}
+    assert "no `lead_agent`" in capsys.readouterr().err
+    rendered = parse_task_frontmatter._render(fields)
+    assert "LEAD_AGENT" not in rendered
+    assert "FINISH_REPORT_PATH=b" in rendered
 
 
 def test_wrong_type_int(tmp_path: Path) -> None:
@@ -210,6 +219,28 @@ body
         "ticket_id": "task-42",
         "flow": "verify",
     }
+
+
+def test_lead_work_dir_rides_through_as_a_shell_variable(tmp_path: Path) -> None:
+    """The launcher's ``lead_work_dir`` stamp reaches the worker as ``LEAD_WORK_DIR``; a task
+    file without it (an older launcher, or a launch from outside an agent) defines nothing."""
+    stamped = _write_task(
+        tmp_path,
+        """---
+lead_agent: agent-abc
+finish_report_path: b
+lead_work_dir: /home/user/.mngr/worktrees/lead-checkout
+---
+body
+""",
+    )
+    rendered = parse_task_frontmatter._render(parse_task_frontmatter.parse(stamped))
+    assert "LEAD_WORK_DIR=/home/user/.mngr/worktrees/lead-checkout\n" in rendered
+
+    (tmp_path / "unstamped").mkdir()
+    unstamped = _write_task(tmp_path / "unstamped", _VALID_FRONTMATTER)
+    rendered = parse_task_frontmatter._render(parse_task_frontmatter.parse(unstamped))
+    assert "LEAD_WORK_DIR" not in rendered
 
 
 def test_non_string_extra_keys_are_dropped(tmp_path: Path) -> None:
