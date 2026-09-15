@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client import restic_cli
 from imbue.minds.desktop_client.backup_env_store import write_canonical_env
 from imbue.minds.desktop_client.backup_status import is_workspace_backing_up
@@ -21,8 +21,8 @@ from imbue.minds.errors import BackupProvisioningError
 from imbue.mngr.primitives import AgentId
 
 
-def _paths(tmp_path: Path) -> WorkspacePaths:
-    return WorkspacePaths(data_dir=tmp_path)
+def _paths(tmp_path: Path) -> InstallationPaths:
+    return InstallationPaths(data_dir=tmp_path)
 
 
 def _now() -> datetime:
@@ -74,3 +74,30 @@ def test_snapshots_empty_then_populated_against_local_repo(tmp_path: Path) -> No
     snapshots = list_workspace_snapshots(paths, agent_id)
     assert len(snapshots) == 1
     assert snapshots[0].time.tzinfo is not None
+
+
+def _install_slow_restic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, sleep_seconds: float) -> None:
+    """Point the app at a restic stand-in that stalls before answering."""
+    stub = tmp_path / "slow-restic"
+    stub.write_text(f"#!/bin/sh\nsleep {sleep_seconds}\necho '[]'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("MINDS_RESTIC_BINARY", str(stub))
+
+
+@pytest.mark.timeout(60)
+def test_snapshot_listing_honors_the_budget_it_is_given(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A listing slower than its budget fails naming the budget; a larger budget lets it through.
+
+    The backup history page is served with a budget of its own precisely
+    because a cold listing outlives the sidebar's status budget.
+    """
+    paths = _paths(tmp_path)
+    agent_id = AgentId.generate()
+    write_canonical_env(paths, agent_id, "RESTIC_REPOSITORY=/unused\nRESTIC_PASSWORD=p\n")
+    _install_slow_restic(tmp_path, monkeypatch, sleep_seconds=2.0)
+
+    with pytest.raises(restic_cli.ResticTimeoutError) as exc_info:
+        list_workspace_snapshots(paths, agent_id, timeout_seconds=0.5)
+    assert "timed out after 0.5s" in str(exc_info.value)
+
+    assert list_workspace_snapshots(paths, agent_id, timeout_seconds=30.0) == ()

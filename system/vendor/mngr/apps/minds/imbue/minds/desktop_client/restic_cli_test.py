@@ -11,43 +11,13 @@ from pathlib import Path
 
 import pytest
 
+from imbue.concurrency_group.subprocess_utils import FinishedProcess
 from imbue.minds.desktop_client import restic_cli
 from imbue.minds.desktop_client.restic_cli import _env_and_flags
 from imbue.minds.desktop_client.restic_cli import _looks_already_initialized
 from imbue.minds.desktop_client.restic_cli import parse_restic_snapshots
-from imbue.minds.desktop_client.restic_cli import parse_restic_timestamp
 from imbue.minds.desktop_client.testing import restic_backup_a_file
 from imbue.minds.errors import BackupProvisioningError
-
-# --- parse_restic_timestamp ---
-
-
-def test_parse_restic_timestamp_handles_z_and_nanoseconds() -> None:
-    parsed = parse_restic_timestamp("2026-05-29T05:33:16.123456789Z")
-    assert parsed is not None
-    assert parsed.tzinfo is not None
-    assert parsed.year == 2026 and parsed.minute == 33
-
-
-def test_parse_restic_timestamp_handles_offset() -> None:
-    parsed = parse_restic_timestamp("2026-05-29T05:33:16+02:00")
-    assert parsed is not None
-    # Normalized to UTC.
-    offset = parsed.utcoffset()
-    assert offset is not None
-    assert offset.total_seconds() == 0
-
-
-def test_parse_restic_timestamp_assumes_utc_when_naive() -> None:
-    parsed = parse_restic_timestamp("2026-05-29T05:33:16")
-    assert parsed is not None
-    assert parsed.tzinfo is not None
-
-
-def test_parse_restic_timestamp_returns_none_on_garbage() -> None:
-    assert parse_restic_timestamp("") is None
-    assert parse_restic_timestamp("not-a-time") is None
-
 
 # --- _env_and_flags ---
 
@@ -85,6 +55,15 @@ def test_looks_like_transient_auth_failure_matches_known_signals() -> None:
     assert restic_cli._looks_like_transient_auth_failure("Fatal: open repository failed: Unauthorized") is True
     assert restic_cli._looks_like_transient_auth_failure("InvalidAccessKeyId: key is not valid") is True
     assert restic_cli._looks_like_transient_auth_failure("SignatureDoesNotMatch") is True
+    # restic renders a not-yet-propagated secret as this message, not the bare code.
+    assert (
+        restic_cli._looks_like_transient_auth_failure(
+            "Fatal: The request signature we calculated does not match the signature you provided"
+        )
+        is True
+    )
+    # The rendered access-key phrasing (spaces) is distinct from the bare InvalidAccessKeyId code.
+    assert restic_cli._looks_like_transient_auth_failure("Fatal: The provided invalid access key is not valid") is True
     assert restic_cli._looks_like_transient_auth_failure("Fatal: network unreachable") is False
     assert restic_cli._looks_like_transient_auth_failure("repository master key already initialized") is False
 
@@ -97,16 +76,46 @@ def test_looks_like_lock_write_failure_matches_signal() -> None:
     assert restic_cli._looks_like_lock_write_failure("") is False
 
 
+def _finished_restic(*, returncode: int, stderr: str, is_timed_out: bool = False) -> FinishedProcess:
+    return FinishedProcess(
+        returncode=returncode,
+        stdout="",
+        stderr=stderr,
+        command=("restic", "snapshots"),
+        is_timed_out=is_timed_out,
+        is_output_already_logged=False,
+    )
+
+
 def test_raise_restic_failure_raises_transient_for_auth_errors() -> None:
     with pytest.raises(restic_cli.ResticTransientAuthError):
-        restic_cli._raise_restic_failure("restic init", 1, "Fatal: create repository failed: Unauthorized")
+        restic_cli._raise_restic_failure(
+            "restic init",
+            _finished_restic(returncode=1, stderr="Fatal: create repository failed: Unauthorized"),
+            timeout_seconds=120.0,
+        )
 
 
 def test_raise_restic_failure_raises_fatal_for_other_errors() -> None:
     with pytest.raises(BackupProvisioningError) as exc_info:
-        restic_cli._raise_restic_failure("restic init", 1, "Fatal: host unreachable")
+        restic_cli._raise_restic_failure(
+            "restic init", _finished_restic(returncode=1, stderr="Fatal: host unreachable"), timeout_seconds=120.0
+        )
     # A non-auth failure must be the plain (non-retryable) error, not the transient subclass.
     assert not isinstance(exc_info.value, restic_cli.ResticTransientAuthError)
+
+
+def test_raise_restic_failure_reports_the_budget_a_killed_restic_blew() -> None:
+    """A timed-out restic reports only the signal that killed it, so say the budget instead."""
+    with pytest.raises(restic_cli.ResticTimeoutError) as exc_info:
+        restic_cli._raise_restic_failure(
+            "restic snapshots",
+            # What a killed restic actually leaves behind: SIGINT's 130 and no stderr.
+            _finished_restic(returncode=130, stderr="", is_timed_out=True),
+            timeout_seconds=12.0,
+        )
+    assert "timed out after 12s" in str(exc_info.value)
+    assert "130" not in str(exc_info.value)
 
 
 def test_retry_on_transient_auth_retries_until_success() -> None:

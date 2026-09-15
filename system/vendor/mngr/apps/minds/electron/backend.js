@@ -34,10 +34,11 @@ let backendProcess = null;
  * ``LATCHKEY_CURL`` is read by the upstream latchkey CLI. The dispatch
  * curl finds the impersonator binary as a sibling in the same
  * ``resources/curl/`` dir (download-binaries.js installs both or neither),
- * so no extra env var is needed. Returns ``{}`` when the dispatch curl
- * isn't bundled (a platform datalib doesn't build) so latchkey falls back
- * to the system curl -- never point ``LATCHKEY_CURL`` at a nonexistent
- * file, which would break every credential check.
+ * so no extra env var is needed. Returns ``{}`` whenever the dispatch curl
+ * is absent -- on the platforms it is never fetched for (macOS x86_64,
+ * Windows), and in packaged builds, which build.js does not stage it into --
+ * so latchkey falls back to the system curl. Never point ``LATCHKEY_CURL``
+ * at a nonexistent file, which would break every credential check.
  */
 function latchkeyCurlEnv() {
   const dispatch = paths.getLatchkeyCurlDispatchPath();
@@ -254,8 +255,8 @@ function startBackend(onProgress, onNotification, onAuthEvent, onMngrForwardStar
       // Forwarded to the Python backend so Sentry tags reports with the desktop
       // app version (release) and the git SHA the build was cut from.
       const { releaseId, gitSha } = getBuildMetadata();
-      // When build.js embedded a client.toml + root_name pair (production
-      // / staging / beta packaged builds), pass --config-file explicitly
+      // When build.js embedded a client.toml + root_name pair (any packaged
+      // build, which today means production or staging), pass --config-file explicitly
       // so the backend doesn't have to fall back to MINDS_CLIENT_CONFIG_PATH.
       // Dev-mode builds (no bundle) inherit MINDS_CLIENT_CONFIG_PATH from
       // the user's activated shell instead; the backend refuses to start
@@ -291,7 +292,7 @@ function startBackend(onProgress, onNotification, onAuthEvent, onMngrForwardStar
       };
 
       if (paths.isDev()) {
-        // Dev mode: use system uv with the monorepo workspace venv
+        // Dev shares the developer's .venv and uv.lock, so it uses their uv.
         uvBin = 'uv';
         args = [
           'run', '--package', 'minds',
@@ -309,7 +310,8 @@ function startBackend(onProgress, onNotification, onAuthEvent, onMngrForwardStar
           ...gitEnv,
           // Pair the bundled git binary with gitEnv in dev too: a system git
           // running against the payload's exec-path would be version-skewed.
-          PATH: `${paths.getGitBinDir()}:${process.env.PATH || ''}`,
+          // limactl too -- mngr_lima resolves it from PATH.
+          PATH: `${paths.getGitBinDir()}:${paths.getLimaBinDir()}:${process.env.PATH || ''}`,
           MINDS_ELECTRON: '1',
           MINDS_ROOT_NAME: mindsRootName,
           MNGR_HOST_DIR: mngrHostDir,
@@ -337,7 +339,12 @@ function startBackend(onProgress, onNotification, onAuthEvent, onMngrForwardStar
         const gitBinDir = paths.getGitBinDir();
         const limaBinDir = paths.getLimaBinDir();
         const desyncBinDir = paths.getDesyncBinDir();
-        const bundledBinDirs = [uvBinDir, gitBinDir, limaBinDir, desyncBinDir];
+        // The shim is first so it shadows /usr/bin/install_name_tool if this
+        // `uv run` is the one that has to fetch the managed CPython.
+        const bundledBinDirs = [
+          ...(process.platform === 'darwin' ? [paths.getUvShimBinDir()] : []),
+          uvBinDir, gitBinDir, limaBinDir, desyncBinDir,
+        ];
         const uvCacheDir = paths.getUvCacheDir();
         const uvPythonDir = paths.getUvPythonDir();
         const pyprojectDir = paths.getPyprojectDir();

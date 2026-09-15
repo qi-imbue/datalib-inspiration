@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Final
 
 import httpx
+import pytest
 from flask.testing import FlaskClient
 from pydantic import Field
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client.app import create_desktop_client
 from imbue.minds.desktop_client.auth import FileAuthStore
 from imbue.minds.desktop_client.backend_resolver import AgentDisplayInfo
@@ -19,13 +20,18 @@ from imbue.minds.desktop_client.backend_resolver import StaticBackendResolver
 from imbue.minds.desktop_client.cookie_manager import SESSION_COOKIE_NAME
 from imbue.minds.desktop_client.cookie_manager import create_session_cookie
 from imbue.minds.desktop_client.latchkey.gateway_client import LatchkeyGatewayClient
+from imbue.minds.desktop_client.latchkey.gateway_client import REQUEST_TYPE_WORKSPACE
 from imbue.minds.desktop_client.latchkey.handlers.messaging import MngrMessageSender
 from imbue.minds.desktop_client.latchkey.handlers.workspace import WorkspacePermissionGrantHandler
-from imbue.minds.desktop_client.request_events import RequestInbox
-from imbue.minds.desktop_client.request_events import RequestType
-from imbue.minds.desktop_client.request_events import create_latchkey_workspace_permission_request_event
-from imbue.minds.desktop_client.request_events import load_response_events
+from imbue.minds.desktop_client.latchkey.response_events import load_response_events
+from imbue.minds.desktop_client.latchkey.testing import FixedHostBackendResolver
+from imbue.minds.desktop_client.latchkey.testing import leave_permissions_on_this_computer
+from imbue.minds.desktop_client.request_handler import UiWorkspacePermissionDetail
+from imbue.minds.desktop_client.testing import StaticPendingRequests
+from imbue.minds.desktop_client.testing import create_workspace_permission_request
 from imbue.mngr.primitives import AgentId
+from imbue.mngr.primitives import HostId
+from imbue.mngr_latchkey.testing import make_full_fake_latchkey
 
 _HttpxHandler: Final = Callable[[httpx.Request], httpx.Response]
 
@@ -69,13 +75,16 @@ def _build_gateway_client(handler: _HttpxHandler) -> LatchkeyGatewayClient:
 def _make_handler(
     tmp_path: Path,
     gateway_handler: _HttpxHandler,
+    push_permissions_to_machine: Callable[[str], None] = leave_permissions_on_this_computer,
 ) -> tuple[WorkspacePermissionGrantHandler, _RecordingMessageSender]:
     sender = _RecordingMessageSender(sent_messages=[])
     return (
         WorkspacePermissionGrantHandler(
             data_dir=tmp_path,
+            latchkey=make_full_fake_latchkey(tmp_path),
             gateway_client=_build_gateway_client(gateway_handler),
             mngr_message_sender=sender,
+            push_permissions_to_machine=push_permissions_to_machine,
         ),
         sender,
     )
@@ -84,17 +93,17 @@ def _make_handler(
 def _build_authenticated_client(
     tmp_path: Path,
     handler: WorkspacePermissionGrantHandler,
-    inbox: RequestInbox,
+    inbox: StaticPendingRequests,
     backend_resolver: BackendResolverInterface,
 ) -> FlaskClient:
     auth_store = FileAuthStore(data_directory=tmp_path / "auth")
-    paths = WorkspacePaths(data_dir=tmp_path)
+    paths = InstallationPaths(data_dir=tmp_path)
     app = create_desktop_client(
         auth_store=auth_store,
         backend_resolver=backend_resolver,
         http_client=None,
         paths=paths,
-        request_inbox=inbox,
+        pending_requests=inbox,
         request_event_handlers=(handler,),
     )
     client = app.test_client()
@@ -107,75 +116,8 @@ def _build_authenticated_client(
 
 def test_handler_claims_workspace_request_type(tmp_path: Path) -> None:
     handler, _sender = _make_handler(tmp_path, lambda r: httpx.Response(204))
-    assert handler.handles_request_type() == str(RequestType.WORKSPACE_PERMISSION)
+    assert handler.handles_request_type() == REQUEST_TYPE_WORKSPACE
     assert handler.kind_label() == "machine access"
-
-
-# -- render_request_detail_fragment --
-
-
-def test_render_fragment_shows_verbs_rationale_and_target_choice(tmp_path: Path) -> None:
-    handler, _sender = _make_handler(tmp_path, lambda r: httpx.Response(204))
-    target = AgentId()
-    event = create_latchkey_workspace_permission_request_event(
-        agent_id=str(AgentId()),
-        rationale="manage my sibling machine",
-        permissions=(PERM_WORKSPACES_DESTROY,),
-        target_workspace_id=str(target),
-    )
-    resolver = _NamingBackendResolver(
-        url_by_agent_and_service={},
-        workspace_name_by_agent={str(target): "Target WS"},
-    )
-    body = handler.render_request_detail_fragment(
-        req_event=event,
-        backend_resolver=resolver,
-        mngr_forward_origin="http://localhost:8421",
-    )
-    assert "manage my sibling machine" in body
-    assert PERM_WORKSPACES_DESTROY in body
-    assert 'name="target_scope"' in body
-    assert "Target WS" in body
-    assert "All machines" in body
-    assert "Approve" in body and "Deny" in body
-    assert "<html" not in body
-    # Targeted request: both the general and the workspace-specific groups show,
-    # and the general (non-targeted) read verb still appears alongside the
-    # targeted destroy verb. The workspace-specific group shows the plain hint,
-    # not the broad-scope caution (which is reserved for target-less requests).
-    assert "General permissions" in body
-    assert "Machine-specific permissions" in body
-    assert PERM_WORKSPACES_READ in body
-    assert "These act on individual machines." in body
-    assert "c-warning-surface" not in body
-
-
-def test_render_fragment_without_target_offers_broad_only(tmp_path: Path) -> None:
-    handler, _sender = _make_handler(tmp_path, lambda r: httpx.Response(204))
-    event = create_latchkey_workspace_permission_request_event(
-        agent_id=str(AgentId()),
-        rationale="create and list machines",
-        permissions=(PERM_WORKSPACES_READ,),
-        target_workspace_id=None,
-    )
-    body = handler.render_request_detail_fragment(
-        req_event=event,
-        backend_resolver=_NamingBackendResolver(url_by_agent_and_service={}),
-        mngr_forward_origin="",
-    )
-    # No target named: both groups still show (the workspace-specific verbs can
-    # be granted), but the only possible scope is broad, so there is a single
-    # pre-selected "All workspaces" radio and no per-workspace ("selected")
-    # option. The broad-scope caution is shown in place of the plain hint.
-    assert "General permissions" in body
-    assert "Machine-specific permissions" in body
-    assert PERM_WORKSPACES_READ in body
-    assert PERM_WORKSPACES_DESTROY in body
-    assert 'name="target_scope" value="all"' in body
-    assert 'value="selected"' not in body
-    assert "c-warning-surface" in body
-    assert "all machines" in body
-    assert "These act on individual machines." not in body
 
 
 # -- apply_grant_request --
@@ -193,13 +135,13 @@ def test_grant_selected_sends_override_with_target(tmp_path: Path) -> None:
     handler, sender = _make_handler(tmp_path, _gateway_handler)
     requester = AgentId()
     target = AgentId()
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(requester),
         rationale="destroy sibling",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(target),
     )
-    inbox = RequestInbox().add_request(event)
+    inbox = StaticPendingRequests(pending=(event,))
     resolver = _NamingBackendResolver(
         url_by_agent_and_service={},
         workspace_name_by_agent={str(target): "Target WS"},
@@ -207,14 +149,14 @@ def test_grant_selected_sends_override_with_target(tmp_path: Path) -> None:
     client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
     response = client.post(
-        f"/requests/{event.event_id}/grant",
+        f"/requests/{event.request_id}/grant",
         data={"permissions": PERM_WORKSPACES_DESTROY, "target_scope": "selected"},
     )
     assert response.status_code == 200, response.text
     assert response.get_json()["outcome"] == "GRANTED"
     # The gateway received an approve POST with the verbs + selected target.
     assert captured["method"] == "POST"
-    assert str(captured["path"]).endswith(f"/permission-requests/approve/{event.event_id}")
+    assert str(captured["path"]).endswith(f"/permission-requests/approve/{event.request_id}")
     sent_body = captured["content"]
     assert isinstance(sent_body, bytes)
     assert json.loads(sent_body) == {
@@ -238,18 +180,18 @@ def test_grant_all_sends_override_with_null_target(tmp_path: Path) -> None:
 
     handler, _sender = _make_handler(tmp_path, _gateway_handler)
     target = AgentId()
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(AgentId()),
         rationale="destroy anything",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(target),
     )
-    inbox = RequestInbox().add_request(event)
+    inbox = StaticPendingRequests(pending=(event,))
     resolver = _NamingBackendResolver(url_by_agent_and_service={})
     client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
     response = client.post(
-        f"/requests/{event.event_id}/grant",
+        f"/requests/{event.request_id}/grant",
         data={"permissions": PERM_WORKSPACES_DESTROY, "target_scope": "all"},
     )
     assert response.status_code == 200, response.text
@@ -272,17 +214,17 @@ def test_grant_rejects_empty_permissions(tmp_path: Path) -> None:
         return httpx.Response(200, json={"request_id": "evt-abc"})
 
     handler, sender = _make_handler(tmp_path, _gateway_handler)
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(AgentId()),
         rationale="x",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(AgentId()),
     )
-    inbox = RequestInbox().add_request(event)
+    inbox = StaticPendingRequests(pending=(event,))
     resolver = _NamingBackendResolver(url_by_agent_and_service={})
     client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
-    response = client.post(f"/requests/{event.event_id}/grant", data={})
+    response = client.post(f"/requests/{event.request_id}/grant", data={})
     assert response.status_code == 400
     assert gateway_called is False
     assert load_response_events(tmp_path) == []
@@ -295,17 +237,17 @@ def test_grant_returns_502_when_gateway_rejects(tmp_path: Path) -> None:
         return httpx.Response(500, json={"error": "boom"})
 
     handler, sender = _make_handler(tmp_path, _gateway_handler)
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(AgentId()),
         rationale="x",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(AgentId()),
     )
-    inbox = RequestInbox().add_request(event)
+    inbox = StaticPendingRequests(pending=(event,))
     resolver = _NamingBackendResolver(url_by_agent_and_service={})
     client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
-    response = client.post(f"/requests/{event.event_id}/grant", data={"permissions": PERM_WORKSPACES_DESTROY})
+    response = client.post(f"/requests/{event.request_id}/grant", data={"permissions": PERM_WORKSPACES_DESTROY})
     assert response.status_code == 502
     assert "gateway" in response.get_json()["error"].lower()
     # The request stays pending: no response event, no agent notification.
@@ -326,42 +268,102 @@ def test_deny_calls_gateway_delete_writes_response_notifies(tmp_path: Path) -> N
 
     handler, sender = _make_handler(tmp_path, _gateway_handler)
     requester = AgentId()
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(requester),
         rationale="please",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(AgentId()),
     )
-    inbox = RequestInbox().add_request(event)
+    inbox = StaticPendingRequests(pending=(event,))
     resolver = _NamingBackendResolver(url_by_agent_and_service={})
     client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
-    response = client.post(f"/requests/{event.event_id}/deny")
+    response = client.post(f"/requests/{event.request_id}/deny")
     assert response.status_code == 200
     assert response.get_json()["outcome"] == "DENIED"
     assert captured["method"] == "DELETE"
-    assert str(captured["path"]).endswith(f"/permission-requests/{event.event_id}")
+    assert str(captured["path"]).endswith(f"/permission-requests/{event.request_id}")
     response_events = load_response_events(tmp_path)
     assert len(response_events) == 1 and response_events[0].status == "DENIED"
     assert sender.sent_messages and sender.sent_messages[0][0] == str(requester)
 
 
-def test_inbox_detail_route_dispatches_to_handler(tmp_path: Path) -> None:
+def test_build_request_detail_payload_mirrors_the_fragment_data(tmp_path: Path) -> None:
     handler, _sender = _make_handler(tmp_path, lambda r: httpx.Response(204))
     target = AgentId()
-    event = create_latchkey_workspace_permission_request_event(
+    event = create_workspace_permission_request(
         agent_id=str(AgentId()),
-        rationale="r",
+        rationale="manage my sibling machine",
         permissions=(PERM_WORKSPACES_DESTROY,),
         target_workspace_id=str(target),
     )
-    inbox = RequestInbox().add_request(event)
     resolver = _NamingBackendResolver(
         url_by_agent_and_service={},
         workspace_name_by_agent={str(target): "Target WS"},
     )
-    client = _build_authenticated_client(tmp_path, handler, inbox, resolver)
 
-    response = client.get(f"/inbox/detail/{event.event_id}")
-    assert response.status_code == 200
-    assert PERM_WORKSPACES_DESTROY in response.text
+    payload = handler.build_request_detail_payload(permission_request=event, backend_resolver=resolver)
+
+    if not isinstance(payload, UiWorkspacePermissionDetail):
+        pytest.fail(f"expected a workspace detail payload, got {payload!r}")
+    assert payload.request_id == event.request_id
+    assert payload.rationale == "manage my sibling machine"
+    assert payload.checked_permissions == (PERM_WORKSPACES_DESTROY,)
+    assert payload.target_workspace_id == str(target)
+    assert payload.target_workspace_name == "Target WS"
+    assert payload.show_target_choice is True
+    verb_permissions = [verb.permission for verb in payload.verbs]
+    assert PERM_WORKSPACES_DESTROY in verb_permissions
+    assert PERM_WORKSPACES_READ in verb_permissions
+
+
+def test_build_request_detail_payload_without_target_disables_target_choice(tmp_path: Path) -> None:
+    handler, _sender = _make_handler(tmp_path, lambda r: httpx.Response(204))
+    event = create_workspace_permission_request(
+        agent_id=str(AgentId()),
+        rationale="broad access",
+        permissions=(PERM_WORKSPACES_DESTROY,),
+        target_workspace_id=None,
+    )
+
+    payload = handler.build_request_detail_payload(
+        permission_request=event,
+        backend_resolver=StaticBackendResolver(url_by_agent_and_service={}),
+    )
+
+    if not isinstance(payload, UiWorkspacePermissionDetail):
+        pytest.fail(f"expected a workspace detail payload, got {payload!r}")
+    assert payload.target_workspace_id is None
+    assert payload.show_target_choice is False
+
+
+def test_grant_hands_the_spliced_policy_to_the_workspaces_own_machine(tmp_path: Path) -> None:
+    """The gateway splices the grant into this computer's copy; the machine enforces its own."""
+    carried: list[str] = []
+    handler, _sender = _make_handler(
+        tmp_path,
+        lambda _req: httpx.Response(200, json={"request_id": "evt-abc", "applied": {}}),
+        push_permissions_to_machine=carried.append,
+    )
+    requester = AgentId()
+    host_id = HostId()
+    event = create_workspace_permission_request(
+        agent_id=str(requester),
+        rationale="destroy sibling",
+        permissions=(PERM_WORKSPACES_DESTROY,),
+        target_workspace_id=None,
+    )
+    client = _build_authenticated_client(
+        tmp_path,
+        handler,
+        StaticPendingRequests(pending=(event,)),
+        FixedHostBackendResolver(url_by_agent_and_service={}, fixed_host_id=host_id, known_agent_ids=(requester,)),
+    )
+
+    response = client.post(
+        f"/requests/{event.request_id}/grant",
+        data={"permissions": PERM_WORKSPACES_DESTROY, "target_scope": "all"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert carried == [str(requester)]

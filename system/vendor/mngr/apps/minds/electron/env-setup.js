@@ -1,5 +1,6 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const paths = require('./paths');
 
 /**
@@ -47,12 +48,16 @@ function runEnvSetup(onProgress) {
       'imbue-mngr',
       'imbue-mngr-aws',
       'imbue-mngr-claude',
+      'imbue-mngr-codex',
       'imbue-mngr-forward',
       'imbue-mngr-imbue-cloud',
       'imbue-mngr-latchkey',
       'imbue-mngr-lima',
       'imbue-mngr-modal',
       'imbue-mngr-ovh',
+      'imbue-mngr-pi-coding',
+      'imbue-mngr-opencode',
+      'imbue-mngr-antigravity',
       'imbue-mngr-vps',
       'imbue-common',
       'concurrency-group',
@@ -73,6 +78,12 @@ function runEnvSetup(onProgress) {
 
     const env = {
       ...process.env,
+      // This sync is what downloads the managed CPython, after which uv execs a
+      // bare `install_name_tool`; the shim keeps that off /usr/bin's xcselect
+      // stub, which would raise the Xcode developer-tools installer.
+      ...(process.platform === 'darwin'
+        ? { PATH: [paths.getUvShimBinDir(), process.env.PATH].filter(Boolean).join(path.delimiter) }
+        : {}),
       VIRTUAL_ENV: venvDir,
       UV_CACHE_DIR: uvCacheDir,
       UV_PYTHON_INSTALL_DIR: uvPythonDir,

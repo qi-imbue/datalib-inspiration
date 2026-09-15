@@ -17,7 +17,7 @@ from uuid import uuid4
 from flask.testing import FlaskClient
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client.agent_creator import AgentCreator
 from imbue.minds.desktop_client.agent_creator import CreateAttemptLogSink
 from imbue.minds.desktop_client.agent_creator import LOG_SENTINEL
@@ -104,7 +104,7 @@ def _make_client_with_store(
     creator: AgentCreator
     if live_create_attempt_id_str is None:
         creator = AgentCreator(
-            paths=WorkspacePaths(data_dir=tmp_path / "minds"),
+            paths=InstallationPaths(data_dir=tmp_path / "minds"),
             root_concurrency_group=root_concurrency_group,
             notification_dispatcher=notification_dispatcher,
             system_interface_health_tracker=SystemInterfaceHealthTracker(),
@@ -113,7 +113,7 @@ def _make_client_with_store(
     else:
         creator = _FixedLiveCreateAttemptAgentCreator(
             live_create_attempt_id_str=live_create_attempt_id_str,
-            paths=WorkspacePaths(data_dir=tmp_path / "minds"),
+            paths=InstallationPaths(data_dir=tmp_path / "minds"),
             root_concurrency_group=root_concurrency_group,
             notification_dispatcher=notification_dispatcher,
             system_interface_health_tracker=SystemInterfaceHealthTracker(),
@@ -125,7 +125,7 @@ def _make_client_with_store(
         backend_resolver=StaticBackendResolver(url_by_agent_and_service={}),
         http_client=None,
         agent_creator=creator,
-        paths=WorkspacePaths(data_dir=tmp_path / "minds"),
+        paths=InstallationPaths(data_dir=tmp_path / "minds"),
         root_concurrency_group=root_concurrency_group,
         mngr_binary=mngr_binary,
     )
@@ -154,164 +154,6 @@ def test_workspace_list_payload_carries_create_attempt_entries(
     assert create_attempt_entry["name"] == "Row Test Name"
     assert create_attempt_entry["accent"] == "#a1b2c3"
     assert create_attempt_entry["account"] == "owner@example.com"
-
-
-def test_landing_page_shows_interrupted_create_attempt_row(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(_record(create_attempt_id, PendingCreateAttemptState.IN_FLIGHT))
-
-    response = client.get("/")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "Row Test Name" in html
-    assert "Interrupted" in html
-    assert f"/creating/{create_attempt_id}" in html
-
-
-def test_landing_page_shows_failed_create_attempt_row(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(_record(create_attempt_id, PendingCreateAttemptState.FAILED, error="mngr create exploded"))
-
-    response = client.get("/")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "Create failed" in html
-    assert f"/creating/{create_attempt_id}" in html
-
-
-def test_creating_page_renders_interrupted_record_with_retry_and_discard(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(_record(create_attempt_id, PendingCreateAttemptState.IN_FLIGHT))
-
-    response = client.get(f"/creating/{create_attempt_id}")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "Interrupted" in html
-    assert f"/create?retry={create_attempt_id}" in html
-    assert "create-attempt-discard-btn" in html
-
-
-def test_creating_page_renders_failed_record_with_error_and_log_tail(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(
-        _record(
-            create_attempt_id,
-            PendingCreateAttemptState.FAILED,
-            error="clone blew up",
-            log_tail=("line one of the tail", "line two of the tail"),
-        )
-    )
-
-    response = client.get(f"/creating/{create_attempt_id}")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "clone blew up" in html
-    assert "line two of the tail" in html
-    assert "create-attempt-dismiss-btn" in html
-
-
-def test_creating_page_redirects_home_without_a_record(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, _store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-
-    response = client.get(f"/creating/{_create_attempt_id()}")
-
-    assert response.status_code == 303
-    assert response.headers["Location"] == "/"
-
-
-def test_create_page_retry_prefills_the_form_from_the_record(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(_record(create_attempt_id, PendingCreateAttemptState.IN_FLIGHT, launch_mode=LaunchMode.LIMA))
-
-    response = client.get(f"/create?retry={create_attempt_id}")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "https://example.com/some-repo.git" in html
-    assert "feature-branch-7" in html
-    assert "Row Test Name" in html
-
-
-def test_create_page_retry_threads_machine_size_and_drops_a_ghost_cloud_account(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    """A BYOK retry restores the machine size; a since-deleted account degrades gracefully.
-
-    The record names a cloud account that no longer exists (this test env has
-    none configured), so no BYOK option is pre-selected -- but the page still
-    renders with the rest of the request pre-filled and the stored machine
-    size threaded into the instance-type populate JS (which itself falls back
-    to the default when the size is not offered).
-    """
-    client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-    create_attempt_id = _create_attempt_id()
-    store.write_record(
-        _record(
-            create_attempt_id,
-            PendingCreateAttemptState.IN_FLIGHT,
-            launch_mode=LaunchMode.GCP,
-            provider_instance_name="byok-gcp-ghost",
-            cloud_account="byok-gcp-ghost",
-            instance_type="e2-standard-4",
-        )
-    )
-
-    response = client.get(f"/create?retry={create_attempt_id}")
-
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert "https://example.com/some-repo.git" in html
-    assert 'var instanceTypePreselect = "e2-standard-4";' in html
-    # The ghost account produced no selected BYOK option (none exists at all).
-    assert "BYOK:byok-gcp-ghost" not in html
-
-
-def test_create_page_ignores_an_unknown_retry_id(
-    tmp_path: Path,
-    root_concurrency_group: ConcurrencyGroup,
-    notification_dispatcher: NotificationDispatcher,
-) -> None:
-    client, _store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
-
-    response = client.get(f"/create?retry={_create_attempt_id()}")
-
-    assert response.status_code == 200
-    assert "feature-branch-7" not in response.get_data(as_text=True)
 
 
 def test_dismiss_create_attempt_deletes_the_record(
@@ -351,7 +193,7 @@ def test_discard_without_leftover_host_completes_and_deletes_the_record(
     assert status_response.status_code == 200
     assert status_response.get_json()["is_done"] is True
     assert store.read_record(create_attempt_id) is None
-    paths = WorkspacePaths(data_dir=tmp_path / "minds")
+    paths = InstallationPaths(data_dir=tmp_path / "minds")
     assert read_discard(create_attempt_id, paths) is None
     # A later poll of the finalized discard reads as unknown.
     assert client.get(f"/api/v1/workspaces/operations/create-attempt-discard/{create_attempt_id}").status_code == 404
@@ -378,7 +220,7 @@ def test_discard_with_leftover_labeled_host_destroys_it_and_finalizes(
     notification_dispatcher: NotificationDispatcher,
 ) -> None:
     """The labeled-provider (lima) path end to end: the route looks the
-    leftover host up by its workspace-id label, spawns the detached destroy,
+    leftover host up by its create-attempt-id label, spawns the detached destroy,
     and the first DONE status read finalizes (record + discard dir gone)."""
     create_attempt_id = _create_attempt_id()
     mngr_binary, calls_path = _write_fake_listing_mngr(
@@ -390,7 +232,7 @@ def test_discard_with_leftover_labeled_host_destroys_it_and_finalizes(
                     "name": "row-test-name",
                     "provider": "lima",
                     "state": "BUILDING",
-                    "labels": {"workspace-id": create_attempt_id},
+                    "labels": {"create-attempt-id": create_attempt_id},
                 }
             ]
         },
@@ -411,7 +253,7 @@ def test_discard_with_leftover_labeled_host_destroys_it_and_finalizes(
     assert post_response.status_code == 202
 
     # The detached destroy is a real subprocess: wait for it to finish.
-    paths = WorkspacePaths(data_dir=tmp_path / "minds")
+    paths = InstallationPaths(data_dir=tmp_path / "minds")
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         record = read_discard(create_attempt_id, paths)
@@ -459,7 +301,7 @@ def test_discard_of_a_done_record_is_refused_with_409(
     notification_dispatcher: NotificationDispatcher,
 ) -> None:
     """A DONE record's workspace exists (its host still carries the
-    workspace-id label), so a discard would destroy a healthy workspace; the
+    create-attempt-id label), so a discard would destroy a healthy workspace; the
     route must refuse and leave the record to the discovery sweep."""
     client, store, _creator = _make_client_with_store(tmp_path, root_concurrency_group, notification_dispatcher)
     create_attempt_id = _create_attempt_id()
@@ -477,7 +319,7 @@ def test_discard_of_a_done_record_is_refused_with_409(
     assert response.status_code == 409
     assert store.read_record(create_attempt_id) is not None
     # No discard was started for it either.
-    assert read_discard(create_attempt_id, WorkspacePaths(data_dir=tmp_path / "minds")) is None
+    assert read_discard(create_attempt_id, InstallationPaths(data_dir=tmp_path / "minds")) is None
 
 
 def test_discard_of_unknown_create_attempt_returns_404(
@@ -503,7 +345,7 @@ def test_discard_status_reports_failed_without_finalizing_when_the_wrapper_died(
     store.write_record(_record(create_attempt_id, PendingCreateAttemptState.IN_FLIGHT))
     # Simulate a discard whose wrapper died without writing an exit code:
     # derived status FAILED, never finalized, record kept.
-    paths = WorkspacePaths(data_dir=tmp_path / "minds")
+    paths = InstallationPaths(data_dir=tmp_path / "minds")
     discard_dir = paths.data_dir / "discarding_create_attempts" / create_attempt_id
     discard_dir.mkdir(parents=True)
     (discard_dir / "output.log").write_text("partial output\n")
@@ -539,7 +381,7 @@ def test_create_operation_log_stream_replays_history_for_every_reader(
     log_sink.put("second history line")
     log_sink.put(LOG_SENTINEL)
     creator = _FixedLogSinkAgentCreator(
-        paths=WorkspacePaths(data_dir=tmp_path / "minds"),
+        paths=InstallationPaths(data_dir=tmp_path / "minds"),
         root_concurrency_group=root_concurrency_group,
         notification_dispatcher=notification_dispatcher,
         system_interface_health_tracker=SystemInterfaceHealthTracker(),
@@ -552,7 +394,7 @@ def test_create_operation_log_stream_replays_history_for_every_reader(
         backend_resolver=StaticBackendResolver(url_by_agent_and_service={}),
         http_client=None,
         agent_creator=creator,
-        paths=WorkspacePaths(data_dir=tmp_path / "minds"),
+        paths=InstallationPaths(data_dir=tmp_path / "minds"),
         root_concurrency_group=root_concurrency_group,
     )
     client = app.test_client()

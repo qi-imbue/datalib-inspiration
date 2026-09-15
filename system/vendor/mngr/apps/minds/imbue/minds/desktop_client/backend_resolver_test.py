@@ -109,6 +109,30 @@ def test_parse_service_log_records_parses_valid_jsonl() -> None:
     assert isinstance(records[0], ServiceLogRecord)
     assert records[0].service == ServiceName("web")
     assert records[0].url == "http://127.0.0.1:9100"
+    # No ``label`` in the row -> empty: a legacy row with no share link.
+    assert records[0].label == ""
+
+
+def test_parse_service_log_records_captures_the_origin_label() -> None:
+    text = '{"service": "terminal", "url": "http://127.0.0.1:9100", "label": "terminal-x7k9q2w1"}\n'
+    records = parse_service_log_records(text)
+
+    assert len(records) == 1
+    assert isinstance(records[0], ServiceLogRecord)
+    assert records[0].label == "terminal-x7k9q2w1"
+
+
+def test_parse_service_log_records_captures_the_registered_icon() -> None:
+    text = '{"service": "notes", "url": "http://127.0.0.1:9100", "icon": "<svg viewBox=\\"0 0 24 24\\"></svg>"}\n'
+    records = parse_service_log_records(text)
+
+    assert len(records) == 1
+    assert isinstance(records[0], ServiceLogRecord)
+    assert records[0].icon == '<svg viewBox="0 0 24 24"></svg>'
+    # No ``icon`` in the row -> empty (an app that registered none).
+    bare = parse_service_log_records('{"service": "web", "url": "http://127.0.0.1:9101"}\n')
+    assert isinstance(bare[0], ServiceLogRecord)
+    assert bare[0].icon == ""
 
 
 def test_parse_service_log_records_returns_empty_for_empty_input() -> None:
@@ -551,6 +575,39 @@ def test_host_state_override_wins_over_discovery_then_drops_on_agreement() -> No
     assert resolver.get_host_state(host) is HostState.RUNNING
 
 
+def test_stopped_override_is_retired_by_a_backend_observed_stopping_reading() -> None:
+    """Discovery observing the stop still in flight (STOPPING) retires a STOPPED override.
+
+    An imbue_cloud host stop returns once the stop is accepted, while the
+    workspace reports STOPPING for as long as its upload runs -- that reading
+    is fresher than the optimistic settle, so the honest "Stopping" badge must
+    show instead of an already-startable "Stopped" one.
+    """
+    host = HostId.generate()
+    agent = AgentId.generate()
+    resolver = _resolver_with_host_state(host, agent, HostState.RUNNING)
+    resolver.set_host_state_override(host, HostState.STOPPED)
+
+    resolver.update_agents(
+        ParsedAgentsResult(
+            agent_ids=(agent,),
+            discovered_agents=(_workspace_agent(host, agent),),
+            host_state_by_host_id={str(host): HostState.STOPPING},
+        )
+    )
+
+    assert resolver.get_host_state(host) is HostState.STOPPING
+    # The override is gone: the eventual settled reading shows unmasked.
+    resolver.update_agents(
+        ParsedAgentsResult(
+            agent_ids=(agent,),
+            discovered_agents=(_workspace_agent(host, agent),),
+            host_state_by_host_id={str(host): HostState.STOPPED},
+        )
+    )
+    assert resolver.get_host_state(host) is HostState.STOPPED
+
+
 def test_clear_host_state_override_reverts_to_discovery() -> None:
     host = HostId.generate()
     agent = AgentId.generate()
@@ -717,6 +774,30 @@ def test_list_restorable_workspace_ids_keeps_workspace_after_discovery_loss(tmp_
     resolver.update_agents(ParsedAgentsResult())
     assert resolver.list_active_workspace_ids() == ()
     assert resolver.list_restorable_workspace_ids() == (agent,)
+
+
+def test_list_restorable_workspace_host_ids_carries_the_host_coordinate(tmp_path: Path) -> None:
+    """The restorable set's host coordinates mirror the agent-keyed set, live and last-good.
+
+    Persisted window URLs are host-keyed (``/goto/<host-id>/``), so the restore
+    filter needs the host coordinate for exactly the same workspaces the
+    agent-keyed set recognizes -- including one that discovery has lost but the
+    last-good topology remembers.
+    """
+    topology_path = tmp_path / "last_good_agent_topology.json"
+    host = HostId.generate()
+    agent = AgentId.generate()
+    resolver = MngrCliBackendResolver(last_good_agents_path=topology_path)
+    resolver.update_agents(
+        ParsedAgentsResult(agent_ids=(agent,), discovered_agents=(_primary_system_services_agent(host, agent),))
+    )
+    assert resolver.list_restorable_workspace_host_ids() == (str(host),)
+
+    # Discovery loses the host (empty snapshot); the host coordinate survives
+    # via the last-good topology, just like the agent coordinate does.
+    resolver.update_agents(ParsedAgentsResult())
+    assert resolver.list_restorable_workspace_ids() == (agent,)
+    assert resolver.list_restorable_workspace_host_ids() == (str(host),)
 
 
 def test_list_restorable_workspace_ids_unions_live_and_last_good(tmp_path: Path) -> None:
@@ -928,6 +1009,78 @@ def test_last_good_topology_retains_provider_hosts_on_errored_snapshot(tmp_path:
 
     assert str(cloud_host) in _read_last_good_agent_topology(topology_path).agents_by_host
     assert set(resolver.list_restorable_workspace_ids()) == {cloud_agent}
+
+
+def test_is_host_positively_absent_requires_a_clean_snapshot_from_the_owning_provider() -> None:
+    """Absence evidence needs a clean snapshot: before one arrives there is no
+    evidence (the startup warm-up window that once let a FAILED destroy finalize
+    as DONE), and a clean snapshot that still lists the host proves presence."""
+    host_id = HostId.generate()
+    provider = ProviderInstanceName("imbue_cloud_user")
+    resolver = MngrCliBackendResolver()
+
+    # No snapshot from the provider yet: no evidence.
+    assert not resolver.is_host_positively_absent(provider, host_id)
+
+    # A clean snapshot that still lists the host: present, not absent.
+    resolver.update_providers(
+        provider_name=provider,
+        provider=None,
+        error=None,
+        last_snapshot_at=datetime.now(timezone.utc),
+        clean_snapshot_host_ids=(str(host_id),),
+    )
+    assert not resolver.is_host_positively_absent(provider, host_id)
+
+    # A later clean snapshot without the host: positively absent.
+    resolver.update_providers(
+        provider_name=provider,
+        provider=None,
+        error=None,
+        last_snapshot_at=datetime.now(timezone.utc),
+        clean_snapshot_host_ids=(),
+    )
+    assert resolver.is_host_positively_absent(provider, host_id)
+
+
+def test_is_host_positively_absent_ignores_errored_and_not_state_current_snapshots() -> None:
+    """An errored poll proves nothing (hosts unreachable, not absent), and a
+    snapshot whose state-current claim was dropped (production: the errored
+    pre-start replay) carries no usable state -- neither may create or replace
+    absence evidence."""
+    host_id = HostId.generate()
+    provider = ProviderInstanceName("imbue_cloud_user")
+    resolver = MngrCliBackendResolver()
+
+    # A snapshot marked not state-current records no evidence, even though it
+    # is error-free and omits the host.
+    resolver.update_providers(
+        provider_name=provider,
+        provider=None,
+        error=None,
+        last_snapshot_at=datetime.now(timezone.utc),
+        clean_snapshot_host_ids=(),
+        is_snapshot_state_current=False,
+    )
+    assert not resolver.is_host_positively_absent(provider, host_id)
+
+    # A clean snapshot listing the host, then an errored poll: the errored poll
+    # must not replace the presence evidence with absence.
+    resolver.update_providers(
+        provider_name=provider,
+        provider=None,
+        error=None,
+        last_snapshot_at=datetime.now(timezone.utc),
+        clean_snapshot_host_ids=(str(host_id),),
+    )
+    resolver.update_providers(
+        provider_name=provider,
+        provider=None,
+        error=DiscoveryError(type_name="ProviderUnavailableError", message="cloud down", provider_name=provider),
+        last_snapshot_at=datetime.now(timezone.utc),
+        clean_snapshot_host_ids=None,
+    )
+    assert not resolver.is_host_positively_absent(provider, host_id)
 
 
 def test_last_good_topology_resets_legacy_file_without_provider_names(tmp_path: Path) -> None:
@@ -1201,6 +1354,31 @@ def test_mngr_cli_resolver_update_services_replaces_state() -> None:
     assert resolver.get_backend_url(_AGENT_A, _SERVICE_WEB) == "http://127.0.0.1:9200"
 
 
+def test_mngr_cli_resolver_exposes_per_service_origin_labels() -> None:
+    """update_services carries the per-service origin labels, keyed by service name."""
+    resolver = MngrCliBackendResolver()
+
+    resolver.update_services(
+        _AGENT_A,
+        {"terminal": "http://127.0.0.1:9100", "web": "http://127.0.0.1:9200"},
+        {"terminal": "terminal-x7k9q2w1"},
+    )
+    # A service with a label is exposed; one with none (``web``) is omitted
+    # (it has no share link).
+    assert resolver.list_service_labels_for_agent(_AGENT_A) == {ServiceName("terminal"): "terminal-x7k9q2w1"}
+
+
+def test_mngr_cli_resolver_replaces_labels_and_defaults_to_empty() -> None:
+    """A later update_services replaces the label map; omitting labels clears it."""
+    resolver = MngrCliBackendResolver()
+
+    resolver.update_services(_AGENT_A, {"terminal": "http://127.0.0.1:9100"}, {"terminal": "terminal-aaaa"})
+    assert resolver.list_service_labels_for_agent(_AGENT_A) == {ServiceName("terminal"): "terminal-aaaa"}
+
+    resolver.update_services(_AGENT_A, {"terminal": "http://127.0.0.1:9100"})
+    assert resolver.list_service_labels_for_agent(_AGENT_A) == {}
+
+
 # -- parse_agents_from_json tests --
 
 
@@ -1243,6 +1421,41 @@ def test_parse_agents_from_json_extracts_ssh_info() -> None:
     assert ssh_info.host == "remote.example.com"
     assert ssh_info.port == 12345
     assert ssh_info.key_path == Path("/home/user/.mngr/providers/modal/modal_ssh_key")
+    # Older mngr versions don't emit known_hosts_path; its absence must parse as
+    # None (the tunnel then falls back to the key-sibling convention).
+    assert ssh_info.known_hosts_path is None
+
+
+def test_parse_agents_from_json_carries_the_explicit_known_hosts_path() -> None:
+    ssh_data = {
+        "user": "root",
+        "host": "remote.example.com",
+        "port": 12345,
+        "key_path": "/tmp/key",
+        "known_hosts_path": "/tmp/pins/known_hosts",
+    }
+    json_str = _make_agents_json_with_ssh((str(_AGENT_A), ssh_data))
+    result = parse_agents_from_json(json_str)
+
+    ssh_info = result.ssh_info_by_agent_id.get(str(_AGENT_A))
+    assert ssh_info is not None
+    assert ssh_info.known_hosts_path == Path("/tmp/pins/known_hosts")
+
+
+def test_parse_agents_from_json_drops_ssh_info_with_a_non_string_known_hosts_path() -> None:
+    """A malformed known_hosts_path value must degrade to no SSH info, not crash the parse."""
+    ssh_data = {
+        "user": "root",
+        "host": "remote.example.com",
+        "port": 12345,
+        "key_path": "/tmp/key",
+        "known_hosts_path": 123,
+    }
+    json_str = _make_agents_json_with_ssh((str(_AGENT_A), ssh_data))
+    result = parse_agents_from_json(json_str)
+
+    assert _AGENT_A in result.agent_ids
+    assert str(_AGENT_A) not in result.ssh_info_by_agent_id
 
 
 def test_parse_agents_from_json_returns_none_ssh_for_local_agents() -> None:
@@ -1375,6 +1588,31 @@ def test_mngr_cli_resolver_get_agent_display_info_returns_none_for_unknown_agent
     resolver = make_resolver_with_data(agents_json=agents_json, service_logs={})
 
     assert resolver.get_agent_display_info(_AGENT_B) is None
+
+
+def test_mngr_cli_resolver_get_agent_display_info_picks_smallest_host_for_duplicated_id() -> None:
+    """A workspace id on two machines (agent ids are unique per host) resolves deterministically.
+
+    The instances are fed in descending host-id order to prove the selection sorts
+    by host id rather than following discovery order, so the displayed machine
+    cannot flap between refreshes during a migration window.
+    """
+    host_id_small = "host-" + "0" * 31 + "1"
+    host_id_large = "host-" + "0" * 31 + "2"
+    agents_json = json.dumps(
+        {
+            "agents": [
+                {"id": str(_AGENT_A), "host": {"id": host_id_large, "name": "machine-two"}},
+                {"id": str(_AGENT_A), "host": {"id": host_id_small, "name": "machine-one"}},
+            ]
+        }
+    )
+    resolver = make_resolver_with_data(agents_json=agents_json, service_logs={})
+
+    info = resolver.get_agent_display_info(_AGENT_A)
+
+    assert info is not None
+    assert info.host_id == host_id_small
 
 
 # -- BackendResolverInterface.get_agent_display_info default --

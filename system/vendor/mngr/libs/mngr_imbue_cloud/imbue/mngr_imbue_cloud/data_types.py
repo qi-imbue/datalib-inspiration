@@ -3,9 +3,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import AnyUrl
 from pydantic import Field
 from pydantic import SecretStr
+from pydantic import computed_field
 
 from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.mngr_imbue_cloud.errors import InvalidBuildArgError
@@ -15,21 +15,76 @@ from imbue.mngr_imbue_cloud.primitives import DEFAULT_FAST_MODE
 from imbue.mngr_imbue_cloud.primitives import FastMode
 from imbue.mngr_imbue_cloud.primitives import ImbueCloudAccount
 from imbue.mngr_imbue_cloud.primitives import KNOWN_OVH_US_REGIONS
-from imbue.mngr_imbue_cloud.primitives import LeaseDbId
 from imbue.mngr_imbue_cloud.primitives import PoolHostDestroyOutcomeStatus
-from imbue.mngr_imbue_cloud.primitives import R2AccessKeyId
-from imbue.mngr_imbue_cloud.primitives import R2BucketAccess
 from imbue.mngr_imbue_cloud.primitives import SliceBakeOutcomeStatus
 from imbue.mngr_imbue_cloud.primitives import SuperTokensUserId
+from imbue.mngr_imbue_cloud.primitives import is_box_exclusive_to_tier
+
+
+class BoxManagementTrust(FrozenModel):
+    """What a box's slice service user trusts for management SSH, read over SSH."""
+
+    authorized_key_count: int = Field(description="Static public keys in the service user's authorized_keys")
+    trusted_ca_public_key: str | None = Field(
+        description="The SSH CA public key the box's sshd trusts (None when no CA trust is installed)"
+    )
+
+
+class StorageVolumeState(FrozenModel):
+    """What backs the gen-2 storage root right now, as the box reports it."""
+
+    mounted_source: str | None = Field(
+        description="The block device mounted at the storage root (None when unmounted)"
+    )
+    is_encrypted: bool = Field(
+        description=(
+            "Whether the mounted device is the opened LUKS mapper (an unmounted root is unencrypted: nothing "
+            "is protecting the slices on it, whatever the underlying partition holds)"
+        )
+    )
+
+
+class SliceProvisionResult(FrozenModel):
+    """What a slice provision produced: the VM instance/disk identifiers and the two box host ports."""
+
+    instance_name: str = Field(description="Slice VM instance name (also the VpsInstanceId)")
+    disk_name: str = Field(description="Identifier of the slice's btrfs data disk on the box")
+    vm_ssh_host_port: int = Field(description="Box host port forwarded to the VM's root sshd")
+    container_ssh_host_port: int = Field(description="Box host port forwarded to the inner container sshd")
+    slice_ordinal: int | None = Field(
+        default=None,
+        description=(
+            "The gen-2 slice's box-local slot ordinal (drives its tap/user/subnet names); "
+            "None for gen-1 (lima) slices, which have no ordinal"
+        ),
+    )
 
 
 class PoolHostDestroyTarget(FrozenModel):
-    """The teardown coordinates of a claimed pool_hosts row: its lima VM and the box hosting it."""
+    """The teardown coordinates of a claimed pool_hosts row: its slice VM and the box hosting it."""
 
-    lima_instance_name: str | None = Field(description="The slice's lima instance name on the box, if recorded")
+    slice_instance_name: str | None = Field(description="The slice's VM instance name on the box, if recorded")
     box_public_address: str | None = Field(description="SSH-reachable address of the box, if its record exists")
-    lima_service_user: str | None = Field(description="The box's non-root lima user that owns the VMs, if recorded")
+    box_wireguard_address: str | None = Field(
+        default=None,
+        description=(
+            "The box's WireGuard overlay address, if assigned -- the teardown dials it (through a "
+            "userspace or interface tunnel) instead of the public address when reachable (a "
+            "locked-down box drops direct :22)"
+        ),
+    )
+    box_wireguard_public_key: str | None = Field(
+        default=None,
+        description="The box's WireGuard public key, if recorded -- the userspace tunnel's peer key",
+    )
+    slice_service_user: str | None = Field(
+        description="The box's non-root service user that owns the slice VMs, if recorded"
+    )
     box_host_public_key: str | None = Field(description="The box's sshd host public key, pinned for the teardown SSH")
+    box_generation: int = Field(
+        default=1,
+        description="The row's stamped slice-fleet generation, selecting the teardown client (lima vs raw qemu)",
+    )
 
 
 class PoolHostDestroyOutcome(FrozenModel):
@@ -73,7 +128,7 @@ class SliceBakeOutcome(FrozenModel):
 
 
 class SliceBakeReport(FrozenModel):
-    """The summary ``admin pool create`` emits: per-slice outcomes plus counts."""
+    """The summary the operator pool bake (``pool create``) emits: per-slice outcomes plus counts."""
 
     requested: int = Field(description="Number of slices the invocation tried to bake")
     succeeded: int = Field(description="Slices baked and inserted into the pool")
@@ -81,19 +136,121 @@ class SliceBakeReport(FrozenModel):
     slices: tuple[SliceBakeOutcome, ...] = Field(description="Per-slice outcomes, in completion order")
 
 
-class PaidListEntry(FrozenModel):
-    """One row of a connector paid-list table (a domain or an email).
+class OrphanReapReport(FrozenModel):
+    """What one orphan reap did (or, dry-run, would do) on a box."""
 
-    ``value`` holds the domain (e.g. ``imbue.com``) or full email; the
-    connector normalizes it to lowercase on write. Rows are never hard
-    deleted -- ``is_paid`` flips to False on removal and ``updated_at``
-    records when that happened.
+    server_id: str = Field(description="The bare_metal_servers row id of the reaped box")
+    is_dry_run: bool = Field(description="Whether the reap only reported, without destroying anything")
+    reaped_instances: tuple[str, ...] = Field(description="Rowless, stopped, old slice VMs destroyed (or to destroy)")
+    reaped_disks: tuple[str, ...] = Field(
+        description="Rowless data disks whose slice VM is gone (not running, not spared) deleted (or to delete)"
+    )
+    spared_instances: tuple[str, ...] = Field(
+        description="Rowless slice VMs left alone because they are running or younger than a bake"
+    )
+    failed: tuple[str, ...] = Field(description="Resources whose destroy failed (logged; the next reap retries)")
+
+
+class WarmCacheReport(FrozenModel):
+    """The summary the cache pre-warm (``pool warm-cache``) emits."""
+
+    cache_tag: str = Field(description="The content-addressed image-cache tag the warm targeted")
+    server_id: str = Field(description="The bare_metal_servers row id of the warmed box")
+    was_tar_already_present: bool = Field(description="Whether the box already held the tar (cheap no-op)")
+    is_warmed: bool = Field(description="Whether the box holds the tar now")
+    slices: tuple[SliceBakeOutcome, ...] = Field(
+        description=(
+            "The throwaway seed slice's final outcome -- the first success or the last retried "
+            "failure (empty on a no-op)"
+        )
+    )
+
+
+class BoxTierAudit(FrozenModel):
+    """What one bare-metal box actually carries, read over SSH rather than from the DB.
+
+    The slot accounting in the operator ``server list`` counts only the querying env's own
+    ``pool_hosts`` rows, so another env's slices -- and in particular another
+    *tier's* -- are invisible to it. This is the on-box truth: every env's slices,
+    plus the two ways a box drifts across tiers.
     """
 
-    value: str = Field(description="The allowed domain or email (lowercased)")
-    is_paid: bool = Field(description="Whether this entry currently grants paid access")
-    created_at: str = Field(description="When the row was first inserted")
-    updated_at: str = Field(description="When is_paid was last changed")
+    server_id: str = Field(description="The bare_metal_servers row id of the audited box")
+    public_address: str = Field(description="SSH-reachable public address the audit reached the box at")
+    slot_count: int = Field(description="Slices the box holds when full")
+    box_used_slots: int = Field(description="Slice resources actually on the box, across every env (plus legacy)")
+    authorized_key_count: int = Field(description="Static public keys authorized for the box's slice service user")
+    expected_authorized_key_count: int = Field(
+        description="Static keys the box's generation should authorize (one pool key on gen-1, none on gen-2)"
+    )
+    trusted_ca_public_key: str | None = Field(
+        description="The SSH CA public key the box's sshd trusts, when it trusts one"
+    )
+    is_trusted_ca_correct: bool = Field(
+        description="Whether the box trusts exactly the owning tier's SSH CA (always true for a gen-1 box)"
+    )
+    foreign_tier_slices: tuple[str, ...] = Field(
+        description="Slice resources on the box stamped for an env belonging to another tier, sorted"
+    )
+    degraded_md_arrays: tuple[str, ...] = Field(
+        description="md RAID arrays on the box running with a failed member (from /proc/mdstat)"
+    )
+    raw_swap_devices: tuple[str, ...] = Field(
+        description=(
+            "Swap devices that are raw (non-md) partitions, i.e. unmirrored -- a disk death loses "
+            "their pages and SIGBUS-kills processes; fixed by a prep re-run (from /proc/swaps)"
+        )
+    )
+    is_storage_encrypted: bool = Field(
+        description=(
+            "Whether the gen-2 storage root is mounted from its opened LUKS mapper, so every slice disk on "
+            "the box is ciphertext at rest (always false for a gen-1 box, which has no storage volume; a "
+            "gen-2 box reading false is either locked -- its TPM unlock failed at boot -- or was prepped "
+            "before storage encryption existed and must be drained and repaved)"
+        )
+    )
+
+    @computed_field
+    @property
+    def is_exclusive_to_tier(self) -> bool:
+        """Whether a bake onto this box would pass the tier-exclusivity guard."""
+        return is_box_exclusive_to_tier(
+            authorized_key_count=self.authorized_key_count,
+            expected_authorized_key_count=self.expected_authorized_key_count,
+            foreign_tier_slice_count=len(self.foreign_tier_slices),
+            is_trusted_ca_correct=self.is_trusted_ca_correct,
+        )
+
+
+class UnauditedBox(FrozenModel):
+    """A box the audit could not read, and why.
+
+    Reported rather than raised: a fleet audit exists to find boxes in a bad
+    state, so one unreachable box must not cost the operator every other box's
+    verdict. An unaudited box is explicitly NOT a clean one.
+    """
+
+    server_id: str = Field(description="The bare_metal_servers row id of the box that could not be read")
+    public_address: str | None = Field(description="The box's recorded address (None when the row has none)")
+    reason: str = Field(description="Why the audit could not read the box")
+
+
+class BoxTierAuditReport(FrozenModel):
+    """The summary ``server list --verify-occupancy`` emits: per-box audits plus counts."""
+
+    env_name: str | None = Field(description="Env whose tier the boxes were audited against (None when not given)")
+    is_foreign_tier_checked: bool = Field(
+        description=(
+            "Whether the foreign-tier-slice half of the audit ran. False without an env name: "
+            "the tier to compare against is then unknown, so an empty foreign_tier_slices means "
+            "'not checked', NOT 'clean'."
+        )
+    )
+    exclusive: int = Field(description="Boxes that belong solely to this tier")
+    contaminated: int = Field(description="Boxes a bake would now refuse (foreign-tier slice or extra key)")
+    unaudited: int = Field(description="Boxes that could not be read, so their state is unknown")
+    boxes: tuple[BoxTierAudit, ...] = Field(description="Per-box audits, in fleet-table order")
+    unaudited_boxes: tuple[UnauditedBox, ...] = Field(description="Boxes that could not be read, in fleet-table order")
 
 
 class LeaseAttributes(FrozenModel):
@@ -227,62 +384,6 @@ def parse_imbue_cloud_build_args(build_args: Sequence[str] | None) -> ParsedImbu
     )
 
 
-class LeaseResult(FrozenModel):
-    """Server response from POST /hosts/lease."""
-
-    host_db_id: LeaseDbId = Field(description="Database id of the leased host (UUID)")
-    vps_address: str = Field(
-        description=(
-            "SSH-reachable address of the leased host's bare-metal box (the box's public "
-            "address that the slice VM is reached through)."
-        )
-    )
-    ssh_port: int = Field(description="SSH port for the VPS itself (root)")
-    ssh_user: str = Field(description="SSH username on the VPS")
-    container_ssh_port: int = Field(description="Port that maps to the docker container's sshd")
-    agent_id: str = Field(description="Pre-baked mngr agent id on the host")
-    host_id: str = Field(description="Pre-baked mngr host id")
-    host_name: str = Field(description="User-chosen friendly name for the leased host")
-    attributes: dict[str, Any] = Field(default_factory=dict, description="Attributes the row was matched against")
-    outer_host_public_key: str | None = Field(
-        default=None,
-        description=(
-            "The VPS/VM-root sshd host public key (port ssh_port). Pinned for strict host-key "
-            "checking on the outer connection; None only against a connector too old to return it."
-        ),
-    )
-    container_host_public_key: str | None = Field(
-        default=None,
-        description=(
-            "The docker container sshd host public key (port container_ssh_port). Pinned for the "
-            "agent connection on the fast/adopt path; None only against a connector too old to return it."
-        ),
-    )
-
-
-class LeasedHostInfo(FrozenModel):
-    """One entry from GET /hosts."""
-
-    host_db_id: LeaseDbId
-    vps_address: str = Field(
-        description="SSH-reachable address of the leased host's bare-metal box (reaches the slice VM)."
-    )
-    ssh_port: int
-    ssh_user: str
-    container_ssh_port: int
-    agent_id: str
-    host_id: str
-    host_name: str = Field(description="User-chosen friendly name for the leased host")
-    attributes: dict[str, Any] = Field(default_factory=dict)
-    leased_at: str = Field(description="ISO-8601 timestamp")
-    outer_host_public_key: str | None = Field(
-        default=None, description="The VPS/VM-root sshd host public key, if known"
-    )
-    container_host_public_key: str | None = Field(
-        default=None, description="The docker container sshd host public key, if known"
-    )
-
-
 class AuthUser(FrozenModel):
     """User information returned by signin/signup/oauth callbacks."""
 
@@ -303,202 +404,21 @@ class AuthSession(FrozenModel):
         default=None,
         description="UTC datetime at which the access token expires (decoded from JWT exp)",
     )
-
-
-class LiteLLMKeyMaterial(FrozenModel):
-    """Key + base URL returned by POST /keys/create."""
-
-    key: SecretStr
-    base_url: AnyUrl
-
-
-class LiteLLMKeyInfo(FrozenModel):
-    """Metadata about a LiteLLM virtual key."""
-
-    token: str
-    key_alias: str | None = None
-    key_name: str | None = None
-    spend: Decimal = Decimal("0")
-    max_budget: Decimal | None = None
-    budget_duration: str | None = None
-    user_id: str | None = None
-
-
-class TunnelInfo(FrozenModel):
-    """A Cloudflare tunnel record."""
-
-    tunnel_name: str
-    tunnel_id: str
-    token: SecretStr | None = None
-    services: tuple[str, ...] = ()
-
-
-class ServiceInfo(FrozenModel):
-    """A service forwarded over a Cloudflare tunnel."""
-
-    service_name: str
-    service_url: str
-    hostname: str
-
-
-class AuthPolicy(FrozenModel):
-    """Cloudflare Access policy expressed as allowed emails / IDPs."""
-
-    emails: tuple[str, ...] = ()
-    email_domains: tuple[str, ...] = ()
-    require_idp: tuple[str, ...] = ()
-
-
-class R2BucketInfo(FrozenModel):
-    """Metadata about an R2 bucket owned by the account."""
-
-    bucket_name: str = Field(description="Full R2 bucket name (<user_id_prefix>--<slug>)")
-    s3_endpoint: AnyUrl = Field(description="S3-compatible endpoint for this account")
-
-
-class R2KeyMaterial(FrozenModel):
-    """A bucket-scoped S3 credential, returned once at key creation."""
-
-    access_key_id: R2AccessKeyId = Field(description="S3 Access Key ID (= the Cloudflare token id)")
-    secret_access_key: SecretStr = Field(description="S3 Secret Access Key (shown once, never persisted by us)")
-    s3_endpoint: AnyUrl = Field(description="S3-compatible endpoint for this account")
-    bucket_name: str = Field(description="Full R2 bucket name this key is scoped to")
-    access: R2BucketAccess = Field(description="Access scope: 'read' or 'readwrite'")
-
-
-class R2KeyInfo(FrozenModel):
-    """Metadata about a bucket key (never includes the secret)."""
-
-    access_key_id: R2AccessKeyId = Field(description="S3 Access Key ID (= the Cloudflare token id)")
-    bucket_name: str = Field(description="Full R2 bucket name this key is scoped to")
-    access: R2BucketAccess = Field(description="Access scope: 'read' or 'readwrite'")
-    alias: str | None = Field(default=None, description="Human-readable alias")
-    created_at: str = Field(description="ISO 8601 timestamp when the key was created")
-    enforced_access: str | None = Field(
-        default=None,
+    is_pending_verification: bool = Field(
+        default=False,
         description=(
-            "Storage-quota enforcement state from the connector: 'read' when the sweep downgraded this "
-            "key because the account is over its storage quota; None when the live token policy matches "
-            "the intended access."
+            "Legacy field, no longer consumed: email verification is non-blocking, so every "
+            "session counts as signed in. Kept so session files written by older plugin "
+            "versions still parse; new writes omit it."
         ),
     )
-
-
-class R2BucketCreateResult(FrozenModel):
-    """Result of creating a bucket: the bucket plus its minted default key."""
-
-    bucket: R2BucketInfo = Field(description="The created bucket")
-    key: R2KeyMaterial = Field(description="The default key minted alongside the bucket")
-
-
-class StorageCleanupGrant(FrozenModel):
-    """Result of requesting a storage-cleanup grant (POST /account/storage-cleanup-grant)."""
-
-    status: str = Field(description="'granted' when a grant is active (new or pre-existing), 'not_needed' otherwise")
-    expires_at: str | None = Field(default=None, description="When the active grant expires")
-    baseline_bytes: int | None = Field(default=None, description="Live usage recorded at grant time")
-    keys: tuple[R2KeyInfo, ...] = Field(default=(), description="The account's bucket keys after the grant")
-
-
-class StorageRecheckResult(FrozenModel):
-    """Result of an on-demand storage recheck (POST /account/storage-recheck)."""
-
-    usage_bytes: int = Field(description="Live total bucket bytes (real-time)")
-    limit_bytes: int = Field(description="The account's max_total_bucket_bytes entitlement")
-    is_over_quota: bool = Field(description="Whether live usage exceeds the limit")
-    is_grant_settled: bool = Field(description="Whether this recheck settled an outstanding cleanup grant")
-    keys: tuple[R2KeyInfo, ...] = Field(default=(), description="The account's bucket keys after enforcement")
-
-
-class AccountEntitlementValues(FrozenModel):
-    """The quota values an account currently holds (mirrors the connector's PlanEntitlements)."""
-
-    max_remote_workspaces: int = Field(description="Max concurrent pool-host leases (running or stopped)")
-    max_tunnels: int = Field(description="Max Cloudflare tunnels")
-    max_services_per_tunnel: int = Field(description="Max forwarded services per tunnel")
-    max_buckets: int = Field(description="Max R2 buckets")
-    max_total_bucket_bytes: int = Field(description="Max total bytes across all the account's buckets")
-    monthly_llm_spend_usd: float = Field(description="Monthly LLM spend cap in USD (rolling)")
-    max_active_synced_workspaces: int = Field(description="Max ACTIVE synced workspace records")
-
-
-class AccountUsageInfo(FrozenModel):
-    """Live usage numbers for an account (mirrors the connector's AccountUsage)."""
-
-    remote_workspaces: int = Field(description="Current pool-host leases")
-    tunnels: int = Field(description="Current Cloudflare tunnels")
-    buckets: int = Field(description="Current R2 buckets")
-    total_bucket_bytes: int = Field(description="Total bytes across the account's buckets")
-    llm_spend_usd_this_period: float = Field(description="LiteLLM aggregate spend in the current budget period")
-    llm_budget_resets_at: str | None = Field(default=None, description="When the rolling LLM budget period resets")
-    active_synced_workspaces: int = Field(description="Current ACTIVE synced workspace records")
-
-
-class AccountInfo(FrozenModel):
-    """An account's plan, entitlement values, and live usage, from GET /account."""
-
-    user_id: SuperTokensUserId = Field(description="SuperTokens user id")
-    email: str = Field(description="The account's verified email")
-    plan_name: str = Field(description="Current plan name (e.g. 'explorer' or 'ally')")
-    entitlements: AccountEntitlementValues = Field(description="The account's current entitlement values")
-    usage: AccountUsageInfo = Field(description="Live usage, computed by the connector at request time")
-    available_plans: tuple[str, ...] = Field(
-        default=(), description="Every plan name currently seeded (for plan-selector UIs)"
-    )
-
-
-class SyncWorkspaceRecord(FrozenModel):
-    """Wire form of one synced workspace record (transport-only; the plugin never decrypts).
-
-    Mirrors the connector's ``WorkspaceRecordModel``: plaintext metadata plus
-    the base64 of the client-side-encrypted secrets blob. ``state`` is passed
-    through as its lowercase wire string -- the producing (minds) and
-    validating (connector) ends own the vocabulary.
-    """
-
-    host_id: str = Field(description="Host the workspace is on (PK with the account)")
-    agent_id: str = Field(description="Logical workspace id (one ACTIVE record per agent_id)")
-    display_name: str = Field(default="", description="Workspace display name")
-    color: str | None = Field(default=None, description="Workspace accent color (#rrggbb)")
-    provider_kind: str = Field(description="mngr provider backend kind (e.g. 'lima', 'imbue_cloud')")
-    hosting_device_id: str | None = Field(
-        default=None, description="Install that hosts a local workspace (None for cloud rows)"
-    )
-    device_label: str = Field(default="", description="Human-readable device name")
-    state: str = Field(description="Lifecycle state: 'active' or 'destroyed' (tombstone)")
-    restored_from_host_id: str | None = Field(default=None, description="Lineage link for restored workspaces")
-    encrypted_secrets: str | None = Field(
-        default=None, description="Base64 of the client-encrypted secrets blob (opaque here)"
-    )
-    revision: int = Field(description="Per-row monotonic revision; pushes are CAS on this")
-    created_at: str = Field(default="", description="Server timestamp (response only)")
-    updated_at: str = Field(default="", description="Server timestamp (response only)")
-    destroyed_at: str | None = Field(
-        default=None,
-        description=(
-            "Server tombstone stamp (response only; set while state is 'destroyed'). Passed through so "
-            "clients can age destroyed workspaces' backups against the server's clock."
-        ),
-    )
-
-
-class SyncKeyBundle(FrozenModel):
-    """Wire form of the per-account password-wrapped data key (transport-only)."""
-
-    kdf_salt: str = Field(description="Base64 argon2id salt")
-    kdf_time_cost: int = Field(description="argon2id iteration count")
-    kdf_memory_kib: int = Field(description="argon2id memory (KiB)")
-    kdf_parallelism: int = Field(description="argon2id lane count")
-    wrapped_dek: str = Field(description="Base64 password-wrapped DEK (opaque here)")
-    key_epoch: int = Field(description="Bumped only on compromise recovery")
-    updated_at: str = Field(default="", description="Server timestamp (response only)")
 
 
 class BareMetalServer(FrozenModel):
-    """A rented OVH bare-metal server that we carve into lima-VM slices.
+    """A rented OVH bare-metal server that we carve into slice VMs.
 
     Mirrors one ``bare_metal_servers`` row. Resource fields and ``raid_level`` /
-    ``lima_service_user`` / ``ovh_service_name`` / ``public_address`` are filled
+    ``slice_service_user`` / ``ovh_service_name`` / ``public_address`` are filled
     in as the box advances through its lifecycle, so they are optional until the
     box reaches the state that populates them.
     """
@@ -521,18 +441,69 @@ class BareMetalServer(FrozenModel):
     )
     slot_count: int = Field(description="Number of slices this box holds (floor(ram_gb / memory_per_slice_gb))")
     raid_level: str | None = Field(default=None, description="RAID level set at OS-install time (e.g. 'RAID1')")
-    lima_service_user: str | None = Field(default=None, description="Non-root OS user that owns the box's lima VMs")
+    slice_service_user: str | None = Field(
+        default=None, description="Non-root OS user that owns the box's slice VMs (set once the box is prepped)"
+    )
     box_host_public_key: str | None = Field(
         default=None,
         description=(
             "The box's sshd host public key (port 22), injected by us at OS reinstall so it is "
-            "deterministically known. Pinned by admin tooling, the lima slice client, and the connector's "
+            "deterministically known. Pinned by admin tooling, the slice clients, and the connector's "
             "slice teardown. None until set at provision (or by the one-time keyscan backfill)."
         ),
     )
-    status: BareMetalServerStatus = Field(description="Lifecycle state: ordered/delivered/installing/ready/failed")
+    status: BareMetalServerStatus = Field(
+        description="Lifecycle state: ordered/delivered/installing/ready/draining/failed"
+    )
     created_at: datetime = Field(description="When the row was created")
     updated_at: datetime = Field(description="When the row was last updated")
+    box_generation: int = Field(
+        default=1,
+        description=(
+            "Which slice-fleet generation this box runs (specs/slice-fleet-gen2): 1 = bookworm + lima/slirp, "
+            "2 = trixie + raw qemu with routed-tap networking. Determines the slice backend every bake and "
+            "teardown against this box uses."
+        ),
+    )
+    uplink_mbps: int = Field(
+        description=(
+            "The box's declared uplink rate in Mbit/s (from its plan's bandwidth option, not measured), the "
+            "source of truth for gen-2 per-slice fair-share bandwidth classes, the egress signal, and the "
+            "link-speed audit."
+        ),
+    )
+    wireguard_address: str | None = Field(
+        default=None,
+        description="The box's WireGuard overlay IP for operator management access (gen-2; assigned at prep).",
+    )
+    wireguard_public_key: str | None = Field(
+        default=None,
+        description=(
+            "The box's WireGuard public key (gen-2; the private key is generated on the box at prep and "
+            "never leaves it). The rendered operator client configs pin each box peer by it."
+        ),
+    )
+
+
+class Gen2BoxDefaultMachineFit(FrozenModel):
+    """How a gen-2 box's estimated disk budget compares with the full complement of default machines its RAM sells."""
+
+    machine_capacity: int = Field(description="Default-size machines the box's RAM budget holds")
+    required_disk_budget_gib: int = Field(description="Disk budget (GiB) that full complement needs")
+    disk_budget_gib: int = Field(
+        description="Disk budget (GiB) estimated from the catalog's usable-disk GB figure, after the storage reserve"
+    )
+
+    @property
+    def is_sufficient(self) -> bool:
+        return self.disk_budget_gib >= self.required_disk_budget_gib
+
+    @property
+    def machines_that_fit(self) -> int:
+        # Each default machine costs the same slice of the disk budget, so the
+        # fit is the budget's whole share of that per-machine cost.
+        per_machine_gib = self.required_disk_budget_gib // self.machine_capacity
+        return min(self.machine_capacity, self.disk_budget_gib // per_machine_gib)
 
 
 class BareMetalServerCapacity(FrozenModel):
@@ -622,4 +593,12 @@ class SlicePricingRow(FrozenModel):
     price_per_slice_usd: Decimal = Field(description="amortized_monthly / slot_count -- the primary sort key")
     storage_options: tuple[SliceStorageOption, ...] = Field(
         description="Other in-region storage configs as per-slice disk upgrades (not splatted into their own rows)"
+    )
+    is_units_valid: bool = Field(
+        default=False,
+        description=(
+            "Whether the base storage passes the gen-2 units-valid guard (specs/slice-fleet): its disk "
+            "budget holds the RAM's full complement of default-size machines, so the config is orderable "
+            "as a gen-2 box."
+        ),
     )

@@ -68,7 +68,11 @@ def test_prevent_silent_decode_error_catches() -> None:
 
 
 def test_prevent_inline_imports() -> None:
-    rc.check_inline_imports(_DIR, snapshot(1))
+    # 4: the lazy provider-backend loader plus the deploy/agent-created hooks in plugin.py
+    # import modal-SDK-bearing modules inside functions to keep the Modal SDK off `mngr`'s
+    # startup path (MIND-179). This is the intended lazy-import pattern, not an anti-pattern
+    # to remove. (The 4th is a pre-existing fastapi import in routes/snapshot_and_shutdown.py.)
+    rc.check_inline_imports(_DIR, snapshot(4))
 
 
 def test_prevent_relative_imports() -> None:
@@ -287,3 +291,14 @@ def test_prevent_per_file_host_upload() -> None:
 
 def test_prevent_code_in_init_files() -> None:
     rc.check_code_in_init_files(_DIR, snapshot(1))
+
+
+# --- Modal images ---
+
+
+# Existing violations: routes/example.py and routes/snapshot_and_shutdown.py
+# build their helper-app images with an unpinned uv_pip_install("fastapi[standard]").
+# Pinning the mngr_modal built-in images is a known follow-up (see
+# blueprint/pin-modal-service-images/); do not add new violations.
+def test_prevent_unpinned_modal_pip_install() -> None:
+    rc.check_unpinned_modal_pip_install(_DIR, snapshot(2))

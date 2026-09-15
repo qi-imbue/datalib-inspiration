@@ -11,6 +11,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager
 from io import StringIO
 from pathlib import Path
+from typing import Final
 from typing import Mapping
 from typing import Sequence
 
@@ -25,6 +26,7 @@ from imbue.modal_proxy.data_types import FileEntry
 from imbue.modal_proxy.data_types import FileEntryType
 from imbue.modal_proxy.data_types import StreamType
 from imbue.modal_proxy.data_types import TunnelInfo
+from imbue.modal_proxy.errors import ModalProxyConnectionError
 from imbue.modal_proxy.errors import ModalProxyError
 from imbue.modal_proxy.errors import ModalProxyNotFoundError
 from imbue.modal_proxy.interface import AppInterface
@@ -122,6 +124,13 @@ class FakeVolume(VolumeInterface):
     def get_name(self) -> str | None:
         return self.volume_name
 
+    def get_object_id(self) -> str:
+        # The backing directory is this volume's identity: deleting it is how the
+        # fake expresses a volume that no longer exists.
+        if not self.root_dir.is_dir():
+            raise ModalProxyNotFoundError(f"Volume not found: {self.volume_name}")
+        return f"vo-{self.root_dir.name}"
+
     def _resolve(self, path: str) -> Path:
         """Resolve a volume path to a local filesystem path."""
         # Strip leading slash and resolve relative to root
@@ -185,6 +194,11 @@ class FakeVolume(VolumeInterface):
     def commit(self) -> None:
         # No-op -- writes are immediate on local filesystem
         pass
+
+
+# Exit code a terminated fake sandbox reports from poll(), mirroring the 137
+# (128 + SIGKILL) that Modal surfaces for a terminated sandbox.
+_FAKE_TERMINATED_EXIT_CODE: Final[int] = 137
 
 
 class FakeSandbox(SandboxInterface):
@@ -264,6 +278,9 @@ class FakeSandbox(SandboxInterface):
         self._snapshot_count += 1
         image_id = f"snap-{self.sandbox_id}-{self._snapshot_count}"
         return FakeImage(image_id=image_id)
+
+    def poll(self) -> int | None:
+        return _FAKE_TERMINATED_EXIT_CODE if self._is_terminated else None
 
     def terminate(self) -> None:
         if self._is_terminated:
@@ -519,3 +536,46 @@ class FakeModalInterface(ModalInterface):
     ) -> AbstractContextManager[tuple[StringIO, ModalLoguruWriter | None]]:
         """No-op: nothing to capture without a Modal SDK behind it."""
         return contextlib.nullcontext((StringIO(), None))
+
+
+# ---------------------------------------------------------------------------
+# Unreachable Modal
+# ---------------------------------------------------------------------------
+
+# The Modal SDK's own wording when it cannot open a connection to the control
+# plane. Reproduced here so a test double reads exactly like the real thing to
+# whatever renders the failure to a user.
+MODAL_UNREACHABLE_MESSAGE: Final[str] = "Could not connect to the Modal server."
+
+
+class UnreachableApp(FakeApp):
+    """An app handle whose run context cannot be entered because Modal is unreachable."""
+
+    def run(self, *, environment_name: str) -> Generator[AppInterface, None, None]:
+        """Fail on the first ``next()``, which is where the real SDK opens the connection."""
+        raise ModalProxyConnectionError(MODAL_UNREACHABLE_MESSAGE)
+        yield self
+
+
+class UnreachableModalInterface(FakeModalInterface):
+    """A Modal whose control plane cannot be reached -- the dropped-network case.
+
+    Only the calls that actually cross the network fail: constructing an app
+    object is local in the real SDK too, so it succeeds here and the failure
+    surfaces when its run context is entered.
+    """
+
+    def environment_create(self, name: str) -> None:
+        raise ModalProxyConnectionError(MODAL_UNREACHABLE_MESSAGE)
+
+    def app_create(self, name: str) -> AppInterface:
+        return UnreachableApp(app_id=f"ap-{uuid.uuid4().hex}", app_name=name)
+
+    def app_lookup(
+        self,
+        name: str,
+        *,
+        create_if_missing: bool = True,
+        environment_name: str,
+    ) -> AppInterface:
+        raise ModalProxyConnectionError(MODAL_UNREACHABLE_MESSAGE)

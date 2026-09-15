@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import re
+import shlex
+import shutil
 import tempfile
 import threading
 import uuid
@@ -25,6 +27,10 @@ from pydantic import Field
 from pydantic import PrivateAttr
 from pydantic import ValidationError
 from pyinfra.api import Host as PyinfraHost
+from tenacity import retry
+from tenacity import retry_if_exception_type
+from tenacity import stop_after_attempt
+from tenacity import wait_exponential
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.concurrency_group.executor import ConcurrencyGroupExecutor
@@ -91,9 +97,12 @@ from imbue.mngr.primitives import SnapshotId
 from imbue.mngr.primitives import SnapshotName
 from imbue.mngr.primitives import VolumeId
 from imbue.mngr.providers.base_provider import BaseProviderInstance
+from imbue.mngr.providers.host_key_store import has_host_key_store
+from imbue.mngr.providers.host_key_store import remove_host_key_record
 from imbue.mngr.providers.listing_utils import build_listing_collection_script
 from imbue.mngr.providers.listing_utils import parse_listing_collection_output
 from imbue.mngr.providers.ssh_host_setup import REQUIRED_HOST_PACKAGES
+from imbue.mngr.providers.ssh_host_setup import SSHD_START_OPTIONS
 from imbue.mngr.providers.ssh_host_setup import build_add_authorized_keys_command
 from imbue.mngr.providers.ssh_host_setup import build_add_known_hosts_command
 from imbue.mngr.providers.ssh_host_setup import build_check_and_install_packages_command
@@ -102,19 +111,25 @@ from imbue.mngr.providers.ssh_host_setup import build_start_activity_watcher_com
 from imbue.mngr.providers.ssh_host_setup import build_start_volume_sync_command
 from imbue.mngr.providers.ssh_host_setup import parse_warnings_from_output
 from imbue.mngr.providers.ssh_host_setup import resolve_host_log_dir
+from imbue.mngr.utils.ssh import build_ssh_connect_command
 from imbue.mngr_modal.config import ModalProviderConfig
 from imbue.mngr_modal.errors import ModalMngrError
+from imbue.mngr_modal.errors import ModalSandboxDiedMngrError
 from imbue.mngr_modal.errors import ModalSandboxTimeoutMngrError
 from imbue.mngr_modal.errors import NoSnapshotsModalMngrError
 from imbue.mngr_modal.routes.deployment import deploy_function
 from imbue.mngr_modal.routes.deployment import get_function_url
 from imbue.mngr_modal.ssh_utils import add_host_to_known_hosts
 from imbue.mngr_modal.ssh_utils import create_pyinfra_host
-from imbue.mngr_modal.ssh_utils import load_or_create_host_keypair
-from imbue.mngr_modal.ssh_utils import load_or_create_ssh_keypair
-from imbue.mngr_modal.ssh_utils import wait_for_sshd
+from imbue.mngr_modal.ssh_utils import load_or_create_per_host_client_keypair
+from imbue.mngr_modal.ssh_utils import load_or_create_per_host_host_keypair
+from imbue.mngr_modal.ssh_utils import per_host_key_dir
+from imbue.mngr_modal.ssh_utils import resolve_per_host_client_keypair
+from imbue.mngr_modal.ssh_utils import resolve_per_host_host_keypair
+from imbue.mngr_modal.ssh_utils import wait_for_sshd_with_retry
 from imbue.mngr_modal.volume import ModalVolume
 from imbue.modal_proxy.data_types import StreamType
+from imbue.modal_proxy.direct import DEPLOY_MAX_DURATION_SECONDS
 from imbue.modal_proxy.errors import ModalProxyAuthError
 from imbue.modal_proxy.errors import ModalProxyError
 from imbue.modal_proxy.errors import ModalProxyInternalError
@@ -131,10 +146,33 @@ from imbue.modal_proxy.interface import VolumeInterface
 
 # Constants
 CONTAINER_SSH_PORT: Final[int] = 22
+
+# Fallback base image when the caller specifies neither an image nor a Dockerfile.
+#
+# This must name a Debian release explicitly, and must match the release that the
+# workspace template's apt sources are pinned to (default-workspace-template's
+# system/scripts/write_apt_sources.sh currently pins the trixie suites).
+#
+# `modal.Image.debian_slim()` cannot be used here: Modal hardcodes it to bookworm
+# (Debian 12) for every image builder version, in its own base-images.json, so it
+# does not track the template. A Debian 12 host whose apt points at Debian 13 turns
+# the workspace's first `apt-get install` into a full cross-release upgrade, which
+# replaces libc6, ld.so and openssh-server (9.2p1 -> 10.0p1) underneath the sshd
+# started by _start_sshd_in_sandbox. sshd re-execs the on-disk binary once per
+# incoming connection, so the surviving 9.2 listener hands every later connection to
+# the 10.0 binary, which rejects 9.2's `-R` re-exec flag; the child dies before
+# logging is initialised and the socket closes with no banner and no log entry. That
+# surfaces as "Error reading SSH protocol banner" on a host that is otherwise healthy.
+DEFAULT_BASE_IMAGE: Final[str] = "python:3.12-slim-trixie"
 # 2 minutes default sandbox lifetime (so that we don't just leave tons of them running--we're not doing a good job of cleaning them up yet)
 DEFAULT_SANDBOX_TIMEOUT: Final[int] = 2 * 60
 # Seconds to wait for sshd to be ready
 SSH_CONNECT_TIMEOUT: Final[int] = 60
+
+# SSH user mngr connects as inside sandboxes. The client key is authorized for
+# exactly this user by _start_sshd_in_sandbox, so every SSH connection
+# (readiness probes included) must authenticate as this user.
+DEFAULT_SSH_USER: Final[str] = "root"
 
 # Tag key constants for sandbox metadata stored in Modal tags.
 # Only host_id and host_name are stored as tags (for discovery). All other
@@ -157,6 +195,11 @@ MODAL_VOLUME_NAME_MAX_LENGTH: Final[int] = 64
 
 # Fixed namespace for deterministic VolumeId derivation from Modal volume names.
 _MODAL_VOLUME_ID_NAMESPACE: Final[uuid.UUID] = uuid.UUID("c8f1a2b3-d4e5-6789-abcd-ef0123456789")
+
+# A shell no-op: the cheapest command that exits 0 if and only if the sandbox ran it.
+_SANDBOX_LIVENESS_PROBE_COMMAND: Final[str] = ":"
+
+_SANDBOX_CREATE_ATTEMPT_COUNT: Final[int] = 3
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -460,25 +503,26 @@ class ModalProviderInstance(BaseProviderInstance):
         """Get the directory for SSH keys (profile-specific)."""
         return self.mngr_ctx.profile_dir / "providers" / "modal"
 
-    def _get_ssh_keypair(self) -> tuple[Path, str]:
-        """Get or create the SSH keypair for this provider instance."""
-        return load_or_create_ssh_keypair(self._keys_dir, key_name="modal_ssh_key")
+    # CLEANUP: the legacy shared modal_ssh_key / host_key files under _keys_dir
+    # only serve sandboxes created before per-host keys existed. Sandboxes cycle
+    # within about a day, so the shared files (and these resolvers' legacy
+    # fallbacks) can be dropped once no pre-per-host-key sandbox remains.
+    def _get_ssh_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        """Resolve the client keypair that opens this host: per-host first, legacy shared as fallback.
 
-    def get_ssh_public_key(self) -> str:
-        """Get the SSH public key content for this provider instance.
-
-        Loads or creates the keypair if it doesn't exist yet.
+        A per-host key dir carries a ``known_hosts`` symlink so key-sibling
+        consumers (the forward SSH tunnel) keep finding the pinned host keys.
         """
-        _private_key_path, public_key_content = self._get_ssh_keypair()
-        return public_key_content
+        return resolve_per_host_client_keypair(self._keys_dir, host_id, "modal_ssh_key", "known_hosts")
 
-    def _get_host_keypair(self) -> tuple[Path, str]:
-        """Get or create the SSH host keypair for Modal sandboxes.
+    def _get_host_keypair(self, host_id: HostId) -> tuple[Path, str]:
+        """Resolve the sshd host keypair for this host's sandbox: per-host first, legacy fallback.
 
-        This key is used as the SSH host key for all sandboxes, allowing us to
-        pre-trust the key and avoid host key verification prompts.
+        The key is injected into the sandbox at every boot (create and
+        snapshot-restore alike), so restore re-serves the same per-host key
+        while pre-per-host-key sandboxes keep their legacy shared one.
         """
-        return load_or_create_host_keypair(self._keys_dir)
+        return resolve_per_host_host_keypair(self._keys_dir, host_id, "host_key")
 
     @property
     def _known_hosts_path(self) -> Path:
@@ -523,39 +567,100 @@ class ModalProviderInstance(BaseProviderInstance):
             return {"vm_runtime": True}
         return None
 
-    @handle_modal_auth_error
-    def get_volume_for_host(self, host: HostInterface | HostId) -> HostVolume | None:
-        """Get the host volume for reading data written by the sandbox.
+    # No backoff: each attempt already spends a container start-up waiting on the
+    # liveness probe, so there is nothing to pace.
+    @retry(
+        stop=stop_after_attempt(_SANDBOX_CREATE_ATTEMPT_COUNT),
+        retry=retry_if_exception_type(ModalSandboxDiedMngrError),
+        reraise=True,
+    )
+    def _create_running_sandbox(
+        self,
+        *,
+        image: ImageInterface,
+        app: AppInterface,
+        config: SandboxConfig,
+        volumes: Mapping[str, VolumeInterface],
+    ) -> SandboxInterface:
+        """Create a Modal sandbox and return it only once it is running commands.
 
-        Returns a HostVolume wrapping the persistent volume mounted inside
-        the sandbox. Returns None if the volume does not exist or if
-        host volume creation is disabled.
+        ``sandbox_create`` returns as soon as Modal accepts the sandbox, and ``tunnels()``
+        resolves from the allocated tunnel rather than from a running container, so
+        neither tells us the container started. Modal kills a fraction of sandboxes on
+        the way up, and every command queued against one of those comes back SIGKILLed
+        (exit 137), which the caller would otherwise read as a failure of whichever
+        bring-up command happened to be first.
 
-        Probes the volume with a ``listdir`` to verify it actually exists, since
-        ``volume_from_name`` returns a lazy reference that doesn't fail for a
-        deleted volume. Callers that only need a reference and want to skip that
-        network probe should use :meth:`get_volume_reference_for_host`.
+        Raises ModalSandboxDiedMngrError when every attempt dies before running a command.
         """
-        host_volume = self.get_volume_reference_for_host(host)
-        if host_volume is None:
-            return None
+        # Add the shutdown buffer to the timeout sent to Modal so the activity watcher can
+        # trigger a clean shutdown before Modal's hard timeout kills the host.
+        modal_timeout = config.timeout + self.config.shutdown_buffer_seconds
+        with log_span(
+            "Creating Modal sandbox",
+            timeout=config.timeout,
+            modal_timeout=modal_timeout,
+            shutdown_buffer=self.config.shutdown_buffer_seconds,
+            cpu=config.cpu,
+            memory_gb=config.memory,
+        ):
+            sandbox = self._modal_interface.sandbox_create(
+                image=image,
+                app=app,
+                # note: we do NOT pass the environment_name here because that is deprecated (it is inferred from the app)
+                timeout=modal_timeout,
+                cpu=config.cpu,
+                # Memory is in GB but Modal expects MB
+                memory=int(config.memory * 1024),
+                unencrypted_ports=[CONTAINER_SSH_PORT],
+                gpu=config.gpu,
+                region=config.region,
+                cidr_allowlist=config.effective_cidr_allowlist,
+                volumes=volumes,
+                experimental_options=self._build_experimental_options(),
+            )
+        logger.trace("Created Modal sandbox", sandbox_id=sandbox.get_object_id())
+
+        if sandbox.exec("sh", "-c", _SANDBOX_LIVENESS_PROBE_COMMAND).wait() == 0:
+            return sandbox
+        # Terminating the dud keeps it from lingering and billing, but it is already
+        # unusable, so a failure to terminate must not mask why we are discarding it.
         try:
-            # Probe the volume to verify it exists (from_name returns lazy references).
-            host_volume.volume.listdir("/")
-        except (ModalProxyNotFoundError, ModalProxyInvalidError):
-            return None
-        return host_volume
+            sandbox.terminate()
+        except ModalProxyError as e:
+            logger.warning("Failed to terminate discarded sandbox {}: {}", sandbox.get_object_id(), e)
+        raise ModalSandboxDiedMngrError(f"Modal sandbox {sandbox.get_object_id()} died before it ran a single command")
 
-    @handle_modal_auth_error
-    def get_volume_reference_for_host(self, host: HostInterface | HostId) -> HostVolume | None:
-        """Return a host-volume *reference* without verifying it exists.
+    def _run_bring_up_command(self, sandbox: SandboxInterface, command: str, description: str) -> str:
+        """Run one host bring-up command in a sandbox and return its stdout.
 
-        Cheap: constructs the lazy ``volume_from_name`` reference and skips the
-        ``listdir`` existence probe that :meth:`get_volume_for_host` performs, so
-        this does no network round-trip beyond resolving the reference. Returns
-        None only when host volumes are disabled for this provider. A reference
-        to a since-deleted volume is still returned; operations on it fail at
-        access time.
+        Modal reports exit 137 (SIGKILL) for every command queued against a sandbox
+        that has died, so a non-zero exit says nothing about the command itself until
+        the sandbox's own liveness has been checked. ``poll()`` is that check.
+
+        Raises ModalSandboxDiedMngrError if the sandbox died, MngrError if the command
+        failed on a live sandbox.
+        """
+        process = sandbox.exec("sh", "-c", command)
+        stdout = process.get_stdout().read()
+        exit_code = process.wait()
+        if exit_code == 0:
+            return stdout
+        sandbox_exit_code = sandbox.poll()
+        if sandbox_exit_code is not None:
+            raise ModalSandboxDiedMngrError(
+                f"Modal sandbox {sandbox.get_object_id()} exited with code {sandbox_exit_code} "
+                f"while mngr was trying to {description}"
+            )
+        raise MngrError(f"Failed to {description} (exit code {exit_code}): {stdout}")
+
+    def _get_host_volume(self, host: HostInterface | HostId) -> ModalVolume | None:
+        """Build a fresh, lazy reference to a host's persistent volume.
+
+        Returns None when host volumes are disabled for this provider or when
+        the name cannot be resolved to a volume at all. The reference is
+        unresolved, so callers that need to know the volume exists must ask it
+        to resolve.
         """
         if not self.config.is_host_volume_created:
             return None
@@ -567,7 +672,45 @@ class ModalProviderInstance(BaseProviderInstance):
             )
         except (ModalProxyNotFoundError, ModalProxyInvalidError):
             return None
-        return HostVolume.model_construct(volume=ModalVolume.model_construct(modal_volume=vol_iface))
+        return ModalVolume.model_construct(modal_volume=vol_iface)
+
+    @handle_modal_auth_error
+    def get_volume_for_host(self, host: HostInterface | HostId) -> HostVolume | None:
+        """Get the host volume for reading data written by the sandbox.
+
+        Returns a HostVolume wrapping the persistent volume mounted inside
+        the sandbox. Returns None if the volume does not exist or if
+        host volume creation is disabled.
+
+        Confirms existence by resolving the volume's id, since ``volume_from_name``
+        returns a lazy reference that doesn't fail for a deleted volume. Callers
+        that only need a reference and want to skip that network probe should use
+        :meth:`get_volume_reference_for_host`.
+        """
+        volume = self._get_host_volume(host)
+        if volume is None:
+            return None
+        try:
+            volume.resolve_id()
+        except (ModalProxyNotFoundError, ModalProxyInvalidError):
+            return None
+        return HostVolume.model_construct(volume=volume)
+
+    @handle_modal_auth_error
+    def get_volume_reference_for_host(self, host: HostInterface | HostId) -> HostVolume | None:
+        """Return a host-volume *reference* without verifying it exists.
+
+        Cheap: constructs the lazy ``volume_from_name`` reference and skips the
+        existence probe that :meth:`get_volume_for_host` performs, so this does no
+        network round-trip beyond resolving the reference. Returns None only when
+        host volumes are disabled for this provider. A reference to a
+        since-deleted volume is still returned; operations on it fail at access
+        time.
+        """
+        volume = self._get_host_volume(host)
+        if volume is None:
+            return None
+        return HostVolume.model_construct(volume=volume)
 
     # =========================================================================
     # Volume-based Host Record Methods
@@ -911,7 +1054,15 @@ class ModalProviderInstance(BaseProviderInstance):
         elif base_image:
             image = modal_interface.image_from_registry(base_image)
         else:
-            image = modal_interface.image_debian_slim().apt_install(*(pkg.package for pkg in REQUIRED_HOST_PACKAGES))
+            # `debian_slim` ships pip/wheel/uv in its base (Modal's "package_tools"); a plain
+            # registry image does not, and the workspace template's provision commands shell
+            # out to `uv` (e.g. `uv sync --all-packages`). Install them so swapping the base
+            # away from debian_slim stays behaviour-preserving.
+            image = (
+                modal_interface.image_from_registry(DEFAULT_BASE_IMAGE)
+                .apt_install(*(pkg.package for pkg in REQUIRED_HOST_PACKAGES))
+                .dockerfile_commands(["RUN pip install --no-cache-dir uv wheel"])
+            )
 
         return image
 
@@ -937,13 +1088,7 @@ class ModalProviderInstance(BaseProviderInstance):
             str(self.host_dir),
             host_volume_mount_path=effective_volume_mount_path,
         )
-        process = sandbox.exec("sh", "-c", check_install_cmd)
-
-        # Read output and check exit code
-        stdout = process.get_stdout().read()
-        exit_code = process.wait()
-        if exit_code != 0:
-            raise MngrError(f"Failed to install required packages (exit code {exit_code}): {stdout}")
+        stdout = self._run_bring_up_command(sandbox, check_install_cmd, "install required packages")
 
         # Parse warnings from output and log them
         warnings = parse_warnings_from_output(stdout)
@@ -956,7 +1101,7 @@ class ModalProviderInstance(BaseProviderInstance):
         client_public_key: str,
         host_private_key: str,
         host_public_key: str,
-        ssh_user: str = "root",
+        ssh_user: str = DEFAULT_SSH_USER,
         known_hosts: Sequence[str] | None = None,
         authorized_keys: Sequence[str] | None = None,
     ) -> None:
@@ -999,30 +1144,37 @@ class ModalProviderInstance(BaseProviderInstance):
             setup_parts.append(f"mkdir -p '{self.host_dir}/events/logs'")
 
             combined_cmd = " && ".join(setup_parts)
-            exit_code = sandbox.exec("sh", "-c", combined_cmd).wait()
-            if exit_code != 0:
-                raise MngrError(f"Failed to configure SSH in sandbox (exit code {exit_code})")
+            self._run_bring_up_command(sandbox, combined_cmd, "configure SSH in sandbox")
 
         with log_span("Starting sshd in sandbox"):
             # Start sshd (-D: don't detach, -E: log to file instead of syslog)
             # stdout/stderr are suppressed so Modal doesn't track them for performance/stability reasons.
+            # The rest of the options come from the shared constant, so a sandbox's
+            # sshd is configured identically to every other container sshd mngr starts.
             self._ssh_process = sandbox.exec(
                 "/usr/sbin/sshd",
                 "-D",
-                "-o",
-                "MaxSessions=100",
+                *shlex.split(SSHD_START_OPTIONS),
                 "-E",
                 sshd_log_path,
                 stdout=StreamType.DEVNULL,
                 stderr=StreamType.DEVNULL,
             )
 
+    @retry(
+        wait=wait_exponential(min=1, max=5),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(ModalProxyError),
+        reraise=True,
+    )
     def _get_ssh_info_from_sandbox(self, sandbox: SandboxInterface, *, tunnel_timeout: int = 50) -> tuple[str, int]:
         """Extract SSH connection info from a running sandbox.
 
         ``tunnel_timeout`` is forwarded to the Modal SDK's ``tunnels()`` call
         and controls how many seconds the backend will wait for the sandbox to
         be ready before raising ``SandboxTimeoutError``.
+
+        Retries on ModalProxyError to absorb cold-start latency.
         """
         try:
             tunnels = sandbox.tunnels(timeout=tunnel_timeout)
@@ -1033,9 +1185,12 @@ class ModalProviderInstance(BaseProviderInstance):
         ssh_tunnel = tunnels[CONTAINER_SSH_PORT]
         return ssh_tunnel.tcp_socket
 
-    def _wait_for_sshd(self, hostname: str, port: int, timeout_seconds: float = SSH_CONNECT_TIMEOUT) -> None:
+    def _wait_for_sshd(
+        self, hostname: str, port: int, host_id: HostId, timeout_seconds: float = SSH_CONNECT_TIMEOUT
+    ) -> None:
         """Wait for sshd to be ready to accept connections."""
-        wait_for_sshd(hostname, port, timeout_seconds)
+        private_key_path, _ = self._get_ssh_keypair(host_id)
+        wait_for_sshd_with_retry(hostname, port, timeout_seconds, private_key_path, username=DEFAULT_SSH_USER)
 
     def _create_pyinfra_host(self, hostname: str, port: int, private_key_path: Path) -> PyinfraHost:
         """Create a pyinfra host with SSH connector."""
@@ -1129,8 +1284,8 @@ class ModalProviderInstance(BaseProviderInstance):
             logger.trace("Found SSH endpoint available", ssh_host=ssh_host, ssh_port=ssh_port)
 
             # Get SSH keypairs
-            private_key_path, client_public_key = self._get_ssh_keypair()
-            host_key_path, host_public_key = self._get_host_keypair()
+            private_key_path, client_public_key = self._get_ssh_keypair(host_id)
+            host_key_path, host_public_key = self._get_host_keypair(host_id)
             host_private_key = host_key_path.read_text()
 
             # set up all the data in modal:
@@ -1151,11 +1306,11 @@ class ModalProviderInstance(BaseProviderInstance):
 
             # Add the host to our known_hosts file before waiting for sshd
             with log_span("Adding host to known_hosts", ssh_host=ssh_host, ssh_port=ssh_port):
-                add_host_to_known_hosts(self._known_hosts_path, ssh_host, ssh_port, host_public_key)
+                add_host_to_known_hosts(self._known_hosts_path, ssh_host, ssh_port, host_public_key, host_id=host_id)
 
             # Wait for sshd to be ready
             with info_span("Waiting for sshd to be ready..."):
-                self._wait_for_sshd(ssh_host, ssh_port, self.config.ssh_connect_timeout)
+                self._wait_for_sshd(ssh_host, ssh_port, host_id, self.config.ssh_connect_timeout)
 
             with log_span("Executing post-ssh operations"):
                 # Create pyinfra host and connector
@@ -1188,7 +1343,9 @@ class ModalProviderInstance(BaseProviderInstance):
 
             with log_span("Waiting for deploy to finish and creating shutdown script"):
                 if snapshot_url_future is not None:
-                    snapshot_url = snapshot_url_future.result(2 * 60.0)
+                    # The deploy may legitimately sit behind Modal's app lock
+                    # for minutes; the future resolves as soon as it finishes.
+                    snapshot_url = snapshot_url_future.result(DEPLOY_MAX_DURATION_SECONDS)
                     self._create_shutdown_script(host, sandbox, host_id, snapshot_url)
 
             # Start the activity watcher. We have to start it here because we only created the shutdown script (with the hardcoded sandbox id)
@@ -1198,9 +1355,7 @@ class ModalProviderInstance(BaseProviderInstance):
                 start_activity_watcher_cmd = build_start_activity_watcher_command(
                     str(self.host_dir), host_log_dir=self._host_log_dir_str()
                 )
-                exit_code = sandbox.exec("sh", "-c", start_activity_watcher_cmd).wait()
-                if exit_code != 0:
-                    raise MngrError(f"Failed to start activity watcher in sandbox (exit code {exit_code})")
+                self._run_bring_up_command(sandbox, start_activity_watcher_cmd, "start activity watcher in sandbox")
 
             # Start periodic volume sync to flush writes to the host volume (only when a host volume is mounted)
             if self.config.is_host_volume_created:
@@ -1208,9 +1363,7 @@ class ModalProviderInstance(BaseProviderInstance):
                     volume_sync_cmd = build_start_volume_sync_command(
                         HOST_VOLUME_MOUNT_PATH, str(self.host_dir), host_log_dir=self._host_log_dir_str()
                     )
-                    exit_code = sandbox.exec("sh", "-c", volume_sync_cmd).wait()
-                    if exit_code != 0:
-                        raise MngrError(f"Failed to start volume sync in sandbox (exit code {exit_code})")
+                    self._run_bring_up_command(sandbox, volume_sync_cmd, "start volume sync in sandbox")
 
             with log_span("Waiting for modal operations to complete"):
                 # something has gone horribly wrong if those operations take longer than that
@@ -1648,10 +1801,11 @@ log "=== Shutdown script completed ==="
                     host_record.ssh_host,
                     host_record.ssh_port,
                     host_record.ssh_host_public_key,
+                    host_id=host_id,
                 )
 
             with trace_span("Creating pyinfra {}", host_id, _is_trace_span_enabled=False):
-                private_key_path, _ = self._get_ssh_keypair()
+                private_key_path, _ = self._get_ssh_keypair(host_id)
                 pyinfra_host = self._create_pyinfra_host(
                     host_record.ssh_host,
                     host_record.ssh_port,
@@ -1759,9 +1913,10 @@ log "=== Shutdown script completed ==="
 
         if not base_image and not dockerfile_path and snapshot is None:
             logger.warning(
-                "No image or Dockerfile specified -- building from mngr default Dockerfile. "
-                "Consider using your own Dockerfile (-b --file=<path>) to include "
-                "your project's dependencies for faster startup.",
+                "No image or Dockerfile specified -- building from the default base image {} plus "
+                "mngr's required host packages. Consider using your own Dockerfile "
+                "(-b --file=<path>) to include your project's dependencies for faster startup.",
+                DEFAULT_BASE_IMAGE,
             )
 
         try:
@@ -1784,11 +1939,6 @@ log "=== Shutdown script completed ==="
                 with log_span("Building Modal image"):
                     modal_image.build(app)
 
-            # Create the sandbox
-            # Add shutdown buffer to the timeout sent to Modal so the activity watcher can
-            # trigger a clean shutdown before Modal's hard timeout kills the host
-            modal_timeout = config.timeout + self.config.shutdown_buffer_seconds
-
             # Build volume mounts from build args
             sandbox_volumes = _build_modal_volumes(config.volumes, self.environment_name, self._modal_interface)
 
@@ -1797,31 +1947,7 @@ log "=== Shutdown script completed ==="
                 with log_span("Ensuring host volume for {}", host_id):
                     sandbox_volumes[HOST_VOLUME_MOUNT_PATH] = self._build_host_volume(host_id)
 
-            with log_span(
-                "Creating Modal sandbox",
-                timeout=config.timeout,
-                modal_timeout=modal_timeout,
-                shutdown_buffer=self.config.shutdown_buffer_seconds,
-                cpu=config.cpu,
-                memory_gb=config.memory,
-            ):
-                # Memory is in GB but Modal expects MB
-                memory_mb = int(config.memory * 1024)
-                sandbox = self._modal_interface.sandbox_create(
-                    image=modal_image,
-                    app=app,
-                    # note: we do NOT pass the environment_name here because that is deprecated (it is inferred from the app)
-                    timeout=modal_timeout,
-                    cpu=config.cpu,
-                    memory=memory_mb,
-                    unencrypted_ports=[CONTAINER_SSH_PORT],
-                    gpu=config.gpu,
-                    region=config.region,
-                    cidr_allowlist=config.effective_cidr_allowlist,
-                    volumes=sandbox_volumes,
-                    experimental_options=self._build_experimental_options(),
-                )
-                logger.trace("Created Modal sandbox", sandbox_id=sandbox.get_object_id())
+            sandbox = self._create_running_sandbox(image=modal_image, app=app, config=config, volumes=sandbox_volumes)
         except (ModalProxyError, MngrError) as e:
             # On failure, save a failed host record so the user can see what happened
             failure_reason = str(e)
@@ -1871,6 +1997,14 @@ log "=== Shutdown script completed ==="
             created_at=now,
             updated_at=now,
         )
+
+        # Mint this host's own client + host keypairs up front so the setup
+        # helper's per-host resolution uses them for the new sandbox instead of
+        # falling back to the legacy shared pair from older sandboxes. A clone
+        # (create_host --snapshot) lands here with a fresh host_id, so it mints
+        # fresh keypairs rather than inheriting the source host's.
+        load_or_create_per_host_client_keypair(self._keys_dir, host_id, "modal_ssh_key", "known_hosts")
+        load_or_create_per_host_host_keypair(self._keys_dir, host_id, "host_key")
 
         # Set up SSH and create host object using shared helper
         with log_span("Setting up SSH and creating Host object for {}", host_id):
@@ -1988,9 +2122,14 @@ log "=== Shutdown script completed ==="
         """
         host_id = host.id if isinstance(host, HostInterface) else host
 
-        # If sandbox is still running, return it
+        # If the sandbox is still running, return it. A just-terminated sandbox
+        # can linger in Sandbox.list under Modal's V2 Sandbox backend, so confirm it is
+        # actually alive (poll() reports the authoritative state) rather than
+        # trusting list-presence -- otherwise a stopped or hard-killed host is
+        # mistaken for running and this returns early, skipping the snapshot
+        # restore below (its stop_reason clear and its no-snapshot check).
         sandbox = self._find_sandbox_by_host_id(host_id)
-        if sandbox is not None:
+        if sandbox is not None and sandbox.poll() is None:
             host_obj = self._create_host_from_sandbox(sandbox)
             if host_obj is not None:
                 if snapshot_id is not None:
@@ -2067,12 +2206,6 @@ log "=== Shutdown script completed ==="
             # Get or create the Modal app
             app = self._get_modal_app()
 
-            # Create the sandbox from the snapshot image
-            # Add shutdown buffer to the timeout sent to Modal so the activity watcher can
-            # trigger a clean shutdown before Modal's hard timeout kills the host
-            modal_timeout = config.timeout + self.config.shutdown_buffer_seconds
-            memory_mb = int(config.memory * 1024)
-
             # Build volume mounts from the stored config
             sandbox_volumes = _build_modal_volumes(config.volumes, self.environment_name, self._modal_interface)
 
@@ -2080,19 +2213,8 @@ log "=== Shutdown script completed ==="
             if self.config.is_host_volume_created:
                 sandbox_volumes[HOST_VOLUME_MOUNT_PATH] = self._build_host_volume(host_id)
 
-            new_sandbox = self._modal_interface.sandbox_create(
-                image=modal_image,
-                app=app,
-                # note: we do NOT pass the environment_name here because that is deprecated (it is inferred from the app)
-                timeout=modal_timeout,
-                cpu=config.cpu,
-                memory=memory_mb,
-                unencrypted_ports=[CONTAINER_SSH_PORT],
-                gpu=config.gpu,
-                region=config.region,
-                cidr_allowlist=config.effective_cidr_allowlist,
-                volumes=sandbox_volumes,
-                experimental_options=self._build_experimental_options(),
+            new_sandbox = self._create_running_sandbox(
+                image=modal_image, app=app, config=config, volumes=sandbox_volumes
             )
         logger.info("Created sandbox from snapshot", sandbox_id=new_sandbox.get_object_id())
 
@@ -2209,6 +2331,16 @@ log "=== Shutdown script completed ==="
     def delete_host(self, host: HostInterface) -> None:
         self._destroy_agents_on_host(host.id)
         self._delete_host_record(host.id)
+        # Forget the host's pins (dead-endpoint GC) and its per-host keypairs;
+        # both are useless once the host is permanently deleted. Benign local
+        # cleanup past the point of no return (the record is gone), so an OS
+        # error must not fail the deletion or abort the GC sweep.
+        if has_host_key_store(self._known_hosts_path):
+            try:
+                remove_host_key_record(self._known_hosts_path, host.id)
+            except OSError as e:
+                logger.trace("Failed to clean up host-key store for {}: {}", self._known_hosts_path, e)
+        shutil.rmtree(per_host_key_dir(self._keys_dir, host.id), ignore_errors=True)
         if self.config.is_host_volume_created:
             # delete_host returns None per the interface; a volume that could not be removed
             # is surfaced through destroy_host, not here (GC calls delete_host after the grace
@@ -2819,12 +2951,14 @@ log "=== Shutdown script completed ==="
         ssh_connection = host.get_ssh_connection_info()
         if ssh_connection is not None:
             user, hostname, port, key_path = ssh_connection
+            known_hosts_path = host.get_ssh_known_hosts_path()
             ssh_info = SSHInfo(
                 user=user,
                 host=hostname,
                 port=port,
                 key_path=key_path,
-                command=f"ssh -i {key_path} -p {port} {user}@{hostname}",
+                known_hosts_path=known_hosts_path,
+                command=build_ssh_connect_command(user, hostname, port, key_path, known_hosts_path),
             )
 
         # Boot time and uptime from SSH-collected data
@@ -2983,6 +3117,9 @@ log "=== Shutdown script completed ==="
         lifecycle = determine_lifecycle_probe_result(
             tmux_info=agent_raw.get("tmux_info"),
             is_active=agent_raw.get("is_active", False),
+            # This listing stats marker files by fixed name and has no agent to ask, so a
+            # blocked agent reads RUNNING here.
+            is_blocked_on_dialog=False,
             expected_process_name=expected_process_name,
             ps_output=ps_output,
             is_agent_type_known=is_type_known,
@@ -3065,7 +3202,20 @@ log "=== Shutdown script completed ==="
                 updated_certified_data,
             ),
         )
-        self._get_host(host_id, host_record=updated_host_record).set_certified_data(updated_certified_data)
+        host = self._get_host(host_id, host_record=updated_host_record)
+        if isinstance(host, OnlineHostInterface):
+            # A Modal filesystem snapshot transiently breaks new connections through the
+            # sandbox's tunnels: for a window afterwards (longer when Modal is under
+            # load), the tunnel edge accepts TCP and then closes it without an SSH
+            # banner. The certified-data write below opens a fresh SSH connection, so
+            # re-verify the tunnel with a full handshake probe first, just like host
+            # creation does after boot. This also means create/snapshot only returns
+            # once the tunnel is healthy again, so follow-up commands don't hit the
+            # same window.
+            ssh_host, ssh_port = self._get_ssh_info_from_sandbox(sandbox)
+            with log_span("Waiting for the SSH tunnel to recover after the snapshot"):
+                self._wait_for_sshd(ssh_host, ssh_port, host_id, self.config.ssh_connect_timeout)
+        host.set_certified_data(updated_certified_data)
         logger.debug(
             "Created snapshot: id={}, name={}",
             snapshot_id,
@@ -3126,8 +3276,7 @@ log "=== Shutdown script completed ==="
         """
         host_id = host.id if isinstance(host, HostInterface) else host
 
-        # Read host record from volume
-        host_record = self._read_host_record(host_id)
+        host_record = self._read_host_record(host_id, use_cache=False)
         if host_record is None:
             return []
 
@@ -3418,9 +3567,10 @@ log "=== Shutdown script completed ==="
             host_record.ssh_host,
             host_record.ssh_port,
             host_record.ssh_host_public_key,
+            host_id=host_id,
         )
 
-        private_key_path, _ = self._get_ssh_keypair()
+        private_key_path, _ = self._get_ssh_keypair(host_id)
         return self._create_pyinfra_host(
             host_record.ssh_host,
             host_record.ssh_port,

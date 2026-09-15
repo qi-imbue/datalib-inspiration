@@ -15,7 +15,8 @@ like restart) so the settings view can poll step-level progress:
    apply script stop them first. Waiting is unbounded and cancellable (the
    cancel just stops polling; nothing has been mutated yet).
 2. Apply: one exec runs the mutating script (stash / checkout tag / commit /
-   ``uv sync`` / restart / verify), which auto-rolls-back via ``git revert``
+   ``uv sync --all-packages`` / restart / verify), which auto-rolls-back via
+   ``git revert``
    on failure. A stash-pop conflict is reported as a warning, never a failure.
 3. Env: re-inject the canonical ``restic.env`` when one exists.
 4. Verify: re-run the check; remaining code/env/service problems fail the
@@ -36,7 +37,7 @@ from pydantic import Field
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.imbue_common.mutable_model import MutableModel
 from imbue.minds.build_info import resolve_release_id
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client import backup_status
 from imbue.minds.desktop_client import restic_cli
 from imbue.minds.desktop_client.backend_resolver import BackendResolverInterface
@@ -61,12 +62,26 @@ from imbue.minds.desktop_client.backup_workspace_scripts import extract_marker_j
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCli
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCliError
 from imbue.minds.desktop_client.workspace_operations import WorkspaceOperationRegistryInterface
+from imbue.minds.desktop_client.workspace_update_state import OLDEST_IN_PLACE_UPDATABLE_VERSION
+from imbue.minds.desktop_client.workspace_update_state import is_below_in_place_update_floor
 from imbue.minds.errors import BackupProvisioningError
 from imbue.mngr.primitives import AgentId
 
 # Machine-readable prefix on the operation error when running chats block the
 # update; the UI parses the comma-separated chat names after it.
 BLOCKED_BY_RUNNING_CHATS_PREFIX: Final[str] = "BLOCKED_BY_RUNNING_CHATS:"
+
+# Why the update refuses a workspace older than the in-place floor. The apply
+# script checks the running release's `system/services/host_backup` out onto the
+# workspace, and that code reads the backup root out of `<snapshot>/home` -- a
+# layout only workspaces at or above the floor have. Installing it on an older
+# one leaves a backup service that fails every tick from then on, which is
+# strictly worse than the outdated service it replaced.
+BELOW_UPDATE_FLOOR_MESSAGE: Final[str] = (
+    "This machine was created before "
+    f"{OLDEST_IN_PLACE_UPDATABLE_VERSION}, and today's backup service does not work on it. "
+    "Updating it would stop its backups altogether. Create a new machine and move your work across."
+)
 
 # User-facing guidance when the apply script's `git stash pop` conflicted;
 # shown on both the success (warning log) and failure (error message) paths so
@@ -133,11 +148,12 @@ class BackupWorkerFailureHandler(MutableModel):
 def run_backup_update_sequence(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     resolver: BackendResolverInterface,
     registry: WorkspaceOperationRegistryInterface,
     parent_cg: ConcurrencyGroup | None,
     is_stop_chats: bool,
+    workspace_version_ref: str | None,
 ) -> None:
     """Worker-thread entry point: run the whole update operation for one workspace.
 
@@ -152,6 +168,7 @@ def run_backup_update_sequence(
             registry=registry,
             parent_cg=parent_cg,
             is_stop_chats=is_stop_chats,
+            workspace_version_ref=workspace_version_ref,
         )
     except BackupProvisioningError as exc:
         logger.warning("Backup update for {} failed: {}", agent_id, exc)
@@ -161,12 +178,18 @@ def run_backup_update_sequence(
 def _run_update_phases(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     resolver: BackendResolverInterface,
     registry: WorkspaceOperationRegistryInterface,
     parent_cg: ConcurrencyGroup | None,
     is_stop_chats: bool,
+    workspace_version_ref: str | None,
 ) -> None:
+    below_floor_refusal = _refuse_update_below_floor(agent_id, workspace_version_ref)
+    if below_floor_refusal is not None:
+        registry.fail(agent_id, below_floor_refusal)
+        return
+
     # Phase 1: gate + wait (cancellable; nothing has been mutated yet).
     registry.append_log(agent_id, "Checking for running chats and in-progress backups...")
     if not _wait_for_quiet_workspace(
@@ -194,6 +217,7 @@ def _run_update_phases(
         registry=registry,
         parent_cg=parent_cg,
         is_stop_chats=is_stop_chats,
+        workspace_version_ref=workspace_version_ref,
     )
     if update_error is not None:
         registry.fail(agent_id, update_error)
@@ -224,14 +248,30 @@ class _ExecLogForwarder(MutableModel):
         self.registry.append_log(self.workspace_agent_id, stripped)
 
 
+def _refuse_update_below_floor(agent_id: AgentId, workspace_version_ref: str | None) -> str | None:
+    """The refusal message when this workspace predates the in-place update floor, else None."""
+    if not is_below_in_place_update_floor(workspace_version_ref):
+        return None
+    logger.warning(
+        "Refused the backup-service update for {}: version {} predates {}",
+        agent_id,
+        workspace_version_ref,
+        OLDEST_IN_PLACE_UPDATABLE_VERSION,
+    )
+    return BELOW_UPDATE_FLOOR_MESSAGE
+
+
 def _apply_update_and_verify(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     resolver: BackendResolverInterface,
     registry: WorkspaceOperationRegistryInterface,
     parent_cg: ConcurrencyGroup | None,
     is_stop_chats: bool,
+    # The workspace's own template version, as the update detector resolved it
+    # (its git tag, else the create-time label). None when nobody could read one.
+    workspace_version_ref: str | None,
 ) -> str | None:
     """Run the mutating update script, re-inject the env, and verify convergence.
 
@@ -240,6 +280,10 @@ def _apply_update_and_verify(
     (which fails the operation on error) and the restore's chained update
     (which downgrades an error to a completion warning).
     """
+    below_floor_refusal = _refuse_update_below_floor(agent_id, workspace_version_ref)
+    if below_floor_refusal is not None:
+        return below_floor_refusal
+
     # The mutating apply script (stash/checkout/commit/sync/restart).
     registry.append_log(agent_id, "Applying the backup service update...")
     apply_command = build_workspace_script_command(
@@ -355,7 +399,7 @@ def _wait_for_quiet_workspace(
 def run_backup_restore_sequence(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     resolver: BackendResolverInterface,
     registry: WorkspaceOperationRegistryInterface,
     parent_cg: ConcurrencyGroup | None,
@@ -364,6 +408,7 @@ def run_backup_restore_sequence(
     is_update_after: bool,
     is_skip_safety_snapshot: bool,
     is_skip_chat_gate: bool,
+    workspace_version_ref: str | None,
 ) -> None:
     """Worker-thread entry point: restore one workspace to one restic snapshot, in place.
 
@@ -383,6 +428,7 @@ def run_backup_restore_sequence(
             is_update_after=is_update_after,
             is_skip_safety_snapshot=is_skip_safety_snapshot,
             is_skip_chat_gate=is_skip_chat_gate,
+            workspace_version_ref=workspace_version_ref,
         )
     except BackupProvisioningError as exc:
         logger.warning("Backup restore for {} failed: {}", agent_id, exc)
@@ -392,7 +438,7 @@ def run_backup_restore_sequence(
 def _resolve_restore_snapshot(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     snapshot_id: str,
     parent_cg: ConcurrencyGroup | None,
 ) -> restic_cli.ResticSnapshot:
@@ -419,7 +465,7 @@ def _resolve_restore_snapshot(
 def _resolve_restore_subpath(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     snapshot: restic_cli.ResticSnapshot,
     parent_cg: ConcurrencyGroup | None,
 ) -> str:
@@ -463,6 +509,36 @@ def _resolve_restore_subpath(
     )
 
 
+def _services_down_warning(names: list[str]) -> str:
+    """Word the restore script's ``services_down`` list as a completion warning.
+
+    These services are outside the restore-critical set (the contract is
+    ``behaviors/backup-restore/restore-verdict.feature``), so their state
+    never fails the operation -- the workspace came back able to serve its
+    user, and this caveat tells them what has not come back up.
+    """
+    return (
+        f"The restore succeeded, but these services have not come back up: {', '.join(names)}. "
+        "The workspace is usable; the machine converges its environment in the background, so "
+        "this usually resolves itself, and a service that stays down needs attention "
+        "independent of this restore."
+    )
+
+
+def _restore_completion_warnings(payload: dict[str, object]) -> list[str]:
+    services_down = payload.get("services_down")
+    if not isinstance(services_down, list) or not services_down:
+        return []
+    return [_services_down_warning([str(name) for name in services_down])]
+
+
+def _complete_restore(registry: WorkspaceOperationRegistryInterface, agent_id: AgentId, warnings: list[str]) -> None:
+    if warnings:
+        registry.complete_with_warning(agent_id, " ".join(warnings))
+    else:
+        registry.complete(agent_id)
+
+
 def _chained_update_warning(update_error: str) -> str:
     """Word a chained-update failure as a completion warning (the restore itself succeeded)."""
     if update_error.startswith(BLOCKED_BY_RUNNING_CHATS_PREFIX):
@@ -472,6 +548,10 @@ def _chained_update_warning(update_error: str) -> str:
             f"The restore succeeded, but the backup service update afterwards was blocked by running "
             f'chats{names_note}. Run "Update backup software" from Settings once they are stopped.'
         )
+    if update_error == BELOW_UPDATE_FLOOR_MESSAGE:
+        # A refusal, not a failure: it will be refused every time, Settings hides
+        # the button for this machine, and the message already says what to do.
+        return f"The restore succeeded, but the backup service was left as it is. {BELOW_UPDATE_FLOOR_MESSAGE}"
     return (
         f"The restore succeeded, but updating the backup service afterwards failed: {update_error} "
         'You can retry it from Settings with "Update backup software".'
@@ -481,7 +561,7 @@ def _chained_update_warning(update_error: str) -> str:
 def _run_restore_phases(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     resolver: BackendResolverInterface,
     registry: WorkspaceOperationRegistryInterface,
     parent_cg: ConcurrencyGroup | None,
@@ -490,6 +570,7 @@ def _run_restore_phases(
     is_update_after: bool,
     is_skip_safety_snapshot: bool,
     is_skip_chat_gate: bool,
+    workspace_version_ref: str | None,
 ) -> None:
     # Phase 0: resolve the snapshot and its host-dir subpath before anything
     # waits or mutates, so an unknown id (or a snapshot with no workspace in
@@ -601,6 +682,9 @@ def _run_restore_phases(
         registry.fail(agent_id, f"{detail}{safety_note}")
         return
     registry.append_log(agent_id, "Restored the backup, reinstalled dependencies, and restarted the machine services.")
+    # Services that were already unhealthy before the restore surface as a
+    # completion warning, never a failure -- see _services_converging_warning.
+    warnings = _restore_completion_warnings(payload)
 
     # Phase 3: the script wrote back the pre-restore restic.env, but re-inject
     # the canonical copy anyway so the workspace ends converged even if the
@@ -615,7 +699,7 @@ def _run_restore_phases(
     # must not fail the operation -- the user's data is restored, which is
     # what they asked for -- so it downgrades to a completion warning.
     if not is_update_after:
-        registry.complete(agent_id)
+        _complete_restore(registry, agent_id, warnings)
         return
     registry.append_log(agent_id, "Updating the backup service to the current version...")
     update_error = _apply_update_and_verify(
@@ -625,21 +709,20 @@ def _run_restore_phases(
         registry=registry,
         parent_cg=parent_cg,
         is_stop_chats=is_stop_chats,
+        workspace_version_ref=workspace_version_ref,
     )
-    if update_error is None:
-        registry.complete(agent_id)
-        return
-    logger.warning("Chained backup-service update after restore for {} failed: {}", agent_id, update_error)
-    registry.complete_with_warning(agent_id, _chained_update_warning(update_error))
+    if update_error is not None:
+        logger.warning("Chained backup-service update after restore for {} failed: {}", agent_id, update_error)
+        warnings.append(_chained_update_warning(update_error))
+    _complete_restore(registry, agent_id, warnings)
 
 
 def run_backup_configure_sequence(
     *,
     agent_id: AgentId,
-    host_id: str,
     request: BackupSetupRequest,
     imbue_cloud_cli: ImbueCloudCli | None,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     parent_cg: ConcurrencyGroup | None,
     registry: WorkspaceOperationRegistryInterface,
     is_destination_change: bool,
@@ -654,7 +737,6 @@ def run_backup_configure_sequence(
         if is_destination_change:
             change_backup_destination_for_host(
                 agent_id=agent_id,
-                host_id=host_id,
                 request=request,
                 imbue_cloud_cli=imbue_cloud_cli,
                 paths=paths,
@@ -664,7 +746,6 @@ def run_backup_configure_sequence(
         else:
             configure_backups_for_host(
                 agent_id=agent_id,
-                host_id=host_id,
                 request=request,
                 imbue_cloud_cli=imbue_cloud_cli,
                 paths=paths,
@@ -681,7 +762,7 @@ def run_backup_configure_sequence(
 def run_backup_disable_sequence(
     *,
     agent_id: AgentId,
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     parent_cg: ConcurrencyGroup | None,
     registry: WorkspaceOperationRegistryInterface,
 ) -> None:

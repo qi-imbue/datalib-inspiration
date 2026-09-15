@@ -313,15 +313,24 @@ the command**, not computed in Python, because the stored command is replayed ve
 
 The agent must report RUNNING while working and WAITING when idle. Core computes state
 live (`base_agent.py:209` -> `determine_lifecycle_state`, `hosts/common.py:324`): tmux
-pane alive + expected process name present -> `RUNNING if active-marker-present else
-WAITING`. **The RUNNING/WAITING split is purely the presence of
-`$MNGR_AGENT_STATE_DIR/active`.** Core never writes it; the plugin must.
+pane alive + expected process name present -> `RUNNING if active-marker-present and not
+blocked-on-dialog else WAITING`. **The RUNNING/WAITING split is the presence of
+`$MNGR_AGENT_STATE_DIR/active`, less any dialog the agent type reports through
+`is_blocked_on_dialog()`.** Core never writes that marker; the plugin must.
 
 - **claude** (`claude_config.py:515`): hooks write markers. `UserPromptSubmit` creates
   `active`; `Notification:idle_prompt` and `Stop` remove it. A separate
   `permissions_waiting` marker (created on `PermissionRequest`, removed on
-  `PostToolUse`/`Stop`) lets `get_lifecycle_state` promote RUNNING->WAITING-on-permission
-  (`plugin.py:1478`).
+  `PostToolUse`/`Stop`) lets the lifecycle probe report WAITING-on-permission rather than RUNNING.
+  The block is folded into the probe rather than layered on top of `get_lifecycle_state`, so the
+  agent listing (which reads `probe_lifecycle`) and `mngr wait` (which reads `get_lifecycle_state`,
+  defined in terms of the probe) report the same state for a blocked agent. This reaches the listing
+  only through `_build_agent_details_from_online_agent`. The vps provider (`instance.py:2145`,
+  inherited by ovh, vultr, and -- via `OfflineCapableVpsProvider` -- aws, azure and gcp), modal
+  (`instance.py:3010`) and imbue_cloud (`providers/instance.py:1100`)
+  override `get_host_and_agent_details` and derive the state straight from
+  `determine_lifecycle_probe_result` over batched SSH data, so on those providers a blocked agent
+  still lists as RUNNING.
 - **antigravity** (`antigravity_config.py:326`): `PreInvocation` -> `set_active_marker.sh`
   touches `active`; `Stop` -> `clear_active_marker_when_idle.sh` removes it.
 - **opencode** (`resources/mngr_opencode_plugin.ts:291`): no shell hooks -- the in-process
@@ -744,7 +753,7 @@ untrusted code**.
 - **antigravity** (`plugin.py:629`): writes the **durable source-repo path** to the user's
   *global* `~/.gemini/.../settings.json` `trustedWorkspaces` (so re-trust isn't prompted
   across agents/worktrees) and the **transient per-agent workspace path** to the *per-agent*
-  settings only. Gating matrix: already-trusted -> no-op; `--yes`/`auto_dismiss_dialogs` ->
+  settings only. Gating matrix: already-trusted -> no-op; `--yes`/`auto_dismiss_dialogs_at_startup` ->
   silent; interactive -> `click.confirm` (defaults False); non-interactive without opt-in or
   declined -> `SystemExit(1)` (clean exit). Onboarding NUX is skipped via a seeded
   `cache/onboarding.json` with all completion flags True (consumer + enterprise -- PR #2022).
@@ -752,7 +761,7 @@ untrusted code**.
   -- the **durable** grant for the git *source repo* in the user's global
   `~/.pi/agent/trust.json`, the **transient** grant for the per-agent workspace in the
   per-agent dir. Same gating matrix as agy (already-trusted -> no-op;
-  `--yes`/`auto_dismiss_dialogs` -> silent; interactive -> `click.confirm`;
+  `--yes`/`auto_dismiss_dialogs_at_startup` -> silent; interactive -> `click.confirm`;
   non-interactive without opt-in or declined -> `SystemExit`). pi has no onboarding NUX.
 - **opencode**: nothing to seed -- opencode has **no** first-run trust dialog (verified
   live), so there is no trust state to write and no onboarding NUX to skip. The whole
@@ -763,7 +772,7 @@ untrusted code**.
   per-agent `config.toml` (the transient workspace) and persists the **durable** grant for the
   git *source repo* in the user's *global* `config.toml` (so re-trust isn't prompted across
   worktrees), with the same gating matrix as agy/pi (already-trusted -> no-op;
-  `--yes`/`auto_dismiss_dialogs` -> silent; interactive -> `click.confirm` defaulting False;
+  `--yes`/`auto_dismiss_dialogs_at_startup` -> silent; interactive -> `click.confirm` defaulting False;
   non-interactive without opt-in or declined -> `SystemExit(1)`). The path key is **canonical**
   (resolved over the host shell via `pwd -P`, `plugin.py:288`) because codex canonicalizes the
   cwd before its trust lookup. codex-specific twist: this single consent *also* covers the
@@ -816,8 +825,8 @@ type. Two layers, both opt-in via mixins (`interfaces/agent.py:446`):
 
 - **Raw** (always provisioned): copy the CLI's native session JSONL verbatim to
   `$MNGR_AGENT_STATE_DIR/logs/<type>_transcript/events.jsonl`.
-- **Common** (gated on `is_common_transcript_enabled`): convert to the shared envelope
-  (`user_message`/`assistant_message`/`tool_result`) at
+- **Common** (gated on `is_common_transcript_enabled`): convert to the shared ATIF-shaped
+  stream (`header`/`step`/`observation` records) at
   `$MNGR_AGENT_STATE_DIR/events/<type>/common_transcript/events.jsonl`.
 
 Both reference plugins provision streamer + converter shell scripts into `commands/` and
@@ -827,15 +836,18 @@ lives. Shared helpers: `agents/common_transcript.py`. In both, the **common laye
 *derived* from the raw stream** (the converter reads the raw JSONL), which is why the raw
 layer is foundational and always-on.
 
-The common envelope's field vocabulary tracks the OpenTelemetry GenAI semantic conventions
-(e.g. `finish_reason`, not a bespoke name); the canonical schema is
-`agents/common_transcript_records.py`. Every assistant record carries an ordered `parts[]`
-(text/tool_call segments, modelled on the OTel message `parts`) -- the agent-agnostic view the
-reader renders -- with a `parts_ordered` flag. The order is faithful for claude, pi-coding,
-opencode (all iterate their native ordered content) and trivially so for codex (text-only
-assistant messages); only antigravity is best-effort (`parts_ordered=False`), because its native
-format does not record where tool calls sat relative to the text. See
-[`../common-transcript-standard/spec.md`](../common-transcript-standard/spec.md).
+The common stream is a streaming JSONL form of ATIF (Harbor's Agent Trajectory Interchange
+Format), pinned to `ATIF-v1.7`; the canonical schema is `agents/common_transcript_records.py`.
+Its first line is a `header` record carrying that pinned `schema_version`. Every turn (one LLM
+inference) is one `step` record whose ATIF `source` is `user`, `agent`, or `system`, carrying
+full-fidelity `message`, `reasoning_content`, and `tool_calls[]` (complete `arguments` objects,
+not previews). Every streamed tool result is one `observation` record whose `results[]` entries
+each require a `source_call_id`, with `is_error` and `tool_name` under the result's `extra`
+(ATIF has no field for either). Records are validated against the canonical schema at *emit*
+time -- each plugin's conformance test drives its real emitter over native fixtures and
+validates every emitted line -- so the independently written emitters cannot silently drift on
+the shared fields. See
+[`../atif-transcript-alignment/spec.md`](../atif-transcript-alignment/spec.md).
 
 **pi-coding emits the two layers *independently*, not derived.** pi has no convenient
 always-current flat session file to tail (its native store is tree-structured JSONL), so the
@@ -886,9 +898,9 @@ by `codex_background_tasks.sh` (pidfile-deduped, restart-on-death, like claude/a
   `logs/codex_transcript/events.jsonl`, with a per-rollout offset file so it resumes after a
   restart (`stream_transcript.sh:97`).
 - **Common** (gated on `emit_common_transcript`): `common_transcript.sh` reads the raw stream
-  and converts `response_item` rows into the shared envelope -- `message`/user -> `user_message`,
-  `message`/assistant -> `assistant_message`, `function_call` + `function_call_output` paired by
-  `call_id` -> `tool_result` -- with `source = "codex/common_transcript"`
+  and converts `response_item` rows into the shared ATIF-shaped records -- `message`/user and
+  `message`/assistant -> `step`, `function_call_output` -> `observation` matched to its
+  `function_call` by `call_id` -- with `emitter = "codex/common_transcript"`
   (`common_transcript.sh:70`). It deliberately ignores `event_msg` display duplicates and
   bookkeeping rows. Since the rollout carries no global per-line id, event ids are synthesized
   from the line's 1-based index (`line-<n>-user` etc.), and the converter dedupes against the
@@ -1010,13 +1022,14 @@ Extra plugin-namespaced fields surfaced in `mngr list`, online and offline.
   codex's single touch/remove flag (opencode is a server with concurrent subagent sessions).
   Root-session idle clears any stranded marker as a safety net (codex uses the root `Stop`), and a
   fresh server clears a marker left by a prior killed/crashed server at startup (codex clears at a
-  fresh root turn; claude has a startup reset). The gating rule lives in one shared
-  `_classify_waiting_reason` routed through both the lifecycle promotion and the field generator, so
-  the two cannot drift (mirrors codex). Notably opencode does **not** inherit codex's cancelled-dialog
-  limitation: codex's hook model fires no terminal hook on Esc/No, stranding both markers until the
-  next turn, but opencode's event bus emits `permission.replied` (on deny) and/or `session.idle` (on
-  deny *and* abort), each of which clears the marker promptly -- verified live against 1.17.7.
-  `OpenCodeAgent.get_lifecycle_state` promotes RUNNING -> WAITING while the marker is present,
+  fresh root turn; claude has a startup reset). The gating rule lives in the shared
+  `classify_waiting_reason` behind the field generator, and the lifecycle weighs the same markers in
+  `determine_lifecycle_probe_result` (mirrors codex). Notably opencode does **not** inherit codex's
+  cancelled-dialog limitation: codex's hook model fires no terminal hook on Esc/No, stranding both
+  markers until the next turn, but opencode's event bus emits `permission.replied` (on deny) and/or
+  `session.idle` (on deny *and* abort), each of which clears the marker promptly -- verified live
+  against 1.17.7.
+  `OpenCodeAgent.is_blocked_on_dialog` reports the marker, so the lifecycle reads WAITING while it is present,
   mirroring claude/codex; `END_OF_TURN` follows from the `active` marker being absent. Covered live
   by a release test (`test_opencode_waiting_reason_reports_permissions`): a real `bash: ask` agent
   blocks on an approval prompt and the marker appears -- the one check that exercises the real event
@@ -1033,7 +1046,7 @@ Extra plugin-namespaced fields surfaced in `mngr list`, online and offline.
 - **codex** -- **status: implemented** (both `PERMISSIONS` and `END_OF_TURN`), via
   `agent_field_generators`. `PermissionRequest` touches a `permissions_waiting` marker (inline
   hook command) and `PostToolUse` clears it; the root `Stop` clears any stranded marker as a
-  safety net. `CodexAgent.get_lifecycle_state` also promotes RUNNING -> WAITING while the
+  safety net. `CodexAgent.is_blocked_on_dialog` also reports the marker, so the lifecycle reads WAITING while the
   marker is present, mirroring claude. Note codex has **no** `PostToolUseFailure` event (claude
   does), so cleanup is `PostToolUse` + `Stop` only. `END_OF_TURN` follows from the `active`
   marker (OR of `codex_root_active` and a non-empty `codex_subagents/`, recomputed under lock).

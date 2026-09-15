@@ -26,6 +26,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 from typing import Callable
+from typing import Final
 from typing import IO
 from typing import Iterator
 from typing import Mapping
@@ -48,9 +49,11 @@ from pyinfra.api.exceptions import ConnectError
 from pyinfra.api.inventory import Inventory
 from pyinfra.connectors.util import CommandOutput
 from pyinfra.connectors.util import OutputLine
+from tenacity import Retrying
 from tenacity import retry
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
+from tenacity import stop_after_delay
 from tenacity import wait_chain
 from tenacity import wait_fixed
 
@@ -63,10 +66,12 @@ from imbue.mngr.errors import HostAuthenticationError
 from imbue.mngr.errors import HostConnectionError
 from imbue.mngr.errors import MngrError
 from imbue.mngr.hosts.common import LOCAL_CONNECTOR_NAME
+from imbue.mngr.hosts.common import get_ssh_known_hosts_file
 from imbue.mngr.interfaces.data_types import CommandResult
 from imbue.mngr.interfaces.data_types import FileType
 from imbue.mngr.interfaces.data_types import VolumeFile
 from imbue.mngr.interfaces.host import OuterHostInterface
+from imbue.mngr.utils.read_deadline import remaining_read_timeout
 
 
 def create_local_pyinfra_host() -> PyinfraHost:
@@ -156,6 +161,22 @@ def _list_directory_local(path: Path, recursive: bool) -> list[VolumeFile]:
     return entries
 
 
+def _is_remote_directory(sftp: SFTPClient, path: str) -> bool:
+    """Whether ``path`` is a directory, asked of the server rather than inferred.
+
+    An SFTP server refuses to open a directory for reading with an opaque
+    failure whose message is server-specific, so the only portable way to tell
+    that case apart from a genuine read error is to ask what the path is. A
+    stat that itself fails answers False, leaving the original error to stand.
+    """
+    try:
+        attrs = sftp.stat(path)
+    except IOError as e:
+        logger.trace("stat failed while classifying {}: {}", path, e)
+        return False
+    return attrs.st_mode is not None and stat.S_ISDIR(attrs.st_mode)
+
+
 def _sftp_walk(sftp: SFTPClient, dir_path: str, recursive: bool) -> list[VolumeFile]:
     """List a remote directory via SFTP ``listdir_attr``, optionally recursing.
 
@@ -196,12 +217,53 @@ def _sftp_walk(sftp: SFTPClient, dir_path: str, recursive: bool) -> list[VolumeF
     return entries
 
 
+# Interval for paramiko transport-level keepalives, set on every SSH connection
+# at connect time. paramiko sends these without awaiting a reply, so they do not
+# detect a wedged-but-ACKing sshd on their own; what they provide is periodic
+# *writes*, so a silently dead TCP path (laptop slept mid-operation, NAT state
+# dropped, peer vanished without a FIN) surfaces as a transport error within the
+# TCP retransmission window instead of never -- a reader blocked in ``recv()``
+# on such a path would otherwise wait forever, since a pure reader generates no
+# traffic of its own for TCP to fail on.
+SSH_KEEPALIVE_INTERVAL_SECONDS: Final[int] = 15
+
+# Bound on opening a new channel on an established transport (exec sessions,
+# SFTP). A healthy sshd answers a channel open within a round trip; only a
+# wedged one stalls, and an unbounded open would hang there indefinitely.
+SSH_CHANNEL_OPEN_TIMEOUT_SECONDS: Final[float] = 30.0
+
+# Per-read silence bound applied to SFTP channels whose caller supplies no
+# timeout. ``settimeout`` applies per socket operation, so arbitrarily large
+# transfers stay safe as long as bytes keep flowing.
+SFTP_CHANNEL_SILENCE_TIMEOUT_SECONDS: Final[float] = 300.0
+
+
+@pure
+def is_dead_ssh_connection_error(exception: OSError) -> bool:
+    """Whether this ``OSError`` is a connection this side still believes in, now dead.
+
+    The two shapes that wreckage arrives in, which every caller has to treat
+    alike: a socket pyinfra closed under us ("Socket is closed"), and a peer
+    that reset one we were still holding -- what a transport cached across a
+    laptop sleep gets when it is next used. The reset is matched on the type
+    because its message is the errno text ("[Errno 54] Connection reset by
+    peer"), which no message match for the first shape will ever catch.
+
+    Whichever it was, the connection cannot be reused: a retry has to disconnect
+    and rebuild rather than let ``_ensure_connected`` hand the same dead one
+    back. Shared so that a third shape of wire death is classified once instead
+    of in each of the paths that have to react to it.
+    """
+    return isinstance(exception, ConnectionResetError) or "Socket is closed" in str(exception)
+
+
 @pure
 def is_transient_ssh_error(exception: BaseException) -> bool:
     """Check if the exception is a transient SSH connection error worth retrying.
 
     Matches:
-    - OSError with "Socket is closed" (stale socket from pyinfra)
+    - OSError naming a dead connection, per :func:`is_dead_ssh_connection_error`
+      (a stale socket from pyinfra, or a peer that reset the connection)
     - SSHException (e.g. "SSH session not active" when transport dies),
       including ChannelException (server refused to open a new channel,
       e.g. MaxSessions limit -- the transport may still be alive)
@@ -209,11 +271,11 @@ def is_transient_ssh_error(exception: BaseException) -> bool:
     - TimeoutError (pyinfra read_output_buffers timeout when the remote
       sshd is reloaded mid-command, e.g. during cloud-init bootstrap).
       Note: ``TimeoutError`` is an OSError subclass on Python 3, but the
-      OSError branch above only matches on its "Socket is closed" message,
-      so bare timeouts fall through and need this explicit branch to be
+      OSError branch above matches neither of the dead-connection shapes, so
+      bare timeouts fall through and need this explicit branch to be
       classified transient.
     """
-    if isinstance(exception, OSError) and "Socket is closed" in str(exception):
+    if isinstance(exception, OSError) and is_dead_ssh_connection_error(exception):
         return True
     if isinstance(exception, SSHException):
         return True
@@ -224,46 +286,75 @@ def is_transient_ssh_error(exception: BaseException) -> bool:
     return False
 
 
-# Shared retry decorator for SSH operations that encounter transient
-# connection errors. Retries after (0, 1, 3, 6) seconds for a total
-# backoff window of ~10 seconds. Also used by the Host subclass in
+# Retry policy for SSH operations that encounter transient connection errors: one
+# pause per retry, so the attempt count follows from the backoff list. Exposed as
+# constants so callers that bound a command per attempt can size the bound against the
+# worst case (every attempt plus every backoff).
+SSH_TRANSIENT_RETRY_BACKOFFS_SECONDS: Final[tuple[float, ...]] = (0.0, 1.0, 3.0, 6.0)
+SSH_TRANSIENT_RETRY_MAX_ATTEMPTS: Final[int] = len(SSH_TRANSIENT_RETRY_BACKOFFS_SECONDS) + 1
+
+# Shared retry decorator built from the policy above. Also used by the Host subclass in
 # ``imbue.mngr.hosts.host``.
 retry_on_transient_ssh_error = retry(
     retry=retry_if_exception(is_transient_ssh_error),
-    stop=stop_after_attempt(5),
-    wait=wait_chain(
-        wait_fixed(0),
-        wait_fixed(1),
-        wait_fixed(3),
-        wait_fixed(6),
-    ),
+    stop=stop_after_attempt(SSH_TRANSIENT_RETRY_MAX_ATTEMPTS),
+    wait=wait_chain(*(wait_fixed(seconds) for seconds in SSH_TRANSIENT_RETRY_BACKOFFS_SECONDS)),
     reraise=True,
+)
+
+
+# The transient SSH *handshake* failures a freshly provisioned or tunnel-fronted sshd
+# (a new Modal sandbox, a new VPS) exhibits, each of which clears on its own within
+# seconds. paramiko raises a distinct message per shape, and pyinfra wraps every one as
+# ``ConnectError("SSH error (<paramiko message>)")``, so they are recognized by substring:
+#   - "error reading ssh protocol banner": the endpoint accepted the TCP connection but
+#     had not answered the SSH banner yet, or a fronting tunnel accepted then reset the
+#     connection before the backend sshd was up.
+#   - "no existing session": the transport was torn down mid-handshake, so paramiko's
+#     ``get_remote_server_key`` finds no active session -- a tunnel blip during key
+#     exchange, which can strike even after a readiness probe has already succeeded.
+# Refused/unreachable/auth/host-key failures are deliberately excluded (they carry other
+# messages) so a genuinely-down host still fails fast.
+_TRANSIENT_SSH_HANDSHAKE_CONNECT_ERROR_MESSAGES: Final[tuple[str, ...]] = (
+    "error reading ssh protocol banner",
+    "no existing session",
 )
 
 
 def _is_transient_ssh_connect_error(exception: BaseException) -> bool:
-    """Check if the exception is a transient SSH connect failure worth retrying.
+    """Whether ``exception`` is a transient SSH handshake failure worth retrying.
 
-    Matches only pyinfra ``ConnectError``s wrapping paramiko's "Error reading
-    SSH protocol banner": the TCP connection was accepted but sshd did not
-    answer the SSH handshake in time, which happens transiently while a freshly
-    booted host's sshd is still coming up (e.g. a new Modal sandbox or VPS) or
-    while it is briefly overloaded. Refused/unreachable/auth/host-key failures
-    are deliberately not matched so genuinely-down hosts still fail fast.
+    True only for pyinfra ``ConnectError``s whose message names one of
+    ``_TRANSIENT_SSH_HANDSHAKE_CONNECT_ERROR_MESSAGES`` (defined above).
     """
-    return isinstance(exception, ConnectError) and "error reading ssh protocol banner" in str(exception).lower()
+    if not isinstance(exception, ConnectError):
+        return False
+    message = str(exception).lower()
+    return any(known in message for known in _TRANSIENT_SSH_HANDSHAKE_CONNECT_ERROR_MESSAGES)
 
 
-_retry_on_transient_ssh_connect_error = retry(
-    retry=retry_if_exception(_is_transient_ssh_connect_error),
-    # One immediate retry, no pause: each failed attempt already blocked for
-    # paramiko's banner timeout (15s by default) waiting for sshd to answer,
-    # so two attempts bound the worst case (a host that accepts TCP but never
-    # speaks SSH) at ~30 seconds while still riding out the boot race.
-    stop=stop_after_attempt(2),
-    wait=wait_fixed(0),
-    reraise=True,
-)
+# A transient handshake failure surfaces either immediately or only after paramiko's full
+# banner timeout, so a fixed count of zero-wait retries can burn every attempt in
+# milliseconds before sshd is ready. Ride the race out over a wall-clock deadline with a
+# fixed pause between attempts instead, so the ride-out window does not depend on how each
+# individual attempt happens to fail.
+SSH_CONNECT_HANDSHAKE_RETRY_DEADLINE_SECONDS: Final[float] = 30.0
+SSH_CONNECT_HANDSHAKE_RETRY_BACKOFF_SECONDS: Final[float] = 0.5
+
+
+def _connect_pyinfra_host_retrying_transient_handshake_failures(
+    pyinfra_host: PyinfraHost,
+    deadline_seconds: float,
+    backoff_seconds: float,
+) -> None:
+    """Connect a pyinfra host, retrying transient handshake failures until it answers or the deadline passes."""
+    retrying = Retrying(
+        retry=retry_if_exception(_is_transient_ssh_connect_error),
+        stop=stop_after_delay(deadline_seconds),
+        wait=wait_fixed(backoff_seconds),
+        reraise=True,
+    )
+    retrying(lambda: pyinfra_host.connect(raise_exceptions=True))
 
 
 def _get_ssh_transport(pyinfra_host: Any) -> Transport | None:
@@ -375,6 +466,31 @@ def _prepend_env_exports(command: str, env: Mapping[str, str] | None) -> str:
     return f"{exports} {command}"
 
 
+def _build_replay_safe_rename_command(source_path: Path, destination_path: Path) -> str:
+    """Build the rename half of an atomic write so that re-running it is harmless.
+
+    The rename goes out through ``execute_idempotent_command``, which retries on
+    a transient SSH error and cannot tell "the command never ran" apart from
+    "the command ran but its result was lost on the way back", so it has to
+    survive a replay of a run that succeeded. The source name is unique to one
+    write and nothing else consumes it, so its absence means this very rename
+    already completed. Losing the destination as well means something outside
+    this write removed both, which stays an error.
+    """
+    quoted_source = shlex.quote(str(source_path))
+    quoted_destination = shlex.quote(str(destination_path))
+    return "\n".join(
+        (
+            f"if [ -e {quoted_source} ]; then",
+            f"  mv -f {quoted_source} {quoted_destination}",
+            f"elif [ ! -e {quoted_destination} ]; then",
+            f"  echo 'neither the staged file nor its destination exists:' {quoted_source} {quoted_destination} >&2",
+            "  exit 1",
+            "fi",
+        )
+    )
+
+
 class OuterHost(OuterHostInterface):
     """A minimal, agent-less host backed by a pyinfra connector.
 
@@ -434,10 +550,11 @@ class OuterHost(OuterHostInterface):
         directory). The branch order matters: ``timed_out``, when provided,
         wraps a post-retry ``TimeoutError`` and MUST be caught before the
         ``OSError`` branch because ``TimeoutError`` is an ``OSError`` subclass.
-        A "Socket is closed" ``OSError`` means the channel died mid-operation;
-        any other ``OSError`` propagates unchanged. Pass ``timed_out=None`` to
-        let a raw ``TimeoutError`` propagate (the list-directory path's existing
-        behavior).
+        An ``OSError`` naming a dead connection (see
+        :func:`is_dead_ssh_connection_error`) means the channel died
+        mid-operation; any other ``OSError`` propagates unchanged. Pass
+        ``timed_out=None`` to let a raw ``TimeoutError`` propagate, for callers
+        that classify a timeout themselves instead of as a connection error.
         """
         try:
             yield
@@ -446,30 +563,22 @@ class OuterHost(OuterHostInterface):
                 raise
             raise HostConnectionError(timed_out) from e
         except OSError as e:
-            if "Socket is closed" in str(e):
+            if is_dead_ssh_connection_error(e):
                 raise HostConnectionError(closed) from e
             raise
         except (EOFError, SSHException) as e:
             raise HostConnectionError(failed) from e
-
-    @_retry_on_transient_ssh_connect_error
-    def _connect_with_transient_retry(self) -> None:
-        """Connect the pyinfra host, retrying banner-read connect failures.
-
-        Each banner-read failure already spent paramiko's own banner timeout
-        waiting for sshd to answer, so a single immediate retry rides out the
-        boot race where a freshly created host accepts TCP before sshd is
-        ready -- which otherwise surfaces to users as a spurious create
-        failure -- while keeping the worst case bounded at ~30 seconds.
-        """
-        self.connector.host.connect(raise_exceptions=True)
 
     def _ensure_connected(self) -> None:
         """Ensure the pyinfra host is connected, re-verifying a held cooperative lock across reconnects."""
         if self.connector.host.connected:
             return
         try:
-            self._connect_with_transient_retry()
+            _connect_pyinfra_host_retrying_transient_handshake_failures(
+                self.connector.host,
+                SSH_CONNECT_HANDSHAKE_RETRY_DEADLINE_SECONDS,
+                SSH_CONNECT_HANDSHAKE_RETRY_BACKOFF_SECONDS,
+            )
         except ConnectError as e:
             message = str(e).lower()
             # Missing/unverifiable host keys are a trust failure: we have no basis to
@@ -487,6 +596,15 @@ class OuterHost(OuterHostInterface):
             # host discovery) treat it as a per-host connection failure rather than
             # letting it abort the whole operation.
             raise HostConnectionError(f"Failed to connect to host: {e}") from e
+        # Keepalives on every fresh transport: without them, a connection whose
+        # path dies silently leaves any blocked reader (a command's output read,
+        # the lock channel's recv) waiting forever. See the constant's comment
+        # for what they do and do not detect.
+        transport = _get_ssh_transport(self.connector.host)
+        if transport is not None:
+            transport.set_keepalive(SSH_KEEPALIVE_INTERVAL_SECONDS)
+        # Keepalives cannot detect a peer that vanished during a suspension.
+        self.mngr_ctx.suspension_watchdog.register(transport)
         # We just (re)built the connection. If a cooperative lock was held, the dropped
         # connection orphaned its lock channel and released the flock, so re-acquire and
         # verify that no other actor acquired in the gap before any operation proceeds.
@@ -634,8 +752,8 @@ class OuterHost(OuterHostInterface):
             self._disconnect_for_retry()
             raise
         except OSError as e:
-            if "Socket is closed" in str(e):
-                logger.debug("Socket closed while running command, disconnecting for retry")
+            if is_dead_ssh_connection_error(e):
+                logger.debug("SSH connection died while running command ({}), disconnecting for retry", e)
                 self._disconnect_for_retry()
             raise
 
@@ -716,8 +834,31 @@ class OuterHost(OuterHostInterface):
         return transport
 
     def _create_sftp_client(self, transport: Transport) -> SFTPClient | None:
-        """Create an SFTPClient from a paramiko Transport."""
-        return SFTPClient.from_transport(transport)
+        """Create an SFTPClient from a paramiko Transport.
+
+        Mirrors ``SFTPClient.from_transport`` but opens the channel with an
+        explicit timeout (``from_transport`` passes none, so a wedged sshd
+        hangs the open forever) and gives the channel a default silence
+        timeout; callers with their own read budget override it via
+        ``settimeout`` (see ``_get_file_via_paramiko``).
+        """
+        channel = transport.open_session(timeout=SSH_CHANNEL_OPEN_TIMEOUT_SECONDS)
+        if channel is None:
+            return None
+        # Close the channel if any setup step after the open fails (the
+        # subsystem request or SFTP version negotiation), so a failed setup
+        # never leaks a channel onto the shared transport. Mirrors the
+        # host-lock channel handling in ``Host._open_lock_channel``.
+        is_sftp_ready = False
+        try:
+            channel.settimeout(SFTP_CHANNEL_SILENCE_TIMEOUT_SECONDS)
+            channel.invoke_subsystem("sftp")
+            sftp_client = SFTPClient(channel)
+            is_sftp_ready = True
+        finally:
+            if not is_sftp_ready:
+                channel.close()
+        return sftp_client
 
     def _get_file(
         self,
@@ -733,7 +874,8 @@ class OuterHost(OuterHostInterface):
         channel, which (after transient retries) surfaces as a
         ``HostConnectionError``. Used by the per-host-bounded discovery read so a
         wedged host cannot hang the read forever; other callers leave it ``None``
-        (unbounded, prior behavior).
+        and fall back to the channel's default per-read silence bound
+        (``SFTP_CHANNEL_SILENCE_TIMEOUT_SECONDS``).
         """
         with (
             self._notify_on_connection_error(),
@@ -783,8 +925,8 @@ class OuterHost(OuterHostInterface):
             error_msg = str(e)
             if "No such file or directory" in error_msg or "cannot stat" in error_msg:
                 raise FileNotFoundError(f"File not found: {remote_filename}") from e
-            elif "Socket is closed" in error_msg:
-                logger.debug("Socket closed while reading {}, disconnecting for retry", remote_filename)
+            elif is_dead_ssh_connection_error(e):
+                logger.debug("SSH connection died while reading {} ({}), disconnecting for retry", remote_filename, e)
                 self._disconnect_for_retry()
                 raise
             else:
@@ -816,8 +958,9 @@ class OuterHost(OuterHostInterface):
         This is thread-safe because paramiko transports can multiplex channels.
 
         When ``timeout_seconds`` is set, the SFTP channel is given that socket
-        timeout so a stalled transfer raises ``socket.timeout`` (a ``TimeoutError``)
-        instead of blocking forever.
+        timeout (overriding the default silence bound applied by
+        ``_create_sftp_client``) so a stalled transfer raises ``socket.timeout``
+        (a ``TimeoutError``) within the caller's own budget.
         """
         transport = self._get_paramiko_transport()
         sftp = self._create_sftp_client(transport)
@@ -837,6 +980,15 @@ class OuterHost(OuterHostInterface):
             error_msg = str(e)
             if "No such file" in error_msg or "not found" in error_msg.lower():
                 raise FileNotFoundError(f"File not found: {remote_filename}") from e
+            # Reading a directory fails here with a server-specific message, so
+            # classify it by asking the server; this keeps a remote read's error
+            # the same OSError subclass a local read of a directory raises. Only
+            # a failure the server actually answered is worth asking about: a
+            # timed-out or dead connection cannot answer, and must not be made
+            # slower by the attempt.
+            is_answered_by_server = not isinstance(e, TimeoutError) and not is_dead_ssh_connection_error(e)
+            if is_answered_by_server and _is_remote_directory(sftp, remote_filename):
+                raise IsADirectoryError(f"Is a directory: {remote_filename}") from e
             raise
         finally:
             sftp.close()
@@ -888,8 +1040,8 @@ class OuterHost(OuterHostInterface):
             self._disconnect_for_retry()
             raise
         except OSError as e:
-            if "Socket is closed" in str(e):
-                logger.debug("Socket closed while writing {}, disconnecting for retry", remote_filename)
+            if is_dead_ssh_connection_error(e):
+                logger.debug("SSH connection died while writing {} ({}), disconnecting for retry", remote_filename, e)
                 self._disconnect_for_retry()
                 raise
             else:
@@ -1063,6 +1215,7 @@ class OuterHost(OuterHostInterface):
             stdout=accumulator.stdout,
             stderr=accumulator.stderr,
             success=(finished.returncode == 0),
+            exit_code=finished.returncode,
         )
 
     @retry_on_transient_ssh_error
@@ -1135,6 +1288,7 @@ class OuterHost(OuterHostInterface):
             stdout="\n".join(stdout_lines) + ("\n" if stdout_lines else ""),
             stderr="\n".join(stderr_state.lines) + ("\n" if stderr_state.lines else ""),
             success=(exit_code == 0),
+            exit_code=exit_code,
         )
 
     def read_file(self, path: Path) -> bytes:
@@ -1143,45 +1297,75 @@ class OuterHost(OuterHostInterface):
             return path.read_bytes()
         else:
             output = io.BytesIO()
-            self._get_file(str(path), output)
+            # Clamp the remote read to any active per-host read budget so a wedged transfer
+            # self-terminates within it (surfacing as HostConnectionError) rather than hanging.
+            self._get_file(str(path), output, timeout_seconds=remaining_read_timeout(None))
             return output.getvalue()
 
     def write_file(self, path: Path, content: bytes, mode: str | None = None, is_atomic: bool = False) -> None:
-        """Write bytes content to a file, creating parent directories as needed."""
+        """Write bytes content to a file, creating parent directories as needed.
+
+        ``mode`` is an octal string (e.g. ``"0755"``) applied to the final path. With
+        ``is_atomic`` the bytes land in a sibling temp file that is renamed over ``path``
+        once complete, so a reader never sees a half-written file; the mode goes on
+        before that rename, so the file is never published without it.
+        """
         if is_atomic:
             write_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
         else:
             write_path = path
 
         if self.is_local:
-            try:
-                write_path.write_bytes(content)
-            except FileNotFoundError:
-                write_path.parent.mkdir(parents=True, exist_ok=True)
-                write_path.write_bytes(content)
+            self._write_file_local(path, write_path, content, mode)
         else:
-            try:
-                is_success = self._put_file(io.BytesIO(content), str(write_path))
-            except IOError:
-                is_success = False
-            if not is_success:
-                parent_dir = str(write_path.parent)
-                result = self.execute_idempotent_command(f"mkdir -p '{parent_dir}'")
-                if not result.success:
-                    raise MngrError(
-                        f"Failed to create parent directory '{parent_dir}' on outer host {self.id} because: {result.stderr}"
-                    )
-                is_success = self._put_file(io.BytesIO(content), str(write_path))
-                if not is_success:
-                    raise MngrError(f"Failed to write file '{str(write_path)}' on outer host {self.id}'")
+            self._write_file_remote(path, write_path, content, mode)
+
+    def _write_file_local(self, path: Path, write_path: Path, content: bytes, mode: str | None) -> None:
+        """Write, chmod, and rename straight through the local filesystem.
+
+        Every step the remote path delegates to a shell command is a direct filesystem
+        call here. Spawning a shell to chmod a file this process just wrote costs more
+        than the write did, and that latency is what stretches under a loaded machine.
+        """
+        try:
+            write_path.write_bytes(content)
+        except FileNotFoundError:
+            write_path.parent.mkdir(parents=True, exist_ok=True)
+            write_path.write_bytes(content)
+        if mode is not None:
+            write_path.chmod(int(mode, 8))
         if write_path != path:
-            result = self.execute_idempotent_command(f"mv '{str(write_path)}' '{str(path)}'")
+            # The temp file is a sibling of its destination, so this is a same-filesystem
+            # rename: atomic, and it replaces any existing file.
+            os.replace(write_path, path)
+
+    def _write_file_remote(self, path: Path, write_path: Path, content: bytes, mode: str | None) -> None:
+        """Write, chmod, and rename over the connection, via SFTP plus shell commands."""
+        try:
+            is_success = self._put_file(io.BytesIO(content), str(write_path))
+        except IOError:
+            is_success = False
+        if not is_success:
+            parent_dir = str(write_path.parent)
+            result = self.execute_idempotent_command(f"mkdir -p {shlex.quote(parent_dir)}")
+            if not result.success:
+                raise MngrError(
+                    f"Failed to create parent directory '{parent_dir}' on outer host {self.id} because: {result.stderr}"
+                )
+            is_success = self._put_file(io.BytesIO(content), str(write_path))
+            if not is_success:
+                raise MngrError(f"Failed to write file '{str(write_path)}' on outer host {self.id}'")
+        # The mode goes on before the rename, so an atomic write publishes the
+        # file already carrying it rather than leaving it at the umask default
+        # (commonly world-readable) until a second round-trip lands.
+        if mode is not None:
+            self.execute_idempotent_command(f"chmod {shlex.quote(mode)} {shlex.quote(str(write_path))}")
+        if write_path != path:
+            result = self.execute_idempotent_command(_build_replay_safe_rename_command(write_path, path))
             if not result.success:
                 raise MngrError(
                     f"Failed to move temp file to final location on outer host {self.id} because: {result.stderr}"
                 )
-        if mode is not None:
-            self.execute_idempotent_command(f"chmod {mode} '{str(path)}'")
 
     def read_text_file(self, path: Path, encoding: str = "utf-8") -> str:
         """Read a file and return its contents as a string."""
@@ -1294,3 +1478,8 @@ class OuterHost(OuterHostInterface):
             return (user, hostname, port, Path(""))
 
         return (user, hostname, port, Path(key_path_str))
+
+    def get_ssh_known_hosts_path(self) -> Path | None:
+        if self.is_local:
+            return None
+        return get_ssh_known_hosts_file(self)

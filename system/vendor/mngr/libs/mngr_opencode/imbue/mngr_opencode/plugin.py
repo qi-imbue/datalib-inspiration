@@ -67,6 +67,8 @@ from imbue.mngr.agents.base_agent import BaseAgent
 from imbue.mngr.agents.common_transcript import provision_scripts_to_commands_dir
 from imbue.mngr.agents.installation import ensure_cli_installed
 from imbue.mngr.agents.installation import verify_pinned_cli_version
+from imbue.mngr.agents.output_styles import read_output_style_files
+from imbue.mngr.agents.output_styles import resolve_output_style
 from imbue.mngr.agents.update_policy import AgentUpdatePolicy
 from imbue.mngr.agents.update_policy import is_self_update_disabled
 from imbue.mngr.api.preservation import PreservedItem
@@ -100,10 +102,11 @@ from imbue.mngr.interfaces.host import HostInterface
 from imbue.mngr.interfaces.host import HostLocation
 from imbue.mngr.interfaces.host import OnlineHostInterface
 from imbue.mngr.plugins.hookspecs import OnBeforeCreateArgs
-from imbue.mngr.primitives import AgentLifecycleState
 from imbue.mngr.primitives import AgentTypeName
 from imbue.mngr.primitives import CommandString
 from imbue.mngr.primitives import DiscoveredAgent
+from imbue.mngr.primitives import OutputStyleName
+from imbue.mngr.primitives import SystemPromptText
 from imbue.mngr.primitives import WaitingReason
 from imbue.mngr.utils.polling import poll_for_value
 from imbue.mngr.utils.polling import poll_until
@@ -129,14 +132,17 @@ from imbue.mngr_opencode.opencode_config import apply_opencode_merge
 from imbue.mngr_opencode.opencode_config import apply_opencode_rebind
 from imbue.mngr_opencode.opencode_config import build_opencode_config
 from imbue.mngr_opencode.opencode_config import collect_adopt_search_db_paths
+from imbue.mngr_opencode.opencode_config import get_opencode_agents_md_path
 from imbue.mngr_opencode.opencode_config import get_opencode_app_data_dir
 from imbue.mngr_opencode.opencode_config import get_opencode_auth_path_for_data_home
 from imbue.mngr_opencode.opencode_config import get_opencode_config_dir
 from imbue.mngr_opencode.opencode_config import get_opencode_config_file_path
 from imbue.mngr_opencode.opencode_config import get_opencode_data_home
+from imbue.mngr_opencode.opencode_config import get_opencode_output_styles_dir
 from imbue.mngr_opencode.opencode_config import get_opencode_plugin_path
 from imbue.mngr_opencode.opencode_config import get_opencode_root_session_file_path
 from imbue.mngr_opencode.opencode_config import get_opencode_server_port_file_path
+from imbue.mngr_opencode.opencode_config import get_opencode_tmp_dir
 from imbue.mngr_opencode.opencode_config import get_shared_opencode_auth_path
 from imbue.mngr_opencode.opencode_config import read_only_root_session_id
 from imbue.mngr_opencode.opencode_config import read_opencode_config
@@ -151,6 +157,10 @@ _USER_CONFIG_RELATIVE_PATH: Final[tuple[str, ...]] = (".config", "opencode", "op
 # OpenCode env vars that isolate config and data per agent.
 _OPENCODE_CONFIG_DIR_ENV_VAR: Final[str] = "OPENCODE_CONFIG_DIR"
 _XDG_DATA_HOME_ENV_VAR: Final[str] = "XDG_DATA_HOME"
+# TMPDIR points opencode (a Bun binary) at an exec-capable temp dir: it extracts its OpenTUI
+# native render library to TMPDIR and maps it executable, which the image's ``noexec`` /tmp
+# rejects. Set on both serve and attach (both are Bun).
+_TMPDIR_ENV_VAR: Final[str] = "TMPDIR"
 
 # Ask ``opencode serve`` for an OS-assigned free port (verified: concurrent
 # ``--port 0`` servers get distinct ports). The launch script records the actual
@@ -170,6 +180,11 @@ _PROMPT_ENDPOINT_TEMPLATE: Final[str] = "http://127.0.0.1:{port}/session/{sessio
 # staging path and copies exactly this trio onto the (possibly remote) host -- the ``-wal``/``-shm``
 # sidecars carry writes not yet checkpointed into the main file, so they travel with it.
 _DB_SIDECAR_SUFFIXES: Final[tuple[str, ...]] = ("-wal", "-shm")
+
+# Role instruction blocks (append_system_prompt, then the output-style body) are joined with a
+# blank line before being written to the per-agent AGENTS.md, matching the separator the other
+# harness plugins use so a style reads identically across harnesses.
+_INSTRUCTIONS_SEPARATOR: Final[str] = "\n\n"
 
 
 def _build_prompt_post_command(port: str, session_id: str, message: str) -> str:
@@ -249,6 +264,22 @@ class OpenCodeAgentConfig(AgentTypeConfig):
         description="Auto-approve everything not explicitly denied "
         "(injects a wildcard allow into the opencode.json permission block).",
     )
+    # output_style / append_system_prompt mirror mngr_antigravity and mngr_pi_coding: the
+    # role's output style and any stacked system-prompt blocks are concatenated and written to
+    # the per-agent AGENTS.md, which opencode auto-loads as global rules. Declaring output_style
+    # here is also what lets the shared `chat` template (which sets output_style) resolve
+    # against this agent type instead of being rejected.
+    output_style: OutputStyleName | None = Field(
+        default=None,
+        description="Name of the output style whose body is appended to the agent's AGENTS.md "
+        "(opencode's system prompt). Resolved from .agents/output-styles in the work dir.",
+    )
+    append_system_prompt: tuple[SystemPromptText, ...] = Field(
+        default=(),
+        description="System-prompt blocks appended to the agent's AGENTS.md, before the "
+        "output-style body. Write `append_system_prompt__extend = [...]` in a template so "
+        "stacked roles each contribute.",
+    )
     check_installation: bool = Field(
         default=True,
         description="Check whether opencode is installed and install it if missing "
@@ -309,21 +340,13 @@ class OpenCodeAgent(
         # also matches it among pane descendants).
         return "opencode"
 
-    def get_lifecycle_state(self) -> AgentLifecycleState:
-        """Get lifecycle state, accounting for the ``permissions_waiting`` marker.
+    def is_blocked_on_dialog(self) -> bool:
+        """Whether opencode is holding on a tool-approval prompt.
 
-        The lifecycle plugin touches ``permissions_waiting`` while opencode is
-        blocked on a tool-approval prompt (its ``ask`` permission policy) and clears
-        it once the prompt is answered. The base state reads only the ``active``
-        marker, which stays present during a prompt (the session is still busy), so
-        on its own it would report RUNNING. Promote RUNNING -> WAITING while the
-        agent is blocked, since it cannot progress without user intervention. The
-        promotion rule lives in ``_resolve_lifecycle_state_for_permission`` so it can
-        be unit-tested without a live server.
+        The lifecycle plugin touches ``permissions_waiting`` while a prompt from its
+        ``ask`` permission policy is open, and clears it once answered.
         """
-        base_state = super().get_lifecycle_state()
-        is_blocked_on_permission = self._check_file_exists(self._get_agent_dir() / PERMISSIONS_WAITING_FILENAME)
-        return _resolve_lifecycle_state_for_permission(base_state, is_blocked_on_permission)
+        return self._check_file_exists(self._get_agent_dir() / PERMISSIONS_WAITING_FILENAME)
 
     def wait_for_ready_signal(
         self, is_readiness_awaited: bool, start_action: Callable[[], None], timeout: float | None = None
@@ -389,6 +412,10 @@ class OpenCodeAgent(
     def _get_opencode_data_home(self) -> Path:
         """Per-agent OpenCode data root (the ``XDG_DATA_HOME`` value)."""
         return get_opencode_data_home(self._get_agent_dir())
+
+    def _get_opencode_tmp_dir(self) -> Path:
+        """Per-agent OpenCode temp dir (the ``TMPDIR`` value; exec-capable, unlike /tmp)."""
+        return get_opencode_tmp_dir(self._get_agent_dir())
 
     def _get_root_session_file_path(self) -> Path:
         """File where the launch script records the root session id (read by send_message)."""
@@ -501,6 +528,7 @@ class OpenCodeAgent(
                 )
         host_home = self._resolve_host_home(host)
         self._provision_opencode_config(host, host_home)
+        self._provision_agent_instructions(host)
         self._provision_plugin(host)
         self._provision_auth(host, host_home)
         with mngr_ctx.concurrency_group.make_concurrency_group("opencode_provisioning") as concurrency_group:
@@ -693,6 +721,39 @@ class OpenCodeAgent(
         with log_span("Writing per-agent opencode config to {}", config_path):
             host.write_text_file(config_path, serialize_opencode_config(per_agent_config))
 
+    def _build_agent_rules_text(self, host: OnlineHostInterface) -> str | None:
+        """Join this agent type's role instructions into one blob, or None if there are none.
+
+        The ``append_system_prompt`` blocks come first, in stack order, then the output-style
+        file's body -- the same ordering codex/antigravity/pi use, so a style reads identically
+        across harnesses. Returns None when the agent type contributes nothing.
+        """
+        blocks: list[str] = [str(prompt) for prompt in self.agent_config.append_system_prompt]
+        if self.agent_config.output_style is not None:
+            styles_dir = get_opencode_output_styles_dir(Path(self.work_dir))
+            blocks.append(
+                resolve_output_style(self.agent_config.output_style, read_output_style_files(host, styles_dir))
+            )
+        blocks = [block for block in blocks if block]
+        if not blocks:
+            return None
+        return _INSTRUCTIONS_SEPARATOR.join(blocks)
+
+    def _provision_agent_instructions(self, host: OnlineHostInterface) -> None:
+        """Write the agent's role instructions to the per-agent ``AGENTS.md`` opencode auto-loads.
+
+        opencode discovers ``<OPENCODE_CONFIG_DIR>/AGENTS.md`` as its global rules file (see
+        opencode's ``session/instruction.ts``), so this is a true system-prompt channel for the
+        agent, additive with the project's own ``AGENTS.md``. When the agent type contributes no
+        instructions (no role ``output_style`` / ``append_system_prompt``), nothing is written.
+        """
+        instructions = self._build_agent_rules_text(host)
+        if instructions is None:
+            return
+        rules_path = get_opencode_agents_md_path(self._get_opencode_config_dir())
+        with log_span("Writing opencode agent instructions to {}", rules_path):
+            host.write_text_file(rules_path, instructions)
+
     def _provision_plugin(self, host: OnlineHostInterface) -> None:
         """Write the lifecycle plugin into the per-agent config dir's ``plugin/``.
 
@@ -754,6 +815,7 @@ class OpenCodeAgent(
 
         config_dir = self._get_opencode_config_dir()
         data_home = self._get_opencode_data_home()
+        tmp_dir = self._get_opencode_tmp_dir()
         launch_script = "$MNGR_AGENT_STATE_DIR/commands/" + LAUNCH_SCRIPT_NAME
         # The launch script puts this straight into the session-create URL query
         # (?directory=...), so URL-encode it here (in Python, via the stdlib)
@@ -764,6 +826,7 @@ class OpenCodeAgent(
         env_prefix = (
             f"env {_OPENCODE_CONFIG_DIR_ENV_VAR}={shlex.quote(str(config_dir))}"
             f" {_XDG_DATA_HOME_ENV_VAR}={shlex.quote(str(data_home))}"
+            f" {_TMPDIR_ENV_VAR}={shlex.quote(str(tmp_dir))}"
             f" {OPENCODE_BIN_ENV_VAR}={shlex.quote(opencode_bin)}"
             f" {OPENCODE_PORT_ENV_VAR}={_EPHEMERAL_PORT}"
             f" {OPENCODE_WORKDIR_ENV_VAR}={shlex.quote(directory_query)}"
@@ -862,39 +925,15 @@ def register_agent_type() -> tuple[str, type[AgentInterface] | None, type[AgentT
     return ("opencode", OpenCodeAgent, OpenCodeAgentConfig)
 
 
-def _resolve_lifecycle_state_for_permission(
-    base_state: AgentLifecycleState, is_blocked_on_permission: bool
-) -> AgentLifecycleState:
-    """Layer the ``permissions_waiting`` signal onto the base lifecycle state.
-
-    Promotes RUNNING -> WAITING while opencode is blocked on a tool-approval prompt
-    (the base state, which reads only the ``active`` marker, would otherwise report
-    RUNNING since the session stays busy). Every non-RUNNING base state passes
-    through unchanged. Kept pure (no agent/host) so ``get_lifecycle_state``'s
-    promotion rule is unit-testable without standing up a live server.
-
-    Defers the gating decision to the shared ``classify_waiting_reason``: a RUNNING
-    base state means the ``active`` marker is present and the process is alive, so
-    the classifier's ``is_active`` gate is satisfied and a PERMISSIONS verdict is
-    what promotes RUNNING to WAITING. Sharing that one function keeps this promotion
-    and the ``waiting_reason`` field generator from drifting apart.
-    """
-    if base_state != AgentLifecycleState.RUNNING:
-        return base_state
-    reason = classify_waiting_reason(is_active=True, is_blocked_on_permission=is_blocked_on_permission)
-    return AgentLifecycleState.WAITING if reason is WaitingReason.PERMISSIONS else base_state
-
-
 def _waiting_reason(agent: AgentInterface, host: OnlineHostInterface) -> WaitingReason | None:
     """Return why the agent is waiting based on marker files, or None.
 
-    Reads the agent state directory's marker files directly rather than calling
-    get_lifecycle_state() (which runs tmux/ps SSH commands), then delegates the
-    decision to the shared ``classify_waiting_reason`` so this and the lifecycle
-    promotion stay in lockstep. The markers are maintained by the in-process
-    lifecycle plugin (mngr_opencode_plugin.ts). ``permissions_waiting`` is only read
-    when ``active`` is present, both to short-circuit the idle case and because the
-    classifier ignores the permission signal when the agent is not in a turn.
+    Reads ``active`` directly rather than calling get_lifecycle_state() (which runs
+    tmux/ps SSH commands), and takes the block through the agent -- the same call the
+    lifecycle makes -- so the reason and the state cannot disagree about one agent. The
+    markers are maintained by the in-process lifecycle plugin (mngr_opencode_plugin.ts).
+    The block is only consulted while ``active`` is present, since the classifier
+    ignores it outside a turn.
 
     Unlike codex, opencode has no cancelled-dialog ambiguity here: a denied prompt
     emits ``permission.replied`` and a cancelled turn emits ``session.idle``, both of
@@ -903,8 +942,7 @@ def _waiting_reason(agent: AgentInterface, host: OnlineHostInterface) -> Waiting
     """
     agent_dir = get_agent_state_dir_path(host.host_dir, agent.id)
     is_active = host.path_exists(agent_dir / ACTIVE_MARKER_FILENAME)
-    is_blocked_on_permission = is_active and host.path_exists(agent_dir / PERMISSIONS_WAITING_FILENAME)
-    return classify_waiting_reason(is_active, is_blocked_on_permission)
+    return classify_waiting_reason(is_active, is_active and agent.is_blocked_on_dialog())
 
 
 @hookimpl

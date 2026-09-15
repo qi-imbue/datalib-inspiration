@@ -8,8 +8,12 @@ record for it. This store joins that view with account *identity* (email,
 display_name), which it fetches on demand from the plugin via
 ``ImbueCloudCli.auth_list()`` and caches in memory so the chrome SSE /
 workspace list rendering paths don't fan out into subprocesses on every
-poll. Sign-in / sign-out flows must call :meth:`invalidate_identity_cache`
-so the cache stays in sync with the plugin's view of who is signed in.
+poll. The cache is validated against a cheap stat-level fingerprint of the
+plugin's on-disk sessions directory, so sign-ins and sign-outs performed
+outside the app (e.g. ``mngr imbue_cloud auth signin`` in a terminal under
+the app's MNGR_HOST_DIR) surface on the next read without a restart. In-app
+sign-in / sign-out flows still call :meth:`invalidate_identity_cache` for an
+immediate, unconditional refresh.
 """
 
 import threading
@@ -29,8 +33,43 @@ from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCliError
 from imbue.minds.desktop_client.workspace_record_store import ReplicaRecord
 from imbue.minds.desktop_client.workspace_record_store import WorkspaceRecordStore
 from imbue.minds.errors import WorkspaceSyncError
+from imbue.minds.mngr_settings.provider_blocks import imbue_cloud_provider_name_for_account
+from imbue.mngr_imbue_cloud.config import get_active_profile_dir
+from imbue.mngr_imbue_cloud.config import get_sessions_dir
+from imbue.mngr_imbue_cloud.errors import ImbueCloudError
 
 _USER_ID_PREFIX_LENGTH = 16
+
+# One (name, mtime_ns, size, inode) tuple per entry of the plugin's sessions dir.
+_SessionsFingerprint = tuple[tuple[str, int, int, int], ...]
+
+
+def _sessions_state_fingerprint(sessions_dir: Path) -> _SessionsFingerprint:
+    """Stat-level fingerprint of the plugin's on-disk session state.
+
+    Any signin/signout through the plugin CLI touches this directory (it
+    writes ``<user_id>.json``, ``accounts.json``, and ``active_account``),
+    so a changed fingerprint means the cached ``auth list`` result may be
+    stale. The inode is included because the plugin writes via atomic
+    temp-file-plus-rename (a new inode every write): it catches a rewrite
+    that races a fingerprint within one coarse-clock mtime tick without
+    changing the size. A missing directory fingerprints the same as an
+    empty one: both mean "no sessions".
+    """
+    try:
+        entries = sorted(sessions_dir.iterdir())
+    except OSError:
+        return ()
+    fingerprint: list[tuple[str, int, int, int]] = []
+    for entry in entries:
+        try:
+            stats = entry.stat()
+        except OSError:
+            # Deleted between iterdir and stat (a concurrent signout); the
+            # dir mutation shows up as the entry's absence on the next read.
+            continue
+        fingerprint.append((entry.name, stats.st_mtime_ns, stats.st_size, stats.st_ino))
+    return tuple(fingerprint)
 
 
 class SuperTokensUserId(NonEmptyStr):
@@ -40,7 +79,7 @@ class SuperTokensUserId(NonEmptyStr):
 
 
 class UserIdPrefix(NonEmptyStr):
-    """First 16 hex chars of a SuperTokens user ID, used for tunnel naming."""
+    """First 16 hex chars of a SuperTokens user ID, used to name per-account resources (e.g. R2 buckets)."""
 
     ...
 
@@ -57,6 +96,10 @@ class AccountSession(FrozenModel):
     email: str = Field(description="User email address")
     display_name: str | None = Field(default=None, description="Display name from OAuth provider")
     workspace_ids: list[str] = Field(default_factory=list, description="Agent IDs associated with this account")
+    is_active: bool = Field(
+        default=False,
+        description="Whether the plugin marks this account active (most recent signin / `auth use` pin)",
+    )
 
 
 class UserInfo(FrozenModel):
@@ -65,7 +108,7 @@ class UserInfo(FrozenModel):
     user_id: SuperTokensUserId = Field(description="SuperTokens user ID")
     email: str = Field(description="User email address")
     display_name: str | None = Field(default=None, description="Display name from OAuth provider")
-    user_id_prefix: UserIdPrefix = Field(description="First 16 hex chars of user ID for tunnel naming")
+    user_id_prefix: UserIdPrefix = Field(description="First 16 hex chars of the user ID, used in resource names")
 
 
 def derive_user_id_prefix(user_id: str) -> UserIdPrefix:
@@ -81,11 +124,15 @@ class MultiAccountSessionStore(MutableModel):
     """Joins plugin-owned auth identity with the workspace-record association view.
 
     Identity is sourced from ``ImbueCloudCli.auth_list()`` and cached in
-    memory; sign-in / sign-out callers must invoke
-    :meth:`invalidate_identity_cache` so the cache stays consistent with the
-    plugin's view. Associations come from (and are written through) the
-    :class:`WorkspaceRecordStore`; when none is configured every workspace
-    reads as private and association writes raise.
+    memory. The cache is coherent with the plugin's on-disk session store:
+    each read stat-fingerprints the plugin's sessions directory (when
+    ``mngr_host_dir`` is configured) and refreshes when it changed, so
+    out-of-band CLI sign-ins/sign-outs surface without an app restart.
+    In-app sign-in / sign-out callers still invoke
+    :meth:`invalidate_identity_cache` for an immediate refresh. Associations
+    come from (and are written through) the :class:`WorkspaceRecordStore`;
+    when none is configured every workspace reads as private and association
+    writes raise.
     """
 
     data_dir: Path = Field(frozen=True, description="Root data directory (e.g. ~/.minds)")
@@ -93,8 +140,26 @@ class MultiAccountSessionStore(MutableModel):
     record_store: WorkspaceRecordStore | None = Field(
         default=None, description="Association source of truth; None disables associations entirely"
     )
+    mngr_host_dir: Path | None = Field(
+        default=None,
+        frozen=True,
+        description=(
+            "The app's mngr host dir (the MNGR_HOST_DIR its plugin subprocesses run under). Used to "
+            "locate the plugin's sessions directory so the identity cache can detect out-of-band "
+            "sign-ins/sign-outs; None disables the on-disk coherence check (the cache then only "
+            "refreshes via invalidate_identity_cache)."
+        ),
+    )
     _cache_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _identity_cache: dict[str, ImbueCloudAuthAccount] | None = PrivateAttr(default=None)
+    # The sessions-dir fingerprint the current ``_identity_cache`` was built
+    # against (None while the sessions dir is not yet resolvable). Compared on
+    # every cached read; a mismatch means the plugin's on-disk session state
+    # changed underneath us and the cache must be rebuilt.
+    _identity_cache_fingerprint: _SessionsFingerprint | None = PrivateAttr(default=None)
+    # Resolved lazily: the profile dir needs the host dir's config.toml, which
+    # the app may not have initialized yet at construction time.
+    _sessions_dir: Path | None = PrivateAttr(default=None)
     # Whether the cache has already been force-refreshed since it was last
     # invalidated. The refresh exists to recover from a signin that rotated to a
     # new user_id, which can only have happened once per invalidation -- without
@@ -122,20 +187,51 @@ class MultiAccountSessionStore(MutableModel):
     def invalidate_identity_cache(self) -> None:
         """Drop the cached ``auth list`` result.
 
-        Callers must invoke this whenever a sign-in / sign-out / oauth
-        flow successfully runs, so the cache reflects the plugin's view
-        on the next read.
+        In-app sign-in / sign-out / oauth flows invoke this so the cache
+        reflects the plugin's view on the very next read (out-of-band
+        changes are caught by the sessions-dir fingerprint check instead).
         """
         with self._cache_lock:
             self._identity_cache = None
 
+    def _resolve_sessions_dir_locked(self) -> Path | None:
+        """The plugin's sessions dir, or None while it cannot be resolved yet.
+
+        Resolution needs the host dir's ``config.toml`` (for the active
+        profile id), which the app writes on mngr initialization -- so a miss
+        is retried on the next read rather than cached.
+        """
+        if self.mngr_host_dir is None:
+            return None
+        if self._sessions_dir is None:
+            try:
+                profile_dir = get_active_profile_dir(self.mngr_host_dir)
+            except ImbueCloudError:
+                return None
+            self._sessions_dir = get_sessions_dir(profile_dir)
+        return self._sessions_dir
+
     def _identity_by_user_id(self, refresh: bool = False) -> dict[str, ImbueCloudAuthAccount]:
         with self._cache_lock:
-            if not refresh and self._identity_cache is not None:
+            # Fingerprint BEFORE the subprocess runs: a session write that
+            # lands mid-listing then mismatches on the next read (refreshing
+            # once more) instead of being masked by a post-listing stamp.
+            sessions_dir = self._resolve_sessions_dir_locked()
+            current_fingerprint = None if sessions_dir is None else _sessions_state_fingerprint(sessions_dir)
+            if (
+                not refresh
+                and self._identity_cache is not None
+                and current_fingerprint == self._identity_cache_fingerprint
+            ):
                 # Return a shallow copy so that an ``invalidate_identity_cache``
                 # call from another thread can't swap the underlying dict
                 # while a caller iterates over it.
                 return dict(self._identity_cache)
+            if self._identity_cache is not None and current_fingerprint != self._identity_cache_fingerprint:
+                logger.info("The plugin's on-disk session state changed; refreshing the identity cache")
+                # A new cache generation: allow one more rotated-user_id
+                # recovery refresh against the new on-disk state.
+                self._has_force_refreshed = False
             try:
                 accounts = self.cli.auth_list()
             except ImbueCloudCliError as exc:
@@ -149,6 +245,7 @@ class MultiAccountSessionStore(MutableModel):
             if refresh:
                 self._has_force_refreshed = True
             self._identity_cache = {account.user_id: account for account in accounts}
+            self._identity_cache_fingerprint = current_fingerprint
             return dict(self._identity_cache)
 
     def _associations_view(self) -> dict[str, list[str]]:
@@ -248,26 +345,36 @@ class MultiAccountSessionStore(MutableModel):
         color: str | None,
         is_cloud_row: bool,
     ) -> None:
-        """Create-path association: seed a minimal record now, queued for push.
+        """Create-path association: seed the record now, queued for push.
 
         Runs right after ``mngr create`` returns the canonical ids -- before
-        discovery has seen the workspace -- so the record starts with just the
-        form metadata. The reconcile's metadata refresh enriches it (provider,
-        secrets) once discovery catches up. Never blocks or fails creation:
-        a push failure just leaves the row dirty for the reconcile.
+        discovery has seen the workspace -- so the record starts with the form
+        metadata plus whatever this device already holds: a cloud row's
+        provider is known from the account, and its SSH key and pins were
+        written by the lease before create returned, so the first push carries
+        the secrets when the account is unlocked: a device that pulls before
+        the reconcile's refresh already sees a record it can unlock and a
+        machine it can open. The refresh still enriches whatever is missing (a
+        local row's provider, a backup env written later). Never blocks or
+        fails creation: a push failure just leaves the row dirty for the
+        reconcile.
         """
         if self.record_store is None:
             logger.warning("Machine sync is not configured; created machine {} stays private", agent_id)
             return
         account = self._require_account(user_id)
+        provider_kind = imbue_cloud_provider_name_for_account(str(account.email)) if is_cloud_row else ""
+        built_secrets = self.record_store.build_encrypted_secrets(user_id, agent_id, host_id, None)
         seed = ReplicaRecord(
             host_id=host_id,
             agent_id=agent_id,
             display_name=display_name or agent_id,
             color=color,
-            provider_kind="",
+            provider_kind=provider_kind,
             hosting_device_id=None if is_cloud_row else self.record_store.device_id,
             device_label=self.record_store.device_label,
+            encrypted_secrets=built_secrets.encrypted if built_secrets is not None else None,
+            secrets_content_hash=built_secrets.content_hash if built_secrets is not None else None,
         )
         self.record_store.upsert_local_record(user_id, account.email, seed)
         logger.info("Associated created machine {} with user {}", agent_id, user_id[:8])
@@ -287,4 +394,5 @@ def _build_session(account: ImbueCloudAuthAccount, workspace_ids: list[str]) -> 
         email=account.email,
         display_name=account.display_name,
         workspace_ids=list(workspace_ids),
+        is_active=account.is_active,
     )

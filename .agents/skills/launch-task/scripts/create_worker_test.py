@@ -25,6 +25,13 @@ import pytest
 from mngr_cli_contract.contract import assert_mngr_argv_valid
 
 _SCRIPT = Path(__file__).parent / "create_worker.py"
+_MESSAGE_CHAT_SCRIPT = (
+    Path(__file__).resolve().parents[4] / "system" / "scripts" / "message_chat.py"
+)
+_WORKER_ID = "agent-00000000000000000000000000abcdef"
+_CREATED_EVENT = (
+    json.dumps({"event": "created", "agent_id": _WORKER_ID, "host_id": "host-1"}) + "\n"
+)
 _spec = importlib.util.spec_from_file_location("create_worker", _SCRIPT)
 assert _spec is not None and _spec.loader is not None
 create_worker_mod = importlib.util.module_from_spec(_spec)
@@ -60,7 +67,13 @@ class _RecordingRunner(create_worker_mod.Runner):
         argv_list = list(argv)
         self.calls.append(_RecordedCall(argv=argv_list, kwargs=kwargs))
         key = tuple(argv_list[:2])
-        canned = self._responses.get(key, _StubResult())
+        # A create answers with its ``created`` event by default, as the live CLI does.
+        default = (
+            _StubResult(stdout=_CREATED_EVENT)
+            if key == ("mngr", "create")
+            else _StubResult()
+        )
+        canned = self._responses.get(key, default)
         if isinstance(canned, BaseException):
             raise canned
         return canned
@@ -90,6 +103,29 @@ def _write_task(task: Path, source_artifacts_dir: str | None) -> None:
     task.write_text(f"---\n{fm}---\n\nbody\n")
 
 
+def _task_message_argv(task: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(_MESSAGE_CHAT_SCRIPT),
+        _WORKER_ID,
+        "--message-file",
+        str(task),
+    ]
+
+
+_CREATE_ARGV = [
+    "mngr",
+    "create",
+    "demo-worker",
+    "-t",
+    "worker",
+    "--label",
+    "agent_created=true",
+    "--format",
+    "jsonl",
+]
+
+
 def test_happy_path_no_artifacts(tmp_path: Path) -> None:
     runtime, task, _ = _make_layout(tmp_path)
     runner = _RecordingRunner()
@@ -106,15 +142,7 @@ def test_happy_path_no_artifacts(tmp_path: Path) -> None:
     argvs = [c.argv for c in runner.calls]
     assert argvs == [
         ["git", "status", "--porcelain"],
-        [
-            "mngr",
-            "create",
-            "demo-worker",
-            "-t",
-            "worker",
-            "--label",
-            "agent_created=true",
-        ],
+        _CREATE_ARGV,
         [
             "mngr",
             "rsync",
@@ -122,8 +150,37 @@ def test_happy_path_no_artifacts(tmp_path: Path) -> None:
             f"demo-worker:{runtime}/",
             "--uncommitted-changes=merge",
         ],
-        ["mngr", "message", "demo-worker", "--message-file", str(task)],
+        _task_message_argv(task),
     ]
+    # The worker's id is read back from the create and stamped for ``reply``.
+    assert f"worker_agent_id: {_WORKER_ID}" in task.read_text()
+
+
+def test_launch_falls_back_to_mngr_message_by_name_when_the_create_reports_no_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime, task, _ = _make_layout(tmp_path)
+    runner = _RecordingRunner()
+    runner.respond(("mngr", "create"), _StubResult(stdout="not an event\n"))
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 0
+    assert runner.calls[-1].argv == [
+        "mngr",
+        "message",
+        "demo-worker",
+        "--message-file",
+        str(task),
+    ]
+    assert "worker_agent_id" not in task.read_text()
+    assert "reported no agent id" in capsys.readouterr().err
 
 
 def test_source_artifacts_dir_synced_after_runtime(tmp_path: Path) -> None:
@@ -184,13 +241,14 @@ def test_emitted_mngr_argv_accepted_by_live_cli(tmp_path: Path) -> None:
 
     assert rc == 0
     mngr_calls = [c.argv for c in runner.calls if c.argv[:1] == ["mngr"]]
-    # Vacuity guard: the full lifecycle is create + two rsyncs + message, so we
-    # know the loop below actually validates four real invocations rather than
-    # passing on an empty list. This counts steps; it deliberately does NOT pin
-    # the subcommand names (that would re-introduce the hand-mirrored
-    # expectation this test exists to replace) -- assert_mngr_argv_valid is what
-    # confronts each argv with the live CLI.
-    assert len(mngr_calls) == 4
+    # Vacuity guard: the mngr half of the lifecycle is create + two rsyncs (the
+    # task message goes through the chat messenger, not mngr), so we know the
+    # loop below actually validates three real invocations rather than passing
+    # on an empty list. This counts steps; it deliberately does NOT pin the
+    # subcommand names (that would re-introduce the hand-mirrored expectation
+    # this test exists to replace) -- assert_mngr_argv_valid is what confronts
+    # each argv with the live CLI.
+    assert len(mngr_calls) == 3
     for argv in mngr_calls:
         assert_mngr_argv_valid(argv)
 
@@ -330,7 +388,7 @@ def test_launch_proceeds_when_report_path_is_clear(tmp_path: Path) -> None:
         ["git", "status"],
         ["mngr", "create"],
         ["mngr", "rsync"],
-        ["mngr", "message"],
+        [sys.executable, str(_MESSAGE_CHAT_SCRIPT)],
     ]
 
 
@@ -438,6 +496,182 @@ def test_malformed_frontmatter_does_not_abort_launch(tmp_path: Path) -> None:
     ]
 
 
+def test_lead_agent_stamped_from_env_over_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A literal, unexpanded ``$MNGR_AGENT_ID`` is replaced with the launching
+    agent's real id so the worker has a valid address to send its report to."""
+    runtime, task, _ = _make_layout(tmp_path)
+    task.write_text("---\nlead_agent: $MNGR_AGENT_ID\n---\n\nbody\n")
+    monkeypatch.setenv("MNGR_AGENT_ID", "agent-real0000000000000000000000000lead")
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 0
+    body = task.read_text()
+    assert "lead_agent: agent-real0000000000000000000000000lead" in body
+    assert "$MNGR_AGENT_ID" not in body
+    assert _CREATE_ARGV in [c.argv for c in runner.calls]
+
+
+def test_lead_work_dir_stamped_from_env_beside_the_lead_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lead's work dir is stamped with its id, so the worker can write its report
+    straight into the lead's checkout; without it in the environment the field is left
+    alone (a manual launch outside an agent)."""
+    runtime, task, _ = _make_layout(tmp_path)
+    task.write_text("---\nfinish_report_path: reports/report.md\n---\n\nbody\n")
+    monkeypatch.setenv("MNGR_AGENT_ID", "agent-real0000000000000000000000000lead")
+    monkeypatch.setenv("MNGR_AGENT_WORK_DIR", "/home/user/.mngr/worktrees/lead")
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=_RecordingRunner(),
+    )
+
+    assert rc == 0
+    body = task.read_text()
+    assert "lead_agent: agent-real0000000000000000000000000lead" in body
+    assert "lead_work_dir: /home/user/.mngr/worktrees/lead" in body
+    assert "finish_report_path: reports/report.md" in body
+
+    monkeypatch.delenv("MNGR_AGENT_WORK_DIR")
+    task.write_text("---\nfinish_report_path: reports/report.md\n---\n\nbody\n")
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=_RecordingRunner(),
+    )
+    assert rc == 0
+    assert "lead_work_dir" not in task.read_text()
+
+
+def test_lead_agent_env_overrides_resolved_file_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher's own identity is authoritative: even a plain, resolved
+    file value is overwritten with MNGR_AGENT_ID (the agent that polls for the
+    report). The file value is never trusted when the env names the launcher, and
+    the id is what is stamped -- never the launcher's name, which a rename changes."""
+    runtime, task, _ = _make_layout(tmp_path)  # lead_agent: lead
+    monkeypatch.setenv("MNGR_AGENT_ID", "agent-real0000000000000000000000000lead")
+    monkeypatch.setenv("MNGR_AGENT_NAME", "real-lead")
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 0
+    assert "lead_agent: agent-real0000000000000000000000000lead" in task.read_text()
+    assert "real-lead" not in task.read_text()
+
+
+def test_lead_agent_injected_when_field_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task file that omits lead_agent entirely still gets it filled in from
+    the environment -- authors no longer need to set it."""
+    runtime, task, _ = _make_layout(tmp_path)
+    task.write_text("---\nfinish_report_path: r/report.md\n---\n\nbody\n")
+    monkeypatch.setenv("MNGR_AGENT_ID", "agent-real0000000000000000000000000lead")
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 0
+    body = task.read_text()
+    assert "lead_agent: agent-real0000000000000000000000000lead" in body
+    assert "finish_report_path: r/report.md" in body  # sibling field preserved
+
+
+def test_unresolved_lead_agent_without_env_is_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If the launcher cannot name itself (no MNGR_AGENT_ID) and the file value
+    is unresolved, fail before provisioning rather than launch an unaddressable
+    worker."""
+    runtime, task, _ = _make_layout(tmp_path)
+    task.write_text("---\nlead_agent: $MNGR_AGENT_ID\n---\n\nbody\n")
+    monkeypatch.delenv("MNGR_AGENT_ID", raising=False)
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 2
+    # Only the preflight cleanliness probe ran -- no worker was provisioned.
+    assert [c.argv for c in runner.calls] == [["git", "status", "--porcelain"]]
+    assert "lead_agent is unresolved" in capsys.readouterr().err
+
+
+def test_resolved_lead_agent_used_as_fallback_without_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside an mngr agent (no MNGR_AGENT_ID), a plain author-set value is
+    accepted as a fallback so manual/test invocations still work."""
+    runtime, task, _ = _make_layout(tmp_path)  # lead_agent: lead
+    monkeypatch.delenv("MNGR_AGENT_ID", raising=False)
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 0
+    assert "lead_agent: lead" in task.read_text()
+
+
+def test_set_frontmatter_field_replaces_inserts_and_ignores_bodyless() -> None:
+    replaced = create_worker_mod._set_frontmatter_field(
+        "---\nlead_agent: old\nx: 1\n---\nbody\n", "lead_agent", "new"
+    )
+    assert "lead_agent: new" in replaced
+    assert "lead_agent: old" not in replaced
+    assert "x: 1" in replaced  # sibling fields preserved
+    inserted = create_worker_mod._set_frontmatter_field(
+        "---\nx: 1\n---\nbody\n", "lead_agent", "new"
+    )
+    assert "lead_agent: new" in inserted
+    assert "x: 1" in inserted
+    assert (
+        create_worker_mod._set_frontmatter_field("just body", "lead_agent", "new")
+        == "just body"
+    )
+
+
 def test_runtime_dir_must_exist(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -479,14 +713,16 @@ def test_mngr_failure_is_fatal(tmp_path: Path) -> None:
         ("mngr", "create"),
         subprocess.CalledProcessError(returncode=1, cmd=["mngr"]),
     )
-    with pytest.raises(subprocess.CalledProcessError):
-        create_worker_mod.launch(
-            name="demo-worker",
-            template="worker",
-            runtime_dir=runtime,
-            task_file=task,
-            runner=runner,
-        )
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+    assert rc == 2
+    # Nothing past the create runs: no sync, no task message.
+    assert [c.argv[:2] for c in runner.calls] == [["git", "status"], ["mngr", "create"]]
 
 
 def _launch_argv(runtime: Path, task: Path) -> list[str]:
@@ -548,15 +784,7 @@ def test_common_transcript_flushed_before_message_send(tmp_path: Path) -> None:
     expected_script = str(state_dir / "commands" / "common_transcript.sh")
     assert argvs == [
         ["git", "status", "--porcelain"],
-        [
-            "mngr",
-            "create",
-            "demo-worker",
-            "-t",
-            "worker",
-            "--label",
-            "agent_created=true",
-        ],
+        _CREATE_ARGV,
         [
             "mngr",
             "rsync",
@@ -565,7 +793,7 @@ def test_common_transcript_flushed_before_message_send(tmp_path: Path) -> None:
             "--uncommitted-changes=merge",
         ],
         [expected_script, "--single-pass"],
-        ["mngr", "message", "demo-worker", "--message-file", str(task)],
+        _task_message_argv(task),
     ]
 
 
@@ -633,13 +861,7 @@ def test_common_transcript_failure_does_not_abort_launch(
 
     assert rc == 0
     # The subsequent message send must still run.
-    assert [c.argv for c in runner.calls][-1] == [
-        "mngr",
-        "message",
-        "demo-worker",
-        "--message-file",
-        str(task),
-    ]
+    assert [c.argv for c in runner.calls][-1] == _task_message_argv(task)
     err = capsys.readouterr().err
     assert "common_transcript.sh" in err
     assert "exited 2" in err
@@ -708,7 +930,9 @@ def _write_await_task(task_file: Path, report_path: Path) -> None:
 
 def test_await_returns_report_immediately_when_present(tmp_path: Path) -> None:
     """A report already on disk is printed at once, before any sleep."""
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     report.write_text("---\ntype: status\nname: done\n---\n\nall good\n")
     out = io.StringIO()
@@ -732,7 +956,9 @@ def test_await_returns_report_immediately_when_present(tmp_path: Path) -> None:
 
 def test_await_polls_until_report_appears(tmp_path: Path) -> None:
     """await loops, sleeping, until the report shows up, then prints it."""
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     out = io.StringIO()
 
@@ -761,7 +987,9 @@ def test_await_times_out_when_report_never_appears(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """When the deadline passes with no report, await returns the timeout code."""
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     out = io.StringIO()
 
@@ -784,7 +1012,9 @@ def test_await_returns_shed_code_when_worker_shed(
 ) -> None:
     """A worker shed for memory pressure ends the poll early with the shed code
     and an actionable revive message -- not the silent full-length timeout."""
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     out = io.StringIO()
 
@@ -805,10 +1035,84 @@ def test_await_returns_shed_code_when_worker_shed(
     assert "demo" in err and "--restart" in err
 
 
+def test_await_returns_idle_code_when_worker_idle_without_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A worker observed idle for the consecutive-poll threshold with no report
+    ends the poll early with the idle code and a message pointing at the
+    worker's own worktree -- not the silent full-length timeout."""
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
+    report.parent.mkdir(parents=True)
+    out = io.StringIO()
+    idle_polls: list[str] = []
+
+    def _always_idle(name: str) -> bool:
+        idle_polls.append(name)
+        return True
+
+    rc = create_worker_mod.await_report(
+        report_path=report,
+        timeout_seconds=1800,
+        poll_interval_seconds=5,
+        sleeper=_no_sleep,
+        clock=lambda: 0.0,
+        out=out,
+        worker_name="demo",
+        pending_shed_check=lambda _name: False,
+        idle_check=_always_idle,
+    )
+
+    assert rc == create_worker_mod._AWAIT_IDLE_RC
+    assert len(idle_polls) == create_worker_mod._IDLE_POLLS_BEFORE_GIVING_UP
+    assert out.getvalue() == ""
+    err = capsys.readouterr().err
+    assert "ended its turn" in err and "worktree" in err
+
+
+def test_await_transient_idle_does_not_end_the_poll(tmp_path: Path) -> None:
+    """Idle observations must be consecutive: a worker seen active again resets
+    the counter, and a report that then appears wins normally."""
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
+    report.parent.mkdir(parents=True)
+    out = io.StringIO()
+
+    # Idle twice, then active (counter resets), then idle again while the
+    # report lands via the sleeper -- await must return the report, not the
+    # idle code.
+    idle_answers = iter([True, True, False, True, True, True])
+    sleeps: list[float] = []
+
+    def _sleeper_that_creates_report(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 4:
+            report.write_text("---\ntype: status\nname: done\n---\n\nmade it\n")
+
+    rc = create_worker_mod.await_report(
+        report_path=report,
+        timeout_seconds=1800,
+        poll_interval_seconds=5,
+        sleeper=_sleeper_that_creates_report,
+        clock=lambda: 0.0,
+        out=out,
+        worker_name="demo",
+        pending_shed_check=lambda _name: False,
+        idle_check=lambda _name: next(idle_answers),
+    )
+
+    assert rc == 0
+    assert "made it" in out.getvalue()
+
+
 def test_await_report_wins_over_pending_shed(tmp_path: Path) -> None:
     """The report file is checked before the shed ledger, so a worker that
     reported and was then shed still yields its report (rc 0)."""
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     report.write_text("---\ntype: status\nname: done\n---\n\nfinished first\n")
     out = io.StringIO()
@@ -831,7 +1135,9 @@ def test_await_report_wins_over_pending_shed(tmp_path: Path) -> None:
 def test_read_finish_report_path_returns_field(tmp_path: Path) -> None:
     """_read_finish_report_path pulls the path out of the task frontmatter."""
     task = tmp_path / "task.md"
-    _write_await_task(task, Path("data/.tasks/harden/crystallize-demo/reports/report.md"))
+    _write_await_task(
+        task, Path("data/.tasks/harden/crystallize-demo/reports/report.md")
+    )
 
     result = create_worker_mod._read_finish_report_path(task)
 
@@ -859,7 +1165,9 @@ def test_main_await_prints_report(
     The report exists up front, so main()'s real ``time.sleep`` is never
     reached and the loop returns immediately.
     """
-    report = tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    report = (
+        tmp_path / "data" / ".tasks" / "launch-task" / "demo" / "reports" / "report.md"
+    )
     report.parent.mkdir(parents=True)
     report.write_text("hello from worker\n")
     task = tmp_path / "task.md"
@@ -1085,17 +1393,7 @@ def test_launch_sync_consumes_report_so_a_repeated_call_is_not_blocked(
     second = _RecordingRunner()
     assert _run_once(second) == 0
     create_calls = [c.argv for c in second.calls if c.argv[:2] == ["mngr", "create"]]
-    assert create_calls == [
-        [
-            "mngr",
-            "create",
-            "demo-worker",
-            "-t",
-            "worker",
-            "--label",
-            "agent_created=true",
-        ]
-    ]
+    assert create_calls == [_CREATE_ARGV]
     # The second run's report is archived under a disambiguated name -- the first
     # archive is not overwritten, so both are retained.
     assert not report.exists()
@@ -1155,6 +1453,8 @@ def test_launch_sync_timeout_keeps_worker_alive(tmp_path: Path) -> None:
 
     assert rc == create_worker_mod._AWAIT_TIMEOUT_RC
     assert _destroy_argvs(runner) == []
+    # The idle poll goes through the injected runner, not a real `mngr list`.
+    assert any(c.argv[:2] == ["mngr", "list"] for c in runner.calls)
     payload = json.loads(result_json.read_text())
     assert payload["timed_out"] is True
     assert payload["branch"] == "mngr/demo-worker"
@@ -1234,7 +1534,7 @@ def test_main_launch_sync_emits_result_json(tmp_path: Path) -> None:
     class _WorkerRespondsRunner(_RecordingRunner):
         def run(self, argv: Sequence[str], **kwargs):
             result = super().run(argv, **kwargs)
-            if list(argv)[:2] == ["mngr", "message"]:
+            if list(argv)[:2] == [sys.executable, str(_MESSAGE_CHAT_SCRIPT)]:
                 report.write_text("---\ntype: status\nname: done\n---\n\ndone\n")
             return result
 
@@ -1269,3 +1569,145 @@ def test_main_destroy_invokes_mngr(tmp_path: Path) -> None:
     rc = create_worker_mod.main(["destroy", "--name", "demo-worker"], runner=runner)
     assert rc == 0
     assert _destroy_argvs(runner) == [["mngr", "destroy", "demo-worker", "--force"]]
+
+
+# --- launch: a refused mngr create ------------------------------------------
+
+
+def test_a_refused_mngr_create_is_reported_not_raised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # mngr's own refusal (a duplicate name, a dirty tree) has to come back as
+    # an exit code and a message, not a traceback.
+    runtime, task, _ = _make_layout(tmp_path)
+    runner = _RecordingRunner()
+    runner.respond(
+        ("mngr", "create"),
+        subprocess.CalledProcessError(returncode=1, cmd=["mngr", "create"]),
+    )
+
+    rc = create_worker_mod.launch(
+        name="demo-worker",
+        template="worker",
+        runtime_dir=runtime,
+        task_file=task,
+        runner=runner,
+    )
+
+    assert rc == 2
+    argvs = [c.argv for c in runner.calls]
+    assert not any(argv[:2] == ["mngr", "rsync"] for argv in argvs)
+    assert not any(
+        argv[:2] == [sys.executable, str(_MESSAGE_CHAT_SCRIPT)] for argv in argvs
+    )
+    assert "`mngr create demo-worker` failed" in capsys.readouterr().err
+
+
+# --- reply ------------------------------------------------------------------
+
+
+def test_reply_goes_through_the_chat_messenger_by_the_stamped_worker_id(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "task.md"
+    task.write_text(
+        f"---\nlead_agent: agent-lead\nworker_agent_id: {_WORKER_ID}\n---\n\nbody\n"
+    )
+    runner = _RecordingRunner()
+    runner.respond(
+        (sys.executable, str(_MESSAGE_CHAT_SCRIPT)), _StubResult(returncode=7)
+    )
+
+    rc = create_worker_mod.reply(
+        task_file=task, message="-continue", message_file=None, name=None, runner=runner
+    )
+
+    # The messenger's exit status (mngr message's codes) is passed through.
+    assert rc == 7
+    assert [c.argv for c in runner.calls] == [
+        [sys.executable, str(_MESSAGE_CHAT_SCRIPT), _WORKER_ID, "--message=-continue"],
+    ]
+
+
+def test_reply_takes_a_message_file(tmp_path: Path) -> None:
+    task = tmp_path / "task.md"
+    task.write_text(f"---\nworker_agent_id: {_WORKER_ID}\n---\n\nbody\n")
+    answer = tmp_path / "answer.md"
+    answer.write_text("yes, do that")
+    runner = _RecordingRunner()
+
+    rc = create_worker_mod.reply(
+        task_file=task, message=None, message_file=answer, name=None, runner=runner
+    )
+
+    assert rc == 0
+    assert runner.calls[0].argv == [
+        sys.executable,
+        str(_MESSAGE_CHAT_SCRIPT),
+        _WORKER_ID,
+        "--message-file",
+        str(answer),
+    ]
+
+
+def test_reply_falls_back_to_mngr_message_by_name_for_a_task_file_without_the_stamp(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task = tmp_path / "task.md"
+    task.write_text("---\nlead_agent: lead\n---\n\nbody\n")
+    runner = _RecordingRunner()
+
+    assert (
+        create_worker_mod.reply(
+            task_file=task, message="hi", message_file=None, name=None, runner=runner
+        )
+        == 2
+    )
+    assert runner.calls == []
+    assert "no worker_agent_id" in capsys.readouterr().err
+
+    rc = create_worker_mod.reply(
+        task_file=task,
+        message="hi",
+        message_file=None,
+        name="demo-worker",
+        runner=runner,
+    )
+
+    assert rc == 0
+    [fallback_argv] = [c.argv for c in runner.calls]
+    assert fallback_argv == ["mngr", "message", "demo-worker", "--message=hi"]
+    assert_mngr_argv_valid(fallback_argv)
+
+
+def test_main_reply_requires_exactly_one_message_source(tmp_path: Path) -> None:
+    task = tmp_path / "task.md"
+    task.write_text(f"---\nworker_agent_id: {_WORKER_ID}\n---\n\nbody\n")
+
+    with pytest.raises(SystemExit):
+        create_worker_mod.main(
+            ["reply", "--task-file", str(task)], runner=_RecordingRunner()
+        )
+
+    runner = _RecordingRunner()
+    rc = create_worker_mod.main(
+        ["reply", "--task-file", str(task), "-m", "go"], runner=runner
+    )
+    assert rc == 0
+    assert runner.calls[0].argv[-1] == "--message=go"
+
+
+@pytest.mark.parametrize(
+    "stdout, expected",
+    [
+        (_CREATED_EVENT, _WORKER_ID),
+        ('{"event": "progress", "x": 1}\n' + _CREATED_EVENT, _WORKER_ID),
+        ("Done.\n", None),
+        ("", None),
+        ('{"event": "created"}\n', None),
+    ],
+)
+def test_created_agent_id_reads_the_created_event(
+    stdout: str, expected: str | None
+) -> None:
+    assert create_worker_mod._created_agent_id(stdout) == expected

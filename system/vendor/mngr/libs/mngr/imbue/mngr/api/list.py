@@ -52,7 +52,9 @@ from imbue.mngr.utils.cel_utils import apply_compiled_cel_filters
 from imbue.mngr.utils.cel_utils import build_cel_context
 from imbue.mngr.utils.cel_utils import compile_cel_filters
 from imbue.mngr.utils.cel_utils import with_tolerant_paths
+from imbue.mngr.utils.error_utils import format_exception_traceback
 from imbue.mngr.utils.pydantic_utils import unwrap_optional
+from imbue.mngr.utils.read_deadline import reads_bounded_for
 from imbue.mngr.utils.thread_cleanup import mngr_executor
 
 
@@ -123,6 +125,14 @@ class ErrorInfo(FrozenModel):
     )
     # Verbose, multi-line remediation guidance (from MngrError.user_help_text), if any.
     help_text: str | None = Field(default=None, description="Verbose remediation guidance for the user")
+    # The message alone is often not enough to locate a failure: an OSError raised
+    # without a filename stringifies to a bare "[Errno 2] No such file or directory",
+    # naming neither the file nor the code that opened it. Discovery swallows the
+    # exception into a snapshot without logging a traceback anywhere, so if we don't
+    # capture it here it is gone for good.
+    traceback_text: str | None = Field(
+        default=None, description="Formatted traceback of the exception, when one was available"
+    )
 
     @classmethod
     def build(cls, exception: BaseException) -> "ErrorInfo":
@@ -132,6 +142,7 @@ class ErrorInfo(FrozenModel):
             message=str(exception),
             is_provider_inaccessible=isinstance(exception, ProviderUnavailableError),
             help_text=exception.user_help_text if isinstance(exception, MngrError) else None,
+            traceback_text=format_exception_traceback(exception),
         )
 
 
@@ -153,6 +164,7 @@ class ProviderErrorInfo(ErrorInfo):
             provider_name=provider_name,
             is_provider_inaccessible=isinstance(exception, ProviderUnavailableError),
             help_text=exception.user_help_text if isinstance(exception, MngrError) else None,
+            traceback_text=format_exception_traceback(exception),
             short_reason=exception.short_reason if isinstance(exception, ProviderUnavailableError) else None,
             short_remediation=exception.short_remediation if isinstance(exception, ProviderUnavailableError) else None,
         )
@@ -406,6 +418,7 @@ def _build_provider_snapshot_state(
                 type_name=error_info.exception_type,
                 message=error_info.message,
                 provider_name=error_info.provider_name,
+                traceback_text=error_info.traceback_text,
             )
 
     candidate_names = list_provider_names_to_load(mngr_ctx)
@@ -752,13 +765,17 @@ def _collect_and_emit_details_for_host(
     result: ListResult,
     results_lock: Lock,
 ) -> None:
-    _host_details, agent_details_list = provider.get_host_and_agent_details(
-        host_ref,
-        agent_refs,
-        field_generators=params.field_generators,
-        offline_field_generators=params.offline_field_generators,
-        on_error=lambda source, exc: _handle_listing_error(source, exc, params, result, results_lock),
-    )
+    # Bound each host's live detail collection by a wall-clock budget so one slow or
+    # contended host's reads self-terminate and fall back to offline/partial data instead
+    # of stalling the whole listing (all hosts are awaited before list_agents returns).
+    with reads_bounded_for(provider.mngr_ctx.config.host_detail_read_timeout_seconds):
+        _host_details, agent_details_list = provider.get_host_and_agent_details(
+            host_ref,
+            agent_refs,
+            field_generators=params.field_generators,
+            offline_field_generators=params.offline_field_generators,
+            on_error=lambda source, exc: _handle_listing_error(source, exc, params, result, results_lock),
+        )
     for agent_details in agent_details_list:
         # Apply CEL filters if provided
         if params.compiled_include_filters or params.compiled_exclude_filters:

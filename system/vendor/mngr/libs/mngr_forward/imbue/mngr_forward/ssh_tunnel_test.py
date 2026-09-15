@@ -1,10 +1,12 @@
 """Unit tests for the shared :class:`SSHTunnelManager`.
 
-The actual SSH I/O paths (paramiko transport, direct-tcpip, reverse port
-forward) require a live sshd and are exercised by the acceptance / release
-tests. These unit tests cover the deterministic surfaces that don't need a
-real network: the URL-parsing helper, the data shapes, and the bits of the
-manager's repair / setup loops that can be driven against fakes.
+These tests cover the surfaces that can be driven deterministically: the
+URL-parsing helper, the data shapes, the repair / setup loops against fakes, and
+the reverse-tunnel bookkeeping.
+
+The direct-tcpip refusal classification at the bottom of this file runs an sshd
+of its own on loopback. What it settles cannot be settled against a fake by
+construction -- see the comment there.
 
 The manager is the single SSH tunneling implementation in the monorepo:
 ``mngr forward --service`` uses its forward (direct-tcpip) path, and both
@@ -18,24 +20,48 @@ agent in one shot.
 import socket
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Final
 from typing import cast
 
 import paramiko
 import pytest
+from paramiko.common import AUTH_SUCCESSFUL
+from paramiko.common import OPEN_FAILED_CONNECT_FAILED
 from pydantic import PrivateAttr
 from pydantic import ValidationError
 
 from imbue.imbue_common.primitives import NonNegativeInt
 from imbue.imbue_common.primitives import PositiveInt
+from imbue.imbue_common.suspension import ClockReading
+from imbue.imbue_common.suspension import read_clocks
+from imbue.mngr.utils.polling import poll_until
 from imbue.mngr_forward.primitives import ReverseTunnelSpec
 from imbue.mngr_forward.ssh_tunnel import RemoteSSHInfo
 from imbue.mngr_forward.ssh_tunnel import ReverseTunnelInfo
 from imbue.mngr_forward.ssh_tunnel import SSHTunnelError
 from imbue.mngr_forward.ssh_tunnel import SSHTunnelManager
+from imbue.mngr_forward.ssh_tunnel import SSHTunnelPhase
+from imbue.mngr_forward.ssh_tunnel import _CHANNEL_OPEN_TIMEOUT_SECONDS
 from imbue.mngr_forward.ssh_tunnel import _ForwardedTunnelHandler
 from imbue.mngr_forward.ssh_tunnel import _REVERSE_TUNNEL_BACKOFF_CAP_SECONDS
+from imbue.mngr_forward.ssh_tunnel import _TransportFailureHandler
+from imbue.mngr_forward.ssh_tunnel import _create_short_path_tmpdir
+from imbue.mngr_forward.ssh_tunnel import _create_ssh_client
+from imbue.mngr_forward.ssh_tunnel import _create_tunnel_listener
+from imbue.mngr_forward.ssh_tunnel import _is_transport_unusable
+from imbue.mngr_forward.ssh_tunnel import _open_and_relay
+from imbue.mngr_forward.ssh_tunnel import _resolve_known_hosts_path
+from imbue.mngr_forward.ssh_tunnel import _tunnel_accept_loop
 from imbue.mngr_forward.ssh_tunnel import parse_url_host_port
+
+# How long a deliberately-stuck ``open_channel`` stays stuck. Must stay well
+# clear of the window a test then waits for the *second* open: at equal values
+# a serialized implementation could release the first open and still deliver
+# the second in time, and the regression test would stop discriminating.
+_BLOCKED_OPEN_HOLD_SECONDS: Final[float] = 30.0
 
 # -- Test doubles ----------------------------------------------------------
 
@@ -103,6 +129,22 @@ class FakeSSHTransport:
     def cancel_port_forward(self, address: str, port: int) -> None:
         self._cancel_port_forward_calls.append((address, port))
 
+    def set_active(self, active: bool) -> None:
+        """Flip the reported liveness, standing in for a peer that went away mid-session."""
+        object.__setattr__(self, "_active", active)
+
+    def open_channel(
+        self,
+        kind: str,
+        dest_addr: tuple[str, int] | None = None,
+        src_addr: tuple[str, int] | None = None,
+        window_size: int | None = None,
+        max_packet_size: int | None = None,
+        timeout: float | None = None,
+    ) -> paramiko.Channel:
+        """Refuse every open, the way sshd does for a target port nothing is listening on."""
+        raise paramiko.ChannelException(2, "Connect failed")
+
 
 class FakeSSHClient(paramiko.SSHClient):
     """Minimal paramiko.SSHClient subclass with a controllable transport for testing.
@@ -147,6 +189,19 @@ def _make_manager_with_fake_connection(
     return manager
 
 
+def _register_reverse_tunnel(
+    manager: SSHTunnelManager,
+    tunnel_key: tuple[str, int],
+    tunnel_info: ReverseTunnelInfo,
+    client: FakeSSHClient,
+) -> None:
+    """Seed a reverse tunnel as ``setup_reverse_tunnel`` leaves one: cached, and registered on ``client``."""
+    with manager._lock:
+        manager._connections[tunnel_key[0]] = client
+        manager._reverse_tunnels[tunnel_key] = tunnel_info
+        manager._reverse_tunnel_clients[tunnel_key] = client
+
+
 # -- parse_url_host_port ---------------------------------------------------
 
 
@@ -172,6 +227,170 @@ def test_parse_url_host_port_localhost_normalization() -> None:
 
 
 # -- RemoteSSHInfo ---------------------------------------------------------
+
+
+def test_create_ssh_client_refuses_to_connect_without_a_known_hosts_file(tmp_path: Path) -> None:
+    """A missing known_hosts file must be a hard error, never trust-on-first-use.
+
+    Tagged ``LOCAL_SETUP``, and that is the load-bearing half: the raise happens
+    before a packet is sent, so it is evidence about this device and nothing at
+    all about the agent's host. A consumer reads the phase to decide whether to
+    blame -- and restart -- the workspace, so tagging this one ``HOST_CONNECT``
+    would blame a machine that was never contacted, with nothing else in the
+    suite noticing.
+    """
+    key_path = tmp_path / "ssh_key"
+    key_path.write_text("irrelevant-key-material")
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=key_path)
+
+    with pytest.raises(SSHTunnelError, match="known_hosts") as exc_info:
+        _create_ssh_client(ssh_info)
+    assert exc_info.value.phase is SSHTunnelPhase.LOCAL_SETUP
+
+
+def test_create_ssh_client_refuses_to_connect_without_the_private_key(tmp_path: Path) -> None:
+    """A key this device does not have must be caught before the host is asked.
+
+    The plan's own #427 case names key material alongside known_hosts, and it is
+    only device-side if it is checked here: paramiko opens the key during
+    authentication, after the host has answered, where a missing file is
+    indistinguishable from the host rejecting the key we offered -- so it would
+    surface as CONNECT_ERROR and get a machine restarted over trust material
+    that never left this laptop.
+    """
+    key_path = tmp_path / "ssh_key"
+    (tmp_path / "known_hosts").write_text("")
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=key_path)
+
+    with pytest.raises(SSHTunnelError, match="No SSH key") as exc_info:
+        _create_ssh_client(ssh_info)
+    assert exc_info.value.phase is SSHTunnelPhase.LOCAL_SETUP
+
+
+def test_create_ssh_client_refuses_a_key_path_that_is_not_a_file(tmp_path: Path) -> None:
+    """A producer-owned key path naming a directory is refused before connecting.
+
+    An existence check would let a directory through to paramiko, which raises
+    ``IsADirectoryError``: an ``OSError``, so it escapes the ``SSHException``
+    arm of paramiko's key loop and arrives untagged, read as CONNECT_ERROR.
+    That blames the workspace for a key this device never had. (A record with
+    no key at all -- ``Path("")``, normalised to ``.`` -- is the
+    credential-deferring case instead, covered by the tests below.)
+    """
+    (tmp_path / "known_hosts").write_text("")
+
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=tmp_path)
+    with pytest.raises(SSHTunnelError, match="No SSH key file") as exc_info:
+        _create_ssh_client(ssh_info)
+    assert exc_info.value.phase is SSHTunnelPhase.LOCAL_SETUP
+
+
+def test_create_ssh_client_refusal_names_both_candidate_paths(tmp_path: Path) -> None:
+    """When an explicit path was supplied and both candidates are missing, the error names both."""
+    key_path = tmp_path / "ssh_key"
+    key_path.write_text("irrelevant-key-material")
+    explicit_path = tmp_path / "pins" / "known_hosts"
+    ssh_info = RemoteSSHInfo(
+        user="root", host="203.0.113.5", port=22, key_path=key_path, known_hosts_path=explicit_path
+    )
+
+    with pytest.raises(SSHTunnelError, match=rf"{explicit_path}.*{key_path.parent / 'known_hosts'}"):
+        _create_ssh_client(ssh_info)
+
+
+def test_create_ssh_client_refusal_names_one_path_when_the_candidates_coincide(tmp_path: Path) -> None:
+    """A producer may store known_hosts beside the key *and* name it explicitly.
+
+    The docker provider does exactly that, so listing both candidates
+    unconditionally renders "at X or X" -- and this text is quoted verbatim
+    behind the recovery card's "Error details", where a path repeated back to the
+    user reads as two places checked when only one was.
+    """
+    key_path = tmp_path / "ssh_key"
+    key_path.write_text("irrelevant-key-material")
+    sibling_path = key_path.parent / "known_hosts"
+    ssh_info = RemoteSSHInfo(
+        user="root", host="203.0.113.5", port=22, key_path=key_path, known_hosts_path=sibling_path
+    )
+
+    with pytest.raises(SSHTunnelError) as exc_info:
+        _create_ssh_client(ssh_info)
+    assert str(exc_info.value).count(str(sibling_path)) == 1
+
+
+def test_resolve_known_hosts_path_prefers_the_explicit_path_when_it_exists(tmp_path: Path) -> None:
+    key_path = tmp_path / "keys" / "ssh_key"
+    key_path.parent.mkdir()
+    key_path.write_text("irrelevant-key-material")
+    sibling_path = key_path.parent / "known_hosts"
+    sibling_path.write_text("sibling-pin")
+    explicit_path = tmp_path / "pins" / "known_hosts"
+    explicit_path.parent.mkdir()
+    explicit_path.write_text("explicit-pin")
+    ssh_info = RemoteSSHInfo(
+        user="root", host="203.0.113.5", port=22, key_path=key_path, known_hosts_path=explicit_path
+    )
+
+    assert _resolve_known_hosts_path(ssh_info) == explicit_path
+
+
+def test_resolve_known_hosts_path_falls_back_to_the_key_sibling_when_explicit_is_missing(tmp_path: Path) -> None:
+    """A stale producer path must never break a connection the sibling convention would have allowed."""
+    key_path = tmp_path / "keys" / "ssh_key"
+    key_path.parent.mkdir()
+    key_path.write_text("irrelevant-key-material")
+    sibling_path = key_path.parent / "known_hosts"
+    sibling_path.write_text("sibling-pin")
+    missing_explicit_path = tmp_path / "gone" / "known_hosts"
+    ssh_info = RemoteSSHInfo(
+        user="root", host="203.0.113.5", port=22, key_path=key_path, known_hosts_path=missing_explicit_path
+    )
+
+    assert _resolve_known_hosts_path(ssh_info) == sibling_path
+
+
+def test_resolve_known_hosts_path_uses_the_user_known_hosts_for_credential_deferring_hosts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty key_path defers credentials to the user's SSH setup, so their known_hosts is the pin source."""
+    home = tmp_path / "home"
+    user_known_hosts = home / ".ssh" / "known_hosts"
+    user_known_hosts.parent.mkdir(parents=True)
+    user_known_hosts.write_text("user-pin")
+    monkeypatch.setenv("HOME", str(home))
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=Path(""))
+
+    assert _resolve_known_hosts_path(ssh_info) == user_known_hosts
+
+
+def test_resolve_known_hosts_path_returns_none_for_credential_deferring_host_without_user_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No user known_hosts either: still no candidate (the client then refuses rather than TOFU)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=Path(""))
+
+    assert _resolve_known_hosts_path(ssh_info) is None
+
+
+def test_create_ssh_client_refusal_names_the_user_known_hosts_for_credential_deferring_hosts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The empty-key refusal points at the user's known_hosts, not a cwd-relative sibling."""
+    home = tmp_path / "empty-home"
+    monkeypatch.setenv("HOME", str(home))
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=Path(""))
+
+    with pytest.raises(SSHTunnelError, match=str(home / ".ssh" / "known_hosts")):
+        _create_ssh_client(ssh_info)
+
+
+def test_resolve_known_hosts_path_returns_none_when_no_candidate_exists(tmp_path: Path) -> None:
+    key_path = tmp_path / "ssh_key"
+    key_path.write_text("irrelevant-key-material")
+    ssh_info = RemoteSSHInfo(user="root", host="203.0.113.5", port=22, key_path=key_path)
+
+    assert _resolve_known_hosts_path(ssh_info) is None
 
 
 def test_remote_ssh_info_round_trip() -> None:
@@ -290,7 +509,7 @@ class _FakeReverseTunnelManager(SSHTunnelManager):
 
     _setup_calls: list[tuple[RemoteSSHInfo, int, int, str | None]] = PrivateAttr(default_factory=list)
     _setup_port: int = PrivateAttr(default=9999)
-    _setup_raise: type[Exception] | None = PrivateAttr(default=None)
+    _setup_raise: Exception | None = PrivateAttr(default=None)
 
     def setup_reverse_tunnel(
         self,
@@ -301,13 +520,13 @@ class _FakeReverseTunnelManager(SSHTunnelManager):
     ) -> int:
         self._setup_calls.append((ssh_info, local_port, remote_port, agent_id))
         if self._setup_raise is not None:
-            raise self._setup_raise("simulated failure")
+            raise self._setup_raise
         return self._setup_port
 
 
 def _make_fake_reverse_tunnel_manager(
     remote_port: int = 9999,
-    raise_on_setup: type[Exception] | None = None,
+    raise_on_setup: Exception | None = None,
 ) -> _FakeReverseTunnelManager:
     mgr = _FakeReverseTunnelManager()
     mgr._setup_port = remote_port
@@ -351,7 +570,9 @@ def test_check_and_repair_tunnels_no_op_then_repairs_with_requested_port(tmp_pat
 
 def test_check_and_repair_tunnels_handles_setup_error(tmp_path: Path) -> None:
     """When ``setup_reverse_tunnel`` raises ``SSHTunnelError``, the error is logged and not propagated."""
-    manager = _make_fake_reverse_tunnel_manager(raise_on_setup=SSHTunnelError)
+    manager = _make_fake_reverse_tunnel_manager(
+        raise_on_setup=SSHTunnelError("simulated failure", SSHTunnelPhase.HOST_CONNECT)
+    )
     ssh_info = _sample_ssh_info(tmp_path)
     conn_key = "192.0.2.1:22"
     tunnel_info = ReverseTunnelInfo(
@@ -401,14 +622,27 @@ def test_check_and_repair_tunnels_skips_alive_tunnel(tmp_path: Path) -> None:
         local_port=8420,
         remote_port=5000,
     )
-    fake_client = FakeSSHClient.create(active=True)
-    with manager._lock:
-        manager._reverse_tunnels[(conn_key, 8420)] = tunnel_info
-        manager._connections[conn_key] = fake_client
+    _register_reverse_tunnel(manager, (conn_key, 8420), tunnel_info, FakeSSHClient.create(active=True))
 
     manager._check_and_repair_tunnels()
 
     assert manager._setup_calls == []
+    manager.cleanup()
+
+
+def test_check_and_repair_tunnels_repairs_a_tunnel_whose_connection_was_replaced(tmp_path: Path) -> None:
+    """A forward is bound to the transport it was registered on; a healthy replacement client carries none of it."""
+    manager = _make_fake_reverse_tunnel_manager(remote_port=9999)
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = "192.0.2.1:22"
+    tunnel_info = ReverseTunnelInfo(ssh_info=ssh_info, local_port=8420, remote_port=5000)
+    _register_reverse_tunnel(manager, (conn_key, 8420), tunnel_info, FakeSSHClient.create(active=True))
+
+    with manager._lock:
+        manager._connections[conn_key] = FakeSSHClient.create(active=True)
+    manager._check_and_repair_tunnels()
+
+    assert len(manager._setup_calls) == 1
     manager.cleanup()
 
 
@@ -444,7 +678,9 @@ def test_check_and_repair_tunnels_fires_on_repaired_callback(tmp_path: Path) -> 
 def test_repair_failure_arms_backoff_and_skips_within_window(tmp_path: Path) -> None:
     """First failure arms the backoff state with a future ``next_attempt_at``,
     and a second tick during that window does not retry."""
-    manager = _make_fake_reverse_tunnel_manager(raise_on_setup=SSHTunnelError)
+    manager = _make_fake_reverse_tunnel_manager(
+        raise_on_setup=SSHTunnelError("simulated failure", SSHTunnelPhase.HOST_CONNECT)
+    )
     ssh_info = _sample_ssh_info(tmp_path)
     conn_key = "192.0.2.1:22"
     tunnel_key = (conn_key, 8420)
@@ -472,7 +708,9 @@ def test_repair_failure_arms_backoff_and_skips_within_window(tmp_path: Path) -> 
 
 def test_repair_failure_backoff_is_capped(tmp_path: Path) -> None:
     """Once the exponential schedule reaches the cap, the counter stops growing."""
-    manager = _make_fake_reverse_tunnel_manager(raise_on_setup=SSHTunnelError)
+    manager = _make_fake_reverse_tunnel_manager(
+        raise_on_setup=SSHTunnelError("simulated failure", SSHTunnelPhase.HOST_CONNECT)
+    )
     ssh_info = _sample_ssh_info(tmp_path)
     conn_key = "192.0.2.1:22"
     tunnel_key = (conn_key, 8420)
@@ -484,7 +722,9 @@ def test_repair_failure_backoff_is_capped(tmp_path: Path) -> None:
     # saturated. We bypass the backoff-window skip by directly calling the
     # bookkeeping helper instead of waiting between ticks.
     for _ in range(20):
-        manager._record_repair_failure(tunnel_key, conn_key, tunnel_info, SSHTunnelError("x"))
+        manager._record_repair_failure(
+            tunnel_key, conn_key, tunnel_info, SSHTunnelError("x", SSHTunnelPhase.HOST_CONNECT)
+        )
 
     with manager._lock:
         failure_state = manager._failure_state.get(tunnel_key)
@@ -507,7 +747,7 @@ def test_successful_setup_clears_failure_state(tmp_path: Path) -> None:
         manager._reverse_tunnels[tunnel_key] = tunnel_info
 
     # Simulate a prior failure.
-    manager._record_repair_failure(tunnel_key, conn_key, tunnel_info, SSHTunnelError("x"))
+    manager._record_repair_failure(tunnel_key, conn_key, tunnel_info, SSHTunnelError("x", SSHTunnelPhase.HOST_CONNECT))
     with manager._lock:
         assert tunnel_key in manager._failure_state
 
@@ -524,7 +764,7 @@ def test_successful_setup_clears_failure_state(tmp_path: Path) -> None:
     manager.cleanup()
 
 
-def test_alive_sibling_clears_stale_failure_state(tmp_path: Path) -> None:
+def test_a_tunnel_on_a_live_transport_clears_stale_failure_state(tmp_path: Path) -> None:
     """When the repair loop observes an alive connection on a tunnel that
     previously failed, it clears the stale backoff so the next failure
     starts a fresh schedule (rather than skipping for 5 minutes)."""
@@ -533,12 +773,10 @@ def test_alive_sibling_clears_stale_failure_state(tmp_path: Path) -> None:
     conn_key = f"{ssh_info.host}:{ssh_info.port}"
     tunnel_key = (conn_key, 8420)
     tunnel_info = ReverseTunnelInfo(ssh_info=ssh_info, local_port=8420, remote_port=5000)
-    with manager._lock:
-        manager._reverse_tunnels[tunnel_key] = tunnel_info
-        manager._connections[conn_key] = FakeSSHClient.create(active=True)
+    _register_reverse_tunnel(manager, tunnel_key, tunnel_info, FakeSSHClient.create(active=True))
 
     # Stale backoff entry from a previous failure cycle.
-    manager._record_repair_failure(tunnel_key, conn_key, tunnel_info, SSHTunnelError("x"))
+    manager._record_repair_failure(tunnel_key, conn_key, tunnel_info, SSHTunnelError("x", SSHTunnelPhase.HOST_CONNECT))
     with manager._lock:
         assert tunnel_key in manager._failure_state
 
@@ -599,6 +837,7 @@ def test_remove_reverse_tunnels_for_agent_closes_orphan_connection(tmp_path: Pat
     manager = _make_manager_with_fake_connection(ssh_info, fake_client)
     conn_key = f"{ssh_info.host}:{ssh_info.port}"
     with manager._lock:
+        manager._connection_established_at[conn_key] = read_clocks()
         manager._reverse_tunnels[(conn_key, 8420)] = ReverseTunnelInfo(
             ssh_info=ssh_info,
             local_port=8420,
@@ -612,6 +851,8 @@ def test_remove_reverse_tunnels_for_agent_closes_orphan_connection(tmp_path: Pat
     with manager._lock:
         assert (conn_key, 8420) not in manager._reverse_tunnels
         assert conn_key not in manager._connections
+        # The stamp the suspension check reads goes with the connection it describes.
+        assert conn_key not in manager._connection_established_at
     manager.cleanup()
 
 
@@ -639,6 +880,58 @@ def test_remove_reverse_tunnels_for_agent_keeps_connection_for_forward_tunnel(tm
         assert (conn_key, 8420) not in manager._reverse_tunnels
         # The forward tunnel is still using the connection -- it must survive.
         assert conn_key in manager._connections
+    manager.cleanup()
+
+
+def test_remove_reverse_tunnel_drops_only_the_named_endpoint(tmp_path: Path) -> None:
+    """Removing one endpoint's tunnel leaves a same-agent tunnel to another endpoint intact.
+
+    The latchkey discovery handler clears a stale desktop->container tunnel on
+    every discovery cycle while the same agent's desktop->VPS tunnel must stay
+    up; an agent-keyed removal would tear down (and force a re-dial of) both.
+    """
+    container_ssh_info = _sample_ssh_info(tmp_path)
+    vps_ssh_info = RemoteSSHInfo(
+        user="root",
+        host="198.51.100.7",
+        port=22,
+        key_path=tmp_path / "vps-key",
+    )
+    container_client = FakeSSHClient.create(active=True)
+    vps_client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(container_ssh_info, container_client)
+    container_conn_key = f"{container_ssh_info.host}:{container_ssh_info.port}"
+    vps_conn_key = f"{vps_ssh_info.host}:{vps_ssh_info.port}"
+    with manager._lock:
+        manager._connections[vps_conn_key] = vps_client
+        manager._reverse_tunnels[(container_conn_key, 8420)] = ReverseTunnelInfo(
+            ssh_info=container_ssh_info,
+            local_port=8420,
+            remote_port=1989,
+            requested_remote_port=1989,
+            agent_id="agent-a@host-1",
+        )
+        manager._reverse_tunnels[(vps_conn_key, 8420)] = ReverseTunnelInfo(
+            ssh_info=vps_ssh_info,
+            local_port=8420,
+            remote_port=1988,
+            requested_remote_port=1988,
+            agent_id="agent-a@host-1",
+        )
+
+    # Removing an endpoint with no registered tunnel reports nothing removed.
+    assert manager.remove_reverse_tunnel(container_ssh_info, 9999) is False
+
+    assert manager.remove_reverse_tunnel(container_ssh_info, 8420) is True
+    with manager._lock:
+        assert (container_conn_key, 8420) not in manager._reverse_tunnels
+        # The same agent's tunnel to the other endpoint (and its SSH
+        # connection) survives.
+        assert (vps_conn_key, 8420) in manager._reverse_tunnels
+        assert vps_conn_key in manager._connections
+
+    # A repeat removal of the already-removed endpoint is a no-op.
+    assert manager.remove_reverse_tunnel(container_ssh_info, 8420) is False
     manager.cleanup()
 
 
@@ -683,8 +976,7 @@ def test_setup_reverse_tunnel_reuses_existing_active_tunnel(tmp_path: Path) -> N
         local_port=8420,
         remote_port=11111,
     )
-    with manager._lock:
-        manager._reverse_tunnels[(conn_key, 8420)] = existing_tunnel
+    _register_reverse_tunnel(manager, (conn_key, 8420), existing_tunnel, fake_client)
 
     port = manager.setup_reverse_tunnel(ssh_info=ssh_info, local_port=8420)
 
@@ -902,3 +1194,796 @@ def test_forwarded_tunnel_handler_closes_channel_on_connect_failure() -> None:
     channel = _ClosableChannel.create()
     handler(cast(paramiko.Channel, channel), ("10.0.0.1", 33333), ("127.0.0.1", 1))
     assert channel.is_closed()
+
+
+# -- Forward-tunnel channel opening ----------------------------------------
+#
+# A transport that has silently gone away keeps reporting ``is_active() ==
+# True``, so the only thing distinguishing it from a healthy one is that
+# opening a channel never completes.
+
+
+class _OpenChannelRecorder:
+    """Transport stand-in that records ``open_channel`` calls and raises a chosen error.
+
+    ``blocker``, when set, is waited on before the call returns or raises --
+    letting a test hold an open in flight while it asserts that a second
+    connection is still served.
+    """
+
+    _error: Exception | None
+    _calls: list[dict[str, object]]
+    _entered: threading.Semaphore
+    _blocker: threading.Event | None
+    _active: bool
+
+    @classmethod
+    def create(
+        cls,
+        error: Exception | None = None,
+        blocker: threading.Event | None = None,
+        active: bool = True,
+    ) -> "_OpenChannelRecorder":
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "_error", error)
+        object.__setattr__(instance, "_calls", [])
+        object.__setattr__(instance, "_entered", threading.Semaphore(0))
+        object.__setattr__(instance, "_blocker", blocker)
+        object.__setattr__(instance, "_active", active)
+        return instance
+
+    def open_channel(
+        self,
+        kind: str,
+        dest_addr: tuple[str, int] | None = None,
+        src_addr: tuple[str, int] | None = None,
+        window_size: int | None = None,
+        max_packet_size: int | None = None,
+        timeout: float | None = None,
+    ) -> paramiko.Channel:
+        self._calls.append({"kind": kind, "dest_addr": dest_addr, "timeout": timeout})
+        self._entered.release()
+        if self._blocker is not None:
+            self._blocker.wait(timeout=_BLOCKED_OPEN_HOLD_SECONDS)
+        raise (
+            self._error
+            if self._error is not None
+            else SSHTunnelError("no channel configured", SSHTunnelPhase.HOST_CONNECT)
+        )
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def wait_for_calls(self, count: int, timeout: float = 5.0) -> bool:
+        """Block until ``open_channel`` has been entered ``count`` times."""
+        deadline = time.monotonic() + timeout
+        for _ in range(count):
+            if not self._entered.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                return False
+        return True
+
+
+@contextmanager
+def _accepted_connection() -> Iterator[tuple[socket.socket, socket.socket]]:
+    """A connected AF_UNIX pair, standing in for an accepted tunnel connection and its peer.
+
+    Yields ``(client_sock, peer)``: ``client_sock`` is what an accept loop would
+    hand to ``_open_and_relay``, and ``peer`` is the end the proxy holds, so a
+    test can observe what the proxy observes. Both are closed on exit;
+    ``_open_and_relay`` closes the end it is handed, and ``close`` is idempotent.
+    """
+    client_sock, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        yield client_sock, peer
+    finally:
+        client_sock.close()
+        peer.close()
+
+
+@contextmanager
+def _short_path_tmpdir() -> Iterator[Path]:
+    """A temp dir for test sockets, built by the same rule the manager uses for its own.
+
+    pytest's ``tmp_path`` will not do: on macOS it is under /var/folders/... and
+    overflows AF_UNIX's sun_path limit on its own.
+    """
+    with _create_short_path_tmpdir("mngr-fwd-test-") as tmpdir:
+        yield Path(tmpdir)
+
+
+@contextmanager
+def _running_accept_loop(transport: _OpenChannelRecorder) -> Iterator[tuple[Path, threading.Event, threading.Thread]]:
+    """Run a tunnel accept loop on a listening socket, and tear it down afterwards."""
+    shutdown_event = threading.Event()
+    stop_event = threading.Event()
+    with _short_path_tmpdir() as tmpdir:
+        socket_path = tmpdir / "t.sock"
+        # Listening before the loop starts, exactly as the manager does it, so
+        # the socket is connectable as soon as this returns.
+        server = _create_tunnel_listener(socket_path)
+        loop = threading.Thread(
+            target=_tunnel_accept_loop,
+            args=(
+                server,
+                socket_path,
+                cast(paramiko.Transport, transport),
+                "127.0.0.1",
+                8000,
+                shutdown_event,
+                stop_event,
+                lambda: None,
+                lambda: None,
+            ),
+            daemon=True,
+        )
+        loop.start()
+        try:
+            yield socket_path, stop_event, loop
+        finally:
+            shutdown_event.set()
+            loop.join(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "is_active, open_seconds, expected",
+    [
+        # sshd answered, one round trip: the connection is fine either way,
+        # whether the refusal kept its ChannelException or not.
+        (True, 0.01, False),
+        # Ran out the bound while paramiko still called the transport active:
+        # the post-sleep half-open case this bound exists for.
+        (True, _CHANNEL_OPEN_TIMEOUT_SECONDS, True),
+        # Paramiko noticed the peer go away on its own.
+        (False, 0.01, True),
+    ],
+)
+def test_transport_is_unusable_only_when_the_peer_stopped_answering(
+    is_active: bool, open_seconds: float, expected: bool
+) -> None:
+    """Which failed opens mean the SSH connection itself must be dropped.
+
+    Covers every way ``Transport.open_channel`` can fail. The exception type is
+    deliberately not consulted, because paramiko cannot make it reliable -- see
+    ``test_only_a_transport_level_open_failure_invalidates_the_connection``.
+    """
+    transport = _OpenChannelRecorder.create(active=is_active)
+    assert _is_transport_unusable(cast(paramiko.Transport, transport), open_seconds) is expected
+
+
+def test_channel_open_carries_the_configured_bound() -> None:
+    """The open must not fall back to paramiko's 3600s default channel timeout.
+
+    That default is what wedged the tunnel for the rest of the session: an open
+    against a peer that silently went away blocked for an hour.
+    """
+    transport = _OpenChannelRecorder.create(error=paramiko.ChannelException(2, "Connect failed"))
+
+    with _accepted_connection() as (client_sock, _peer):
+        _open_and_relay(
+            client_sock, cast(paramiko.Transport, transport), "127.0.0.1", 8000, lambda: None, lambda: None
+        )
+
+    assert transport._calls[0]["timeout"] == _CHANNEL_OPEN_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    "error, is_active, expected_invalidated",
+    [
+        # sshd answered and refused: a workspace whose system interface has not
+        # started listening yet refuses every open until it comes up. Dropping
+        # the SSH connection on each one would churn a healthy connection --
+        # and every reverse tunnel sharing it -- through a normal cold boot.
+        (paramiko.ChannelException(2, "Connect failed"), True, False),
+        # The same refusal, arriving as a bare SSHException because it lost the
+        # race for ``saved_exception``. A page load fans out several parallel
+        # requests, so these are the common case, not the rare one.
+        (paramiko.SSHException("Unable to open channel."), True, False),
+        # Paramiko noticed the peer go away on its own.
+        (paramiko.SSHException("SSH session not active"), False, True),
+        # An open that was in flight when the peer closed under it. Closing a
+        # shared SSH client is itself one way a sibling tunnel's open lands here.
+        (EOFError(), False, True),
+    ],
+)
+def test_only_a_transport_level_open_failure_invalidates_the_connection(
+    error: Exception, is_active: bool, expected_invalidated: bool
+) -> None:
+    """Which failed opens retire the SSH connection, across every exception an open can raise.
+
+    The exception type is deliberately not consulted, because paramiko cannot
+    make it reliable: ``Transport.saved_exception`` is one slot shared by every
+    in-flight open and ``get_exception`` clears it, so when sshd refuses a burst
+    of opens only the first waiter to wake sees the ``ChannelException``; the
+    rest get a bare ``SSHException``, the same type a genuine transport failure
+    raises. Measured against a real paramiko transport, two opens refused in one
+    burst split one and one.
+
+    ``EOFError`` is in the set because paramiko re-raises a bare one from an open
+    the peer closed under; it is neither an ``SSHException`` nor an ``OSError``,
+    so letting it escape the relay thread would leave the accepted socket open
+    and never retire the tunnel.
+
+    Every case must also close the accepted socket, whatever the verdict: that
+    close is what makes the proxy see the failure immediately instead of waiting
+    out its own timeout.
+    """
+    transport = _OpenChannelRecorder.create(error=error, active=is_active)
+    invalidated = threading.Event()
+    refused = threading.Event()
+
+    with _accepted_connection() as (client_sock, peer):
+        _open_and_relay(
+            client_sock,
+            cast(paramiko.Transport, transport),
+            "127.0.0.1",
+            8000,
+            invalidated.set,
+            refused.set,
+        )
+
+        assert invalidated.is_set() is expected_invalidated
+        # The two reports are exclusive: an open that failed is evidence about
+        # the inner port or about the SSH connection, never about both. The
+        # refusal report is the only trace of a reachable host with nothing
+        # listening -- all the proxy sees is the socket closing below.
+        assert refused.is_set() is (not expected_invalidated)
+        # An empty read means our end is closed.
+        peer.settimeout(5.0)
+        assert peer.recv(1) == b""
+
+
+def test_transport_failure_handler_retires_the_connection_and_the_loop(tmp_path: Path) -> None:
+    """The handler acts on the live manager, not a copy, and retires the tunnel with it.
+
+    Guards the seam between the two: the handler is a pydantic model holding
+    the manager, so a model that copied its ``manager`` on construction would
+    invalidate a detached clone and leave the real cache untouched -- a no-op
+    that nothing else in the suite would notice.
+    """
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    fake_client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(ssh_info, fake_client)
+    stop_event = threading.Event()
+
+    handler = _TransportFailureHandler(
+        manager=manager,
+        conn_key=conn_key,
+        client=fake_client,
+        stop_event=stop_event,
+    )
+    handler()
+
+    assert conn_key not in manager._connections
+    assert stop_event.is_set()
+
+
+def test_invalidate_connection_drops_the_cached_client(tmp_path: Path) -> None:
+    """Invalidating removes the client from the cache so the next request reconnects."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    fake_client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(ssh_info, fake_client)
+
+    manager._invalidate_connection(conn_key, fake_client)
+
+    assert conn_key not in manager._connections
+
+
+def test_invalidate_connection_leaves_a_replacement_alone(tmp_path: Path) -> None:
+    """A late invalidation from a stale connection must not drop its replacement.
+
+    Several requests can be in flight against the same dead transport and all
+    time out. The first invalidation reconnects; the rest must be no-ops
+    rather than tearing down the fresh connection.
+    """
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    stale_client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(ssh_info, stale_client)
+
+    replacement = FakeSSHClient.create(active=True)
+    with manager._lock:
+        manager._connections[conn_key] = replacement
+
+    manager._invalidate_connection(conn_key, stale_client)
+
+    assert manager._connections[conn_key] is replacement
+
+
+def test_accept_loop_serves_a_second_connection_while_an_open_is_stuck() -> None:
+    """A wedged channel open must not queue every later connection behind it.
+
+    The regression this guards: opening the channel on the accept loop itself
+    meant one stuck open (an hour, at paramiko's default timeout) blocked the
+    whole tunnel, so nothing got through and nothing detected it.
+    """
+    blocker = threading.Event()
+    transport = _OpenChannelRecorder.create(
+        error=paramiko.SSHException("Timeout opening channel."),
+        blocker=blocker,
+    )
+
+    try:
+        with _running_accept_loop(transport) as (socket_path, _stop_event, _loop):
+            first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                first.connect(str(socket_path))
+                second.connect(str(socket_path))
+                # Both opens must be in flight at once. With the open on the
+                # accept loop, the second is never reached while the first
+                # is blocked.
+                assert transport.wait_for_calls(2)
+            finally:
+                first.close()
+                second.close()
+    finally:
+        blocker.set()
+
+
+def test_accept_loop_stops_when_its_tunnel_is_invalidated() -> None:
+    """Setting the per-tunnel stop event retires the loop so the next request rebuilds it."""
+    transport = _OpenChannelRecorder.create()
+
+    with _running_accept_loop(transport) as (socket_path, stop_event, loop):
+        stop_event.set()
+        loop.join(timeout=5.0)
+        assert not loop.is_alive()
+        assert not socket_path.exists()
+
+
+def test_tunnel_listener_is_listening_before_it_is_returned() -> None:
+    """The listener is connectable the instant it is handed back, not merely bound.
+
+    The socket file appears at ``bind()``, but connections are only accepted
+    after ``listen()``. A caller that waited for the *file* could land in
+    between and be refused, which reads as an unreachable backend.
+
+    Driven against ``_create_tunnel_listener`` directly rather than through
+    ``get_tunnel_socket_path``: going through the manager puts a thread start
+    and two dict writes between the listen and the assertion, which is ample
+    for a background thread to have run ``listen()`` on its own. Moving the
+    listen back out of this function passes that version and fails this one.
+    """
+    with _short_path_tmpdir() as tmpdir:
+        socket_path = tmpdir / "t.sock"
+        server = _create_tunnel_listener(socket_path)
+        client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            assert client_sock.connect_ex(str(socket_path)) == 0
+        finally:
+            client_sock.close()
+            server.close()
+
+
+def test_tunnel_listener_bind_failure_leaves_the_existing_socket_alone() -> None:
+    """A path this call did not bind is not ours to unlink, even though a later failure would.
+
+    ``bind`` creates the socket file and closing the socket does not remove it,
+    so a listener that fails *after* binding has to unlink. One that fails at
+    the bind must not: tunnel socket paths are a deterministic hash of the
+    tunnel key, so the thing already bound there is another listener, and
+    unlinking leaves it accepting on an inode no caller can reach.
+    """
+    with _short_path_tmpdir() as tmpdir:
+        socket_path = tmpdir / "t.sock"
+        incumbent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            incumbent.bind(str(socket_path))
+            incumbent.listen(1)
+
+            # A socket this device could not bind is raised against this
+            # device's own socket table, so it carries the same phase.
+            with pytest.raises(SSHTunnelError) as exc_info:
+                _create_tunnel_listener(socket_path)
+            assert exc_info.value.phase is SSHTunnelPhase.LOCAL_SETUP
+
+            # Connectable, not merely present: a path that was unlinked and
+            # re-created would still pass an ``exists()`` check.
+            client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                assert client_sock.connect_ex(str(socket_path)) == 0
+            finally:
+                client_sock.close()
+        finally:
+            incumbent.close()
+
+
+def _connect_and_read_until_closed(socket_path: Path) -> None:
+    """Drive one connection through a tunnel and wait for the tunnel to close it.
+
+    Both failing open paths close the accepted socket, so an empty read is the
+    signal that the open was attempted and decided upon.
+    """
+    client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client_sock.connect(str(socket_path))
+        client_sock.settimeout(5.0)
+        assert client_sock.recv(1) == b""
+    finally:
+        client_sock.close()
+
+
+def test_a_tunnel_over_a_dead_transport_is_rebuilt_on_the_next_request(tmp_path: Path) -> None:
+    """The whole recovery, driven through the manager: refuse, retire, rebuild.
+
+    The pieces are covered individually above; this is the wiring that turns
+    them into a recovery, driven through ``get_tunnel_socket_path``: it holds
+    the accept loop to the per-tunnel stop event, the failure handler to the
+    cached client, and the rebuilt tunnel to the same socket path the retired
+    one unlinked.
+    """
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    tunnel_key = f"{conn_key}->127.0.0.1:8000"
+    dying_client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(ssh_info, dying_client)
+
+    try:
+        socket_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+        original_thread = manager._tunnel_threads[tunnel_key]
+
+        # sshd is answering and refusing: a workspace whose service has not
+        # come up yet. Neither the connection nor the tunnel may be retired,
+        # or a normal cold boot would churn both on every request.
+        _connect_and_read_until_closed(socket_path)
+        assert manager._connections[conn_key] is dying_client
+        assert original_thread.is_alive()
+
+        # Now the peer goes away.
+        dying_client._fake_transport.set_active(False)
+        _connect_and_read_until_closed(socket_path)
+        assert poll_until(lambda: conn_key not in manager._connections)
+        assert poll_until(lambda: not original_thread.is_alive())
+
+        # The next request establishes both fresh. The path is a hash of the
+        # tunnel key, so the rebuilt tunnel has to reclaim the very path the
+        # retired accept loop just unlinked.
+        replacement_client = FakeSSHClient.create(active=True)
+        with manager._lock:
+            manager._connections[conn_key] = replacement_client
+
+        rebuilt_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+
+        assert rebuilt_path == socket_path
+        assert manager._tunnel_threads[tunnel_key] is not original_thread
+        _connect_and_read_until_closed(rebuilt_path)
+        assert manager._connections[conn_key] is replacement_client
+    finally:
+        manager.cleanup()
+
+
+class _StubDialTunnelManager(SSHTunnelManager):
+    """Hands out a fresh fake connection instead of dialing the unroutable sample host."""
+
+    _clients_handed_out: list[FakeSSHClient] = PrivateAttr(default_factory=list)
+
+    def _get_or_create_connection(self, ssh_info: RemoteSSHInfo) -> paramiko.SSHClient:
+        conn_key = f"{ssh_info.host}:{ssh_info.port}"
+        existing = self._connections.get(conn_key)
+        if existing is not None and not self._has_connection_outlived_a_suspension(conn_key):
+            return existing
+        client = FakeSSHClient.create(active=True)
+        self._connections[conn_key] = client
+        self._connection_established_at[conn_key] = read_clocks()
+        self._clients_handed_out.append(client)
+        return client
+
+
+def _pose_a_suspension_since_the_connection(manager: SSHTunnelManager, conn_key: str, seconds: float) -> None:
+    """Rewrite the stamps of the connection and of every tunnel over it, so ``seconds`` of wall clock passed unseen.
+
+    A real suspension outlives both at once: the tunnels were built over that
+    same connection, before it.
+    """
+    with manager._lock:
+        current = read_clocks()
+        before_the_sleep = ClockReading(
+            wall_seconds=current.wall_seconds - seconds,
+            monotonic_seconds=current.monotonic_seconds - 1.0,
+        )
+        manager._connection_established_at[conn_key] = before_the_sleep
+        for tunnel_key in manager._tunnel_connection_established_at:
+            if tunnel_key.startswith(f"{conn_key}->"):
+                manager._tunnel_connection_established_at[tunnel_key] = before_the_sleep
+
+
+def test_a_tunnel_whose_connection_outlived_a_suspension_is_rebuilt_before_it_is_handed_out(
+    tmp_path: Path,
+) -> None:
+    """A live accept loop is not evidence its transport still works; it captured the dead one."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    tunnel_key = f"{conn_key}->127.0.0.1:8000"
+    manager = _StubDialTunnelManager()
+
+    try:
+        socket_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+        original_thread = manager._tunnel_threads[tunnel_key]
+        assert len(manager._clients_handed_out) == 1
+
+        # A second request while nothing has happened reuses both.
+        assert manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000) == socket_path
+        assert manager._tunnel_threads[tunnel_key] is original_thread
+        assert len(manager._clients_handed_out) == 1
+
+        _pose_a_suspension_since_the_connection(manager, conn_key, seconds=730.0)
+        rebuilt_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+
+        assert manager._tunnel_threads[tunnel_key] is not original_thread
+        assert len(manager._clients_handed_out) == 2
+        # Same path (a hash of the key), so the old loop must be gone before the
+        # replacement binds, or its ``finally`` unlinks the new socket.
+        assert rebuilt_path == socket_path
+        assert not original_thread.is_alive()
+        assert rebuilt_path.exists()
+    finally:
+        manager.cleanup()
+
+
+def test_every_tunnel_sharing_the_retired_connection_is_rebuilt_not_just_the_first(tmp_path: Path) -> None:
+    """One host serves a tunnel per agent and per service, and the rebuild closed the transport they all captured."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    first_key = f"{conn_key}->127.0.0.1:8000"
+    second_key = f"{conn_key}->127.0.0.1:9000"
+    manager = _StubDialTunnelManager()
+
+    try:
+        manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+        manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 9000)
+        first_thread = manager._tunnel_threads[first_key]
+        second_thread = manager._tunnel_threads[second_key]
+        assert len(manager._clients_handed_out) == 1
+
+        _pose_a_suspension_since_the_connection(manager, conn_key, seconds=730.0)
+        # The first request rebuilds the connection, which restamps the host key.
+        manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+        manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 9000)
+
+        assert manager._tunnel_threads[first_key] is not first_thread
+        assert manager._tunnel_threads[second_key] is not second_thread
+        assert not second_thread.is_alive()
+        # Both rebuilds ran over the one connection established after the wake.
+        assert len(manager._clients_handed_out) == 2
+    finally:
+        manager.cleanup()
+
+
+class _UnstoppableThread(threading.Thread):
+    """An accept loop that outlasts the join, without waiting out ``_TUNNEL_RETIREMENT_TIMEOUT_SECONDS``."""
+
+    def join(self, timeout: float | None = None) -> None:
+        return
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def test_a_tunnel_that_outlasts_its_retirement_stays_recorded(tmp_path: Path) -> None:
+    """Forgetting it would let the next request bind a second listener under the loop that still owns the path."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    tunnel_key = f"{conn_key}->127.0.0.1:8000"
+    manager = _StubDialTunnelManager()
+
+    try:
+        socket_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+        stuck_thread = _UnstoppableThread(daemon=True)
+        with manager._lock:
+            manager._tunnel_threads[tunnel_key] = stuck_thread
+
+        _pose_a_suspension_since_the_connection(manager, conn_key, seconds=730.0)
+
+        with pytest.raises(SSHTunnelError):
+            manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+
+        assert manager._tunnel_threads[tunnel_key] is stuck_thread
+        assert manager._tunnel_socket_paths[tunnel_key] == socket_path
+        assert manager._tunnel_stop_events[tunnel_key].is_set()
+    finally:
+        manager.cleanup()
+
+
+def test_a_reverse_tunnel_whose_connection_outlived_a_suspension_reads_as_broken(tmp_path: Path) -> None:
+    """A suspension leaves the same, still-active-looking client in place, so the repair loop must ask about it itself."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    tunnel_key = (conn_key, 8420)
+    client = FakeSSHClient.create(active=True)
+    manager = _make_manager_with_fake_connection(ssh_info, client)
+    with manager._lock:
+        manager._reverse_tunnel_clients[tunnel_key] = client
+        manager._connection_established_at[conn_key] = read_clocks()
+        assert manager._is_reverse_tunnel_transport_alive_locked(tunnel_key)
+
+    _pose_a_suspension_since_the_connection(manager, conn_key, seconds=730.0)
+
+    with manager._lock:
+        assert not manager._is_reverse_tunnel_transport_alive_locked(tunnel_key)
+
+
+def test_a_connection_with_no_recorded_stamp_is_never_called_suspension_stale(tmp_path: Path) -> None:
+    """No stamp is no evidence, which is what leaves an externally seeded connection alone."""
+    ssh_info = _sample_ssh_info(tmp_path)
+    conn_key = f"{ssh_info.host}:{ssh_info.port}"
+    manager = _make_manager_with_fake_connection(ssh_info, FakeSSHClient.create(active=True))
+
+    with manager._lock:
+        assert not manager._has_connection_outlived_a_suspension(conn_key)
+
+
+def test_reading_the_refusal_count_does_not_wait_on_a_tunnel_being_established(tmp_path: Path) -> None:
+    """The refusal count must be readable while another tunnel is mid-setup.
+
+    The proxy reads it on its event loop, once per request, to tell a refused
+    inner port from an unreachable host. ``_lock`` is held for the whole of
+    ``get_tunnel_socket_path`` -- including a ``paramiko`` connect that runs to
+    its 10s timeout against a host that has gone away, which is exactly the
+    situation this count exists to classify. Sharing that lock would park every
+    request the proxy is serving behind it, so the counter keeps its own.
+    """
+    manager = SSHTunnelManager()
+    ssh_info = _sample_ssh_info(tmp_path)
+    manager._record_backend_refusal(f"{ssh_info.host}:{ssh_info.port}->127.0.0.1:8000")
+
+    with manager._lock:
+        read_count: list[int] = []
+        reader = threading.Thread(
+            target=lambda: read_count.append(manager.get_backend_refusal_count(ssh_info, "127.0.0.1", 8000))
+        )
+        reader.start()
+        reader.join(timeout=5.0)
+        assert not reader.is_alive(), "get_backend_refusal_count blocked on the tunnel manager's setup lock"
+
+    assert read_count == [1]
+
+
+# -- Refusal classification against a real sshd ----------------------------
+#
+# ``BACKEND_NOT_LISTENING`` rests on one judgement no fake can make for it:
+# whether a real sshd refusing a ``direct-tcpip`` open leaves the transport in
+# the state ``_is_transport_unusable`` reads as still usable. Every test above
+# supplies that state itself, so all of them would keep passing if the real
+# thing landed on the other side of the line -- and the refusal count would then
+# never move, silently, with the reason simply never firing. These two run the
+# real client against a real server so the judgement is made rather than
+# assumed. The seam above them (a count that moved becoming the reason on the
+# envelope) is covered in ``server_test.py``.
+
+# How long the fake sshd's accept loop waits before re-checking for shutdown.
+_SSHD_ACCEPT_POLL_SECONDS: Final[float] = 0.2
+
+
+class _InnerPortRefusingServer(paramiko.ServerInterface):
+    """An sshd that admits anyone and refuses every forward to a port behind it.
+
+    The shape of a live container whose service has died: the host answers, its
+    transport stays healthy, and nothing is listening on the inner port.
+    """
+
+    def get_allowed_auths(self, username: str) -> str:
+        return "publickey"
+
+    def check_auth_publickey(self, username: str, key: paramiko.PKey) -> int:
+        return AUTH_SUCCESSFUL
+
+    def check_channel_direct_tcpip_request(
+        self, chanid: int, origin: tuple[str, int], destination: tuple[str, int]
+    ) -> int:
+        return OPEN_FAILED_CONNECT_FAILED
+
+
+@contextmanager
+def _refusing_sshd(tmp_path: Path) -> Iterator[tuple[RemoteSSHInfo, list[paramiko.Transport]]]:
+    """Run an sshd on loopback that refuses every ``direct-tcpip`` open.
+
+    Yields the ``RemoteSSHInfo`` that addresses it -- real key material, and a
+    known_hosts pinning this server's key, so ``_create_ssh_client`` performs a
+    real handshake rather than being handed a connection -- along with the
+    server-side transports it has accepted, which a caller closes to make the
+    host go away mid-test.
+    """
+    host_key = paramiko.ECDSAKey.generate()
+    key_path = tmp_path / "id_ecdsa"
+    paramiko.ECDSAKey.generate().write_private_key_file(str(key_path))
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(_SSHD_ACCEPT_POLL_SECONDS)
+    port = listener.getsockname()[1]
+    # Pinned under OpenSSH's non-default-port spelling, which is what paramiko
+    # looks the host up by. Written beside the key, the placement
+    # ``_resolve_known_hosts_path`` falls back to.
+    (tmp_path / "known_hosts").write_text(f"[127.0.0.1]:{port} {host_key.get_name()} {host_key.get_base64()}\n")
+
+    served: list[paramiko.Transport] = []
+    stop_event = threading.Event()
+
+    def accept_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            transport = paramiko.Transport(connection)
+            transport.add_server_key(host_key)
+            transport.start_server(server=_InnerPortRefusingServer())
+            served.append(transport)
+
+    thread = threading.Thread(target=accept_loop, daemon=True, name="test-refusing-sshd")
+    thread.start()
+    try:
+        yield RemoteSSHInfo(user="root", host="127.0.0.1", port=port, key_path=key_path), served
+    finally:
+        stop_event.set()
+        thread.join(timeout=5.0)
+        for transport in served:
+            transport.close()
+        listener.close()
+
+
+@pytest.mark.timeout(60)
+def test_a_real_sshd_refusing_the_inner_port_counts_a_refusal_and_keeps_the_connection(tmp_path: Path) -> None:
+    """A refused ``direct-tcpip`` open must be counted, and must not retire the SSH connection.
+
+    The two halves are one judgement. The refusal is only tellable from an
+    unreachable host because the transport survives it, so a run that retired
+    the connection would also have counted nothing -- and every request against
+    a container with a dead service would rebuild the tunnel to learn the same
+    thing again.
+
+    The count is read straight after the failed request rather than polled for,
+    because the ordering is the contract: the refusal is recorded before the
+    accepted socket is closed, precisely so a caller that has observed its own
+    failure is guaranteed to see it. A poll here would pass either way.
+    """
+    with _refusing_sshd(tmp_path) as (ssh_info, _served):
+        manager = SSHTunnelManager()
+        try:
+            socket_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+            tunnel_key = f"{ssh_info.host}:{ssh_info.port}->127.0.0.1:8000"
+            assert manager.get_backend_refusal_count(ssh_info, "127.0.0.1", 8000) == 0
+
+            _connect_and_read_until_closed(socket_path)
+
+            assert manager.get_backend_refusal_count(ssh_info, "127.0.0.1", 8000) == 1
+            assert f"{ssh_info.host}:{ssh_info.port}" in manager._connections
+            assert manager._tunnel_threads[tunnel_key].is_alive()
+        finally:
+            manager.cleanup()
+
+
+@pytest.mark.timeout(60)
+def test_a_real_ssh_host_that_goes_away_counts_no_refusal(tmp_path: Path) -> None:
+    """A host that stopped answering must not be read as a refused inner port.
+
+    The negative half, and the reason the count cannot simply be "an open
+    failed": both failures reach the proxy as nothing but the tunnel socket
+    closing. Here the same server, refusing the same way, has had its transport
+    taken out from under it -- and that alone has to flip the classification, or
+    a vanished machine would be reported as reachable-with-a-dead-service and
+    the restart that fixes it withheld.
+    """
+    with _refusing_sshd(tmp_path) as (ssh_info, served):
+        manager = SSHTunnelManager()
+        conn_key = f"{ssh_info.host}:{ssh_info.port}"
+        try:
+            socket_path = manager.get_tunnel_socket_path(ssh_info, "127.0.0.1", 8000)
+            assert poll_until(lambda: len(served) == 1), "the sshd never accepted the manager's connection"
+
+            served[0].close()
+            client_transport = manager._connections[conn_key].get_transport()
+            assert client_transport is not None
+            assert poll_until(lambda: not client_transport.is_active()), "the client never noticed the host go away"
+
+            _connect_and_read_until_closed(socket_path)
+
+            assert poll_until(lambda: conn_key not in manager._connections), "the dead connection was not retired"
+            assert manager.get_backend_refusal_count(ssh_info, "127.0.0.1", 8000) == 0
+        finally:
+            manager.cleanup()

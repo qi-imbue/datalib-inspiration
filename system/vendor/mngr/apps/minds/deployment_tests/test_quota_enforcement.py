@@ -3,7 +3,7 @@
 Exercises the connector's entitlements paths against the real Neon DB (lazy
 row creation, plan resolution, the quota rejections) using a fresh verified
 user, who -- being created after the feature-ship cutoff with a non-paid-listed
-email -- must land on the explorer plan.
+email and no explicit signup plan choice -- must land on the free plan.
 
 The lease *cap* itself (403 at max_remote_workspaces) is unit-tested only: the
 ci env's pool has no baked hosts and the test fixtures have no admin key
@@ -20,11 +20,14 @@ import pytest
 
 from imbue.minds.deployment_tests.data_types import SharedEnvHandle
 from imbue.minds.deployment_tests.data_types import VerifiedUserHandle
+from imbue.minds.deployment_tests.helpers import LEASE_MAX_BOX_GENERATION
 from imbue.minds.deployment_tests.helpers import wait_for_env_ready
 
 pytestmark = [pytest.mark.release, pytest.mark.minds_services]
 
-_HTTP_TIMEOUT_SECONDS = 60.0
+# The storage recheck lists the account's R2 objects and rewrites Cloudflare
+# token policies inline; one such round trip exceeded 60s on 2026-09-13.
+_HTTP_TIMEOUT_SECONDS = 120.0
 
 # A comfortably-large max_total_bucket_bytes the grant-cycle test restores
 # the shared user's entitlement to (both mid-test and on any failure path).
@@ -71,11 +74,11 @@ def _delete_cleanup_grants(env: SharedEnvHandle, user_id: str) -> None:
 
 
 @pytest.mark.timeout(180)
-def test_fresh_account_lands_on_explorer_and_cannot_mint_llm_keys(
+def test_fresh_account_lands_on_free_and_cannot_mint_llm_keys(
     shared_env: Callable[[str], SharedEnvHandle],
     verified_user: VerifiedUserHandle,
 ) -> None:
-    """A new non-paid account gets the explorer plan; its $0 LLM budget refuses key minting."""
+    """A new account with no signup plan choice gets the free plan; its $0 LLM budget refuses key minting."""
     env = shared_env("default")
     wait_for_env_ready(env)
     connector_url = _connector_url(env)
@@ -84,9 +87,10 @@ def test_fresh_account_lands_on_explorer_and_cannot_mint_llm_keys(
         account = client.get(f"{connector_url}/account", headers=_auth_header(verified_user))
         assert account.status_code == 200, f"GET /account failed: {account.text[:400]!r}"
         body = account.json()
-        assert body["plan_name"] == "explorer", f"fresh account landed on {body['plan_name']!r}, not explorer"
+        assert body["plan_name"] == "free", f"fresh account landed on {body['plan_name']!r}, not free"
         assert body["entitlements"]["monthly_llm_spend_usd"] == 0
         assert "ally" in body["available_plans"], "plans table is not seeded with the launch plans"
+        assert "explorer" in body["available_plans"], "plans table is not seeded with the launch plans"
 
         key_response = client.post(
             f"{connector_url}/keys/create",
@@ -94,7 +98,7 @@ def test_fresh_account_lands_on_explorer_and_cannot_mint_llm_keys(
             json={},
         )
         assert key_response.status_code == 403, (
-            f"explorer key minting should be refused, got {key_response.status_code}: {key_response.text[:400]!r}"
+            f"free-plan key minting should be refused, got {key_response.status_code}: {key_response.text[:400]!r}"
         )
         detail = key_response.json()["detail"]
         assert detail["code"] == "quota_exceeded"
@@ -122,6 +126,9 @@ def test_ally_plan_requires_partner_access(
 
 
 @pytest.mark.timeout(300)
+# Each recheck is a live Cloudflare round trip (object listing plus token policy
+# rewrites) whose latency the test does not control.
+@pytest.mark.flaky
 def test_storage_cleanup_grant_cycle(
     shared_env: Callable[[str], SharedEnvHandle],
     verified_user: VerifiedUserHandle,
@@ -210,6 +217,7 @@ def test_lease_quota_check_passes_through_for_under_quota_account(
                 "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholderTestKeyForQuotaCheck",
                 "host_name": "quota-check-probe",
                 "attributes": {"cpus": 999999},
+                "max_box_generation": LEASE_MAX_BOX_GENERATION,
             },
         )
         if response.status_code == 200:

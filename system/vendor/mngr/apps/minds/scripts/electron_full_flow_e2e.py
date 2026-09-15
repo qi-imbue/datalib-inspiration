@@ -8,7 +8,8 @@ created from the default-workspace-template:
      selected (compute/backup association; the create flow injects no AI
      credentials, so the chat step relies on the operator's synced Claude
      subscription credentials keeping the workspace authenticated),
-  2. send a chat message and wait for the agent's reply,
+  2. start a chat from the workspace's New Tab page, send it a message and
+     wait for the agent's reply,
   3. open a terminal panel in the dockview,
   4. navigate back to the home/landing screen (via the chrome Home button),
   5. open that workspace's settings and destroy it (the versioned
@@ -22,7 +23,7 @@ this script is the thin CLI wrapper that picks names + an env and reports.
 
 Run it headless on Linux via ``just minds-test-electron-flow`` (wraps this in
 ``xvfb-run``). It inherits whatever minds env is activated; activate one with a
-logged-in account first, e.g. ``eval "$(uv run minds env activate dev-josh-1)"``.
+logged-in account first, e.g. ``eval "$(uv run minds-admin env activate dev-josh-1)"``.
 
 This is an operator/debug harness, not a pytest test: chat replies depend on
 live Claude credentials and Docker, which are not available on the standard
@@ -49,7 +50,7 @@ from imbue.mngr.utils.testing import get_short_random_string
 def main() -> None:
     configure_logging()
     if not os.environ.get("MINDS_ROOT_NAME"):
-        logger.error('No MINDS_ROOT_NAME activated. Run: eval "$(uv run minds env activate dev-josh-1)"')
+        logger.error('No MINDS_ROOT_NAME activated. Run: eval "$(uv run minds-admin env activate dev-josh-1)"')
         sys.exit(2)
     # Keep the local-Docker provider on the stock runtime and silence Modal noise.
     # MINDS_DOCKER_RUNTIME_DEFAULT pins the create form / API default to runc so

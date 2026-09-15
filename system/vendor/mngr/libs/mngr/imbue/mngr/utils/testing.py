@@ -17,14 +17,14 @@ from collections.abc import Generator
 from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import datetime
-from datetime import timedelta
 from datetime import timezone
 from enum import auto
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from typing import Final
 from typing import IO
-from typing import assert_never
+from typing import TypeVar
 from uuid import uuid4
 
 import pluggy
@@ -43,6 +43,7 @@ from imbue.mngr.config.data_types import MngrConfig
 from imbue.mngr.config.data_types import MngrContext
 from imbue.mngr.errors import ConfigStructureError
 from imbue.mngr.errors import MngrError
+from imbue.mngr.hosts.host import Host
 from imbue.mngr.hosts.tmux import TmuxWindowTarget
 from imbue.mngr.hosts.tmux import build_tmux_capture_pane_command
 from imbue.mngr.interfaces.cleanup_failures import CleanupFailedGroup
@@ -66,8 +67,8 @@ from imbue.mngr.providers.local.instance import LOCAL_HOST_NAME
 from imbue.mngr.providers.local.instance import LocalProviderInstance
 from imbue.mngr.providers.registry import load_local_backend_only
 from imbue.mngr.utils.deps import CLAUDE
-from imbue.mngr.utils.env_utils import TEST_ENV_PATTERN
 from imbue.mngr.utils.env_utils import TEST_ENV_PREFIX
+from imbue.mngr.utils.polling import poll_until
 from imbue.mngr.utils.polling import wait_for
 
 # =============================================================================
@@ -605,6 +606,9 @@ def run_mngr_subprocess(
     )
 
 
+_TMUX_CLEANUP_SUBPROCESS_TIMEOUT_SECONDS: float = 5.0
+
+
 def _get_descendant_pids(pid: str) -> list[str]:
     """Recursively get all descendant PIDs of a given process.
 
@@ -612,22 +616,39 @@ def _get_descendant_pids(pid: str) -> list[str]:
     directly instead of host.execute_command, since this is used for test cleanup
     outside of Host (e.g., in fixtures and context managers). The Host version goes
     through pyinfra which supports both local and SSH execution.
+
+    The whole walk shares one deadline, for the reason given on
+    :func:`_run_with_timeout`: this runs inside the caller's ``pytest-timeout``
+    window, so an unbounded ``pgrep`` here stalls the test itself. A per-call
+    timeout would not be enough, because the walk recurses once per descendant
+    and each call would get a fresh budget. Running out returns the PIDs found
+    so far, which is what cleanup wants: signalling most of the tree beats
+    signalling none of it.
     """
+    return _get_descendant_pids_before(pid, time.monotonic() + _TMUX_CLEANUP_SUBPROCESS_TIMEOUT_SECONDS)
+
+
+def _get_descendant_pids_before(pid: str, deadline: float) -> list[str]:
+    """Collect ``pid``'s descendants, giving up on whatever is left at ``deadline``."""
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        return []
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", pid],
+            capture_output=True,
+            text=True,
+            timeout=remaining_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return []
     descendants: list[str] = []
-    result = subprocess.run(
-        ["pgrep", "-P", pid],
-        capture_output=True,
-        text=True,
-    )
     if result.returncode == 0 and result.stdout.strip():
         for child_pid in result.stdout.strip().split("\n"):
             if child_pid:
                 descendants.append(child_pid)
-                descendants.extend(_get_descendant_pids(child_pid))
+                descendants.extend(_get_descendant_pids_before(child_pid, deadline))
     return descendants
-
-
-_TMUX_CLEANUP_SUBPROCESS_TIMEOUT_SECONDS: float = 5.0
 
 
 def _run_with_timeout(*args: str) -> "subprocess.CompletedProcess[bytes]":
@@ -836,6 +857,32 @@ def create_test_agent_via_cli(
     )
 
     return session_name
+
+
+HostSubclassT = TypeVar("HostSubclassT", bound=Host)
+
+
+def make_local_host_of_class(
+    local_provider: LocalProviderInstance,
+    host_class: type[HostSubclassT],
+    **extra_fields: Any,
+) -> HostSubclassT:
+    """Build a ``Host`` subclass instance standing in for the local provider's real host.
+
+    The instance shares the real host's id, name, and local connector, so anything the
+    subclass does not override (file reads and writes, agent discovery) still hits the
+    real temp host dir. ``extra_fields`` are the subclass's own pydantic fields.
+    """
+    real_host = local_provider.create_host(HostName(LOCAL_HOST_NAME))
+    assert isinstance(real_host, Host)
+    return host_class(
+        id=real_host.id,
+        host_name=real_host.host_name,
+        connector=real_host.connector,
+        provider_instance=local_provider,
+        mngr_ctx=local_provider.mngr_ctx,
+        **extra_fields,
+    )
 
 
 def make_local_provider(
@@ -1156,280 +1203,6 @@ def setup_claude_trust_config_for_subprocess(
 
 
 # =============================================================================
-# Modal test environment cleanup utilities
-# =============================================================================
-
-
-def _parse_test_env_timestamp(env_name: str) -> datetime | None:
-    """Parse the timestamp from a test environment name.
-
-    Returns the datetime if the name matches the test environment pattern,
-    otherwise returns None.
-    """
-    match = TEST_ENV_PATTERN.match(env_name)
-    if not match:
-        return None
-
-    year, month, day, hour, minute, second = match.groups()
-    return datetime(
-        int(year),
-        int(month),
-        int(day),
-        int(hour),
-        int(minute),
-        int(second),
-        tzinfo=timezone.utc,
-    )
-
-
-def list_modal_test_environments() -> list[str]:
-    """List all Modal test environments.
-
-    Returns a list of environment names that match the test environment pattern
-    (mngr_test-YYYY-MM-DD-HH-MM-SS*).
-    """
-    try:
-        result = subprocess.run(
-            ["uv", "run", "modal", "environment", "list", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            logger.warning("Failed to list Modal environments: {}", result.stderr)
-            return []
-
-        environments = json.loads(result.stdout)
-        test_envs: list[str] = []
-
-        for env in environments:
-            env_name = env.get("name", "")
-            if env_name.startswith(TEST_ENV_PREFIX):
-                test_envs.append(env_name)
-
-        return test_envs
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError) as e:
-        logger.warning("Error listing Modal environments: {}", e)
-        return []
-
-
-def find_old_test_environments(
-    max_age: timedelta,
-) -> list[str]:
-    """Find Modal test environments older than the specified age.
-
-    Returns a list of environment names that are older than max_age.
-    The age is determined by parsing the timestamp from the environment name.
-    """
-    now = datetime.now(timezone.utc)
-    cutoff = now - max_age
-    old_envs: list[str] = []
-
-    for env_name in list_modal_test_environments():
-        timestamp = _parse_test_env_timestamp(env_name)
-        if timestamp is not None and timestamp < cutoff:
-            old_envs.append(env_name)
-
-    return old_envs
-
-
-def delete_modal_apps_in_environment(environment_name: str) -> None:
-    """Stop all Modal apps in the specified environment.
-
-    This is robust to concurrent deletion - failures result in warnings, not errors.
-    """
-    try:
-        result = subprocess.run(
-            ["uv", "run", "modal", "app", "list", "--env", environment_name, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            # Environment may not exist or may have been deleted concurrently
-            logger.warning("Failed to list apps in environment {}: {}", environment_name, result.stderr)
-            return
-
-        apps = json.loads(result.stdout)
-        for app in apps:
-            app_id = app.get("App ID", "")
-            app_name = app.get("Description", "")
-            if app_id:
-                try:
-                    stop_result = subprocess.run(
-                        # --yes: skip the interactive confirmation, which otherwise aborts the
-                        # stop in non-interactive runs (CI / release tests) so the app is never
-                        # stopped and only the environment deletion reaps it.
-                        ["uv", "run", "modal", "app", "stop", app_id, "--yes"],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if stop_result.returncode != 0:
-                        logger.warning(
-                            "Modal app stop returned non-zero for {} ({}): {}",
-                            app_name,
-                            app_id,
-                            stop_result.stderr or stop_result.stdout,
-                        )
-                    else:
-                        logger.debug("Stopped Modal app {} ({})", app_name, app_id)
-                except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
-                    logger.warning("Failed to stop Modal app {} ({}): {}", app_name, app_id, e)
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError) as e:
-        logger.warning("Failed to list/delete Modal apps in environment {}: {}", environment_name, e)
-
-
-def delete_modal_volumes_in_environment(environment_name: str) -> None:
-    """Delete all Modal volumes in the specified environment.
-
-    This is robust to concurrent deletion - failures result in warnings, not errors.
-    """
-    try:
-        result = subprocess.run(
-            ["uv", "run", "modal", "volume", "list", "--env", environment_name, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            # Environment may not exist or may have been deleted concurrently
-            logger.warning("Failed to list volumes in environment {}: {}", environment_name, result.stderr)
-            return
-
-        volumes = json.loads(result.stdout)
-        for volume in volumes:
-            volume_name = volume.get("Name", "")
-            if volume_name:
-                try:
-                    del_result = subprocess.run(
-                        ["uv", "run", "modal", "volume", "delete", volume_name, "--env", environment_name, "--yes"],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if del_result.returncode != 0:
-                        logger.warning(
-                            "Modal volume delete returned non-zero for {} in env {}: {}",
-                            volume_name,
-                            environment_name,
-                            del_result.stderr or del_result.stdout,
-                        )
-                    else:
-                        logger.debug("Deleted Modal volume {} in environment {}", volume_name, environment_name)
-                except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
-                    logger.warning(
-                        "Failed to delete Modal volume {} in environment {}: {}", volume_name, environment_name, e
-                    )
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError) as e:
-        logger.warning("Failed to list/delete Modal volumes in environment {}: {}", environment_name, e)
-
-
-def delete_modal_environment(environment_name: str) -> ModalCleanupOutcome:
-    """Delete a Modal environment.
-
-    Robust to concurrent deletion: returns a ModalCleanupOutcome instead of
-    raising. Callers should treat DELETED and NOT_FOUND as success (the env
-    is gone, whether we did the deleting or someone else did) and only
-    FAILED as a reason to keep the env tracked for leak detection.
-    """
-    try:
-        result = subprocess.run(
-            ["uv", "run", "modal", "environment", "delete", environment_name, "--yes"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            logger.debug("Deleted Modal environment {}", environment_name)
-            return ModalCleanupOutcome.DELETED
-        stderr = result.stderr or result.stdout
-        # Require the env name to appear alongside "not found" so unrelated
-        # errors (e.g. "credentials not found", "config file not found") do
-        # NOT get misclassified as NOT_FOUND. NOT_FOUND lets the caller drop
-        # the env from leak tracking; misclassifying a real FAILED here would
-        # silently defeat the session-end leak detector for that env.
-        stderr_lower = stderr.lower()
-        if "not found" in stderr_lower and environment_name.lower() in stderr_lower:
-            logger.debug("Modal environment {} already gone: {}", environment_name, stderr.strip())
-            return ModalCleanupOutcome.NOT_FOUND
-        logger.warning(
-            "Modal environment delete returned non-zero for {}: {}",
-            environment_name,
-            stderr,
-        )
-        return ModalCleanupOutcome.FAILED
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
-        logger.warning("Failed to delete Modal environment {}: {}", environment_name, e)
-        return ModalCleanupOutcome.FAILED
-
-
-def cleanup_old_modal_test_environments(
-    max_age_hours: float = 1.0,
-) -> int:
-    """Clean up Modal test environments older than the specified age.
-
-    This function finds all Modal test environments with names matching the pattern
-    mngr_test-YYYY-MM-DD-HH-MM-SS*, parses the timestamp from the name, and deletes
-    those that are older than max_age_hours.
-
-    For each old environment, it:
-    1. Stops all apps in the environment
-    2. Deletes all volumes in the environment
-    3. Deletes the environment itself
-
-    This function is designed to be robust to concurrent deletion: it never raises
-    on a failed delete, so the loop always processes every old environment. App
-    and volume failures log at warning level. A FAILED environment delete logs at
-    error level so a stuck safety-net run is greppable in the cron/CI logs that
-    drive this script (DELETED and NOT_FOUND are silent successes).
-
-    Warning vs error rationale: `modal environment delete` cascades and "deletes
-    all apps in the selected environment" (per Modal CLI docs), so individual
-    app/volume delete failures are best-effort and not real leaks as long as the
-    env-level delete succeeds. Reserving error level for the env-level FAILED
-    keeps CI logs free of false-positive noise.
-
-    Returns the number of environments that were processed (attempted deletion).
-    """
-    max_age = timedelta(hours=max_age_hours)
-    old_envs = find_old_test_environments(max_age)
-
-    if not old_envs:
-        logger.info("No old Modal test environments found (older than {} hours)", max_age_hours)
-        return 0
-
-    logger.info("Found {} old Modal test environments to clean up", len(old_envs))
-
-    for env_name in old_envs:
-        logger.info("Cleaning up old test environment: {}", env_name)
-
-        # Delete all apps in the environment first
-        delete_modal_apps_in_environment(env_name)
-
-        # Then delete all volumes
-        delete_modal_volumes_in_environment(env_name)
-
-        # Finally delete the environment itself. `delete_modal_environment`
-        # already logs at debug/warning for individual outcomes; surface
-        # FAILED at error level here so a stuck safety-net run is greppable
-        # in the CI logs that drive this script.
-        outcome = delete_modal_environment(env_name)
-        match outcome:
-            case ModalCleanupOutcome.DELETED | ModalCleanupOutcome.NOT_FOUND:
-                pass
-            case ModalCleanupOutcome.FAILED:
-                logger.error(
-                    "Safety-net cleanup failed to delete Modal environment {}; leaving it for the next cleanup run.",
-                    env_name,
-                )
-            case _ as unreachable:
-                assert_never(unreachable)
-
-    return len(old_envs)
-
-
-# =============================================================================
 # SSH test utilities
 # =============================================================================
 
@@ -1720,3 +1493,12 @@ def assert_init_first_param_is_provider_name(subclass: type) -> None:
         f"{subclass.__name__}.__init__ provider_name annotation is {provider_name_hint!r}, "
         f"expected ProviderInstanceName"
     )
+
+
+def poll_until_file_contains(path: Path, text: str, timeout: float = 5.0) -> bool:
+    """Poll until ``path`` exists and contains ``text``, returning False on timeout.
+
+    For files written behind a shell process substitution (``2> >(tee ...)``): the shell
+    does not wait for the substitution, so the file can trail the command's exit.
+    """
+    return poll_until(lambda: path.exists() and text in path.read_text(), timeout=timeout)

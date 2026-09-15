@@ -37,6 +37,7 @@ from imbue.mngr.providers.deploy_utils import collect_deploy_files
 from imbue.mngr.providers.deploy_utils import detect_mngr_install_mode as _shared_detect_mngr_install_mode
 from imbue.mngr.providers.deploy_utils import resolve_mngr_install_mode as _shared_resolve_mngr_install_mode
 from imbue.mngr_modal.instance import ModalProviderInstance
+from imbue.mngr_modal.modal_cli import parse_modal_app_listings
 from imbue.mngr_schedule.data_types import ModalScheduleCreationRecord
 from imbue.mngr_schedule.data_types import ScheduleTriggerDefinition
 from imbue.mngr_schedule.data_types import VerifyMode
@@ -310,28 +311,23 @@ def _get_mngr_repo_root() -> Path:
 def get_mngr_dockerfile_path(mode: MngrInstallMode) -> Path:
     """Get the path to the mngr Dockerfile based on the install mode.
 
-    For EDITABLE mode, the Dockerfile is found by navigating from the mngr-schedule
-    source directory to the mngr resources directory within the monorepo.
-    For PACKAGE mode, the Dockerfile is loaded from the installed mngr package
-    via importlib.resources.
+    The Dockerfile is a packaged resource of imbue.mngr (imbue/mngr/resources/
+    Dockerfile), so every mode resolves it from the package location via
+    importlib.resources: for EDITABLE/SKIP installs that lands in the monorepo
+    source tree, and for PACKAGE installs it lands in site-packages. Deriving
+    the path from the package rather than the enclosing git root also works
+    when the monorepo is vendored inside another git repository (where the git
+    root is not the mngr checkout).
     """
     match mode:
-        case MngrInstallMode.EDITABLE | MngrInstallMode.SKIP:
-            mngr_repo_root = _get_mngr_repo_root()
-            dockerfile_path = mngr_repo_root / "libs" / "mngr" / "imbue" / "mngr" / "resources" / "Dockerfile"
-            if not dockerfile_path.exists():
-                raise ScheduleDeployError(
-                    f"mngr Dockerfile not found at {dockerfile_path}. "
-                    "Expected the mngr monorepo to contain libs/mngr/imbue/mngr/resources/Dockerfile."
-                )
-            return dockerfile_path
-        case MngrInstallMode.PACKAGE:
+        case MngrInstallMode.EDITABLE | MngrInstallMode.SKIP | MngrInstallMode.PACKAGE:
             resources_dir = importlib.resources.files(mngr_resources)
             dockerfile_resource = resources_dir / "Dockerfile"
             dockerfile_path = Path(str(dockerfile_resource))
             if not dockerfile_path.exists():
                 raise ScheduleDeployError(
-                    "mngr Dockerfile not found in installed package. The mngr package may be missing its resources."
+                    f"mngr Dockerfile not found at {dockerfile_path}. "
+                    "The imbue.mngr package may be missing its resources."
                 )
             return dockerfile_path
         case MngrInstallMode.AUTO:
@@ -723,14 +719,10 @@ def remove_modal_schedule(
         # guard that would have to decide whether to treat it as "list
         # failed" or "no apps" (see the reverted commits 51151b405 and
         # 4212dadde for why that branching is not obviously correct).
-        apps = json.loads(list_result.stdout)
-        app_id: str | None = None
-        for app in apps:
-            if app.get("Description", "") == app_name:
-                app_id = app.get("App ID", "")
-                break
+        apps = parse_modal_app_listings(json.loads(list_result.stdout))
+        app_id = next((app.app_id for app in apps if app.description == app_name), None)
 
-        if app_id:
+        if app_id is not None:
             with ConcurrencyGroup(name=f"modal-app-stop-{trigger_name}") as cg:
                 stop_result = cg.run_process_to_completion(
                     # --yes: newer Modal CLIs prompt to confirm `app stop` and

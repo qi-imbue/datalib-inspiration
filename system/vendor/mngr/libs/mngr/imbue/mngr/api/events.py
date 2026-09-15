@@ -45,12 +45,27 @@ from imbue.mngr.primitives import HostId
 from imbue.mngr.primitives import ProviderInstanceName
 from imbue.mngr.providers.base_provider import BaseProviderInstance
 from imbue.mngr.utils.cel_utils import apply_cel_filters_to_context
+from imbue.mngr.utils.file_watch import DirectoryWatchGroup
+from imbue.mngr.utils.file_watch import WATCHED_TAIL_FALLBACK_POLL_SECONDS
+from imbue.mngr.utils.file_watch import start_event_forwarder
 from imbue.mngr.utils.jsonl_warn import MalformedJsonLineWarner
 from imbue.mngr.utils.jsonl_warn import split_complete_lines
 
+# Poll interval for tails that cannot be woken by a directory watch: remote
+# (SSH/volume) targets, and local targets whose watch could not be established.
+# This is the delivery latency for those tails, so it must stay short.
 FOLLOW_POLL_INTERVAL_SECONDS: Final[float] = 1.0
 SOURCE_SCAN_INTERVAL_SECONDS: Final[float] = 10.0
 ONLINE_CHECK_INTERVAL_SECONDS: Final[float] = 30.0
+# Interval between the follow loop's host probes while a tail reports that its reads are failing,
+# in place of the regular online-check interval; each probe re-resolves the host handle.
+READ_FAILURE_REPROBE_INTERVAL_SECONDS: Final[float] = 5.0
+# Consecutive failed polls before a tail thread asks the follow loop to re-resolve the host; the
+# first failure or two is often a transient the SSH layer's own retry already covers.
+TAIL_READ_FAILURES_BEFORE_REPROBE: Final[int] = 3
+# Consecutive failed polls after which a tail thread says so at warning level, once, so a follow
+# that has quietly stopped delivering is visible in the log.
+_TAIL_READ_FAILURES_BEFORE_WARNING: Final[int] = 30
 _EVENTS_JSONL_FILENAME: Final[str] = "events.jsonl"
 
 
@@ -205,13 +220,14 @@ def _resolve_host_events_target(address: HostAddress, mngr_ctx: MngrContext) -> 
     # `@HOST.PROVIDER` target skips unrelated providers (the agent path gets
     # the same treatment via discover_by_address).
     provider_names: tuple[str, ...] | None = (str(address.provider),) if address.provider is not None else None
-    host_agents_by_host, _ = discover_hosts_and_agents(
+    outcome = discover_hosts_and_agents(
         mngr_ctx,
         provider_names=provider_names,
         agent_identifiers=None,
         include_destroyed=False,
         reset_caches=False,
     )
+    host_agents_by_host = outcome.agents_by_host
     all_hosts = list(host_agents_by_host.keys())
     host_ref = filter_one_host(address, all_hosts)
 
@@ -472,6 +488,61 @@ def _sort_rotated_files_oldest_first(filenames: Sequence[str]) -> list[str]:
 # =============================================================================
 
 
+COMMON_TRANSCRIPT_SOURCE_SUFFIX: Final[str] = "common_transcript"
+
+
+def find_common_transcript_source(target: EventsTarget) -> str:
+    """Find the event source path ending with 'common_transcript'.
+
+    Discovers all event sources for the target and returns the one whose
+    source_path ends with 'common_transcript' (e.g. 'claude/common_transcript'),
+    so callers do not need to know the agent type prefix. Raises MngrError when
+    there is no such source, or more than one.
+    """
+    sources = discover_event_sources(target)
+    matching_sources = [
+        s
+        for s in sources
+        if (
+            (
+                s.source_path == COMMON_TRANSCRIPT_SOURCE_SUFFIX
+                or s.source_path.endswith(f"/{COMMON_TRANSCRIPT_SOURCE_SUFFIX}")
+            )
+            and not s.source_path.startswith("logs/")
+        )
+    ]
+    if len(matching_sources) == 0:
+        raise MngrError(
+            f"No common transcript found for {target.display_name}. "
+            "The agent may not have produced any transcript events yet."
+        )
+    if len(matching_sources) > 1:
+        source_paths = ", ".join(s.source_path for s in matching_sources)
+        raise MngrError(
+            f"Multiple common transcript sources found for {target.display_name}: {source_paths}. "
+            "This is unexpected -- please report this as a bug."
+        )
+    return matching_sources[0].source_path
+
+
+def read_common_transcript_content(target: EventsTarget) -> tuple[str, str]:
+    """Read the target's common-transcript stream file.
+
+    Returns ``(event_file_name, content)`` where ``event_file_name`` is the
+    path of the stream relative to the events directory (e.g.
+    ``claude/common_transcript/events.jsonl``), suitable for use as a
+    human-readable source description. Raises :class:`MngrError` when the
+    source cannot be found or read.
+    """
+    source_path = find_common_transcript_source(target)
+    event_file_name = f"{source_path}/events.jsonl"
+    try:
+        content = read_event_content(target, event_file_name)
+    except (MngrError, OSError) as e:
+        raise MngrError(f"Failed to read transcript for {target.display_name}: {e}") from e
+    return event_file_name, content
+
+
 def discover_event_sources(target: EventsTarget) -> list[EventSourceInfo]:
     """Find all event sources (subdirectories containing events.jsonl files).
 
@@ -656,7 +727,9 @@ def _start_tail_threads_for_sources(
     cel_exclude_filters: Sequence[Any],
     stop_event: threading.Event,
     online_event: threading.Event,
+    read_failure_event: threading.Event,
     offset_dir_path: Path,
+    watch_group: DirectoryWatchGroup,
 ) -> list[threading.Thread]:
     """Start one persistent tail thread per current events.jsonl file.
 
@@ -675,8 +748,10 @@ def _start_tail_threads_for_sources(
                 cel_exclude_filters=cel_exclude_filters,
                 stop_event=stop_event,
                 online_event=online_event,
+                read_failure_event=read_failure_event,
                 offset_dir_path=offset_dir_path,
                 initial_byte_offset=initial_byte_offsets.get(source.source_path, 0),
+                watch_group=watch_group,
             )
             threads.append(thread)
     return threads
@@ -727,6 +802,9 @@ def stream_all_events(
     online_event = threading.Event()
     if state.is_online:
         online_event.set()
+    # Set by a tail thread whose reads keep failing, so the consume loop re-resolves the host
+    # handle ahead of its regular probe (see _handle_online_offline_transition).
+    read_failure_event = threading.Event()
     # Shared, swappable handle to the current target. The consume loop swaps
     # target_holder[0] on an online/offline transition; the tail threads read
     # it each poll, so they follow the new target without being recreated.
@@ -734,6 +812,9 @@ def stream_all_events(
     event_queue: queue.Queue[EventRecord] = queue.Queue()
     tail_threads: list[threading.Thread] = []
     offset_dir: tempfile.TemporaryDirectory[str] | None = None
+    # Wakes local tail threads on directory changes so their poll interval only
+    # covers missed filesystem events rather than delivery latency.
+    watch_group = DirectoryWatchGroup()
 
     try:
         # Discover sources and read all historical events
@@ -756,7 +837,9 @@ def stream_all_events(
                 cel_exclude_filters,
                 stop_event,
                 online_event,
+                read_failure_event,
                 Path(offset_dir.name),
+                watch_group,
             )
 
         # Rotation guard: re-scan for newly rotated files that appeared during startup
@@ -783,18 +866,23 @@ def stream_all_events(
             cel_exclude_filters=cel_exclude_filters,
             stop_event=stop_event,
             online_event=online_event,
+            read_failure_event=read_failure_event,
             tail_threads=tail_threads,
             offset_dir_path=Path(offset_dir.name) if offset_dir is not None else None,
             source_filters=source_filters,
+            watch_group=watch_group,
         )
 
     finally:
         stop_event.set()
-        # Wake any thread parked on the offline gate so it observes the stop and
-        # exits promptly rather than after a full poll interval.
+        # Wake any thread parked on the offline gate or on a directory-watch
+        # wake event so it observes the stop and exits promptly rather than
+        # after a full poll interval.
         online_event.set()
+        watch_group.wake_all()
         for thread in tail_threads:
             thread.join(timeout=5.0)
+        watch_group.stop()
         if offset_dir is not None:
             offset_dir.cleanup()
 
@@ -863,8 +951,10 @@ def _start_tail_thread(
     cel_exclude_filters: Sequence[Any],
     stop_event: threading.Event,
     online_event: threading.Event,
+    read_failure_event: threading.Event,
     offset_dir_path: Path,
     initial_byte_offset: int,
+    watch_group: DirectoryWatchGroup,
 ) -> threading.Thread:
     """Start a persistent daemon thread that tails one source into the queue.
 
@@ -889,8 +979,10 @@ def _start_tail_thread(
             cel_exclude_filters,
             stop_event,
             online_event,
+            read_failure_event,
             offset_dir_path,
             initial_byte_offset,
+            watch_group,
         ),
         daemon=True,
     )
@@ -1024,8 +1116,10 @@ def _tail_source_thread(
     cel_exclude_filters: Sequence[Any],
     stop_event: threading.Event,
     online_event: threading.Event,
+    read_failure_event: threading.Event,
     offset_dir_path: Path,
     initial_byte_offset: int,
+    watch_group: DirectoryWatchGroup,
 ) -> None:
     """Persistent per-source tail thread for the whole follow session.
 
@@ -1037,18 +1131,36 @@ def _tail_source_thread(
     its reader and re-reads from the start; ``emitted_event_ids`` dedup in the
     consume loop suppresses anything already emitted, so the re-read never
     double-emits.
+
+    Pacing: a local source directory is watched via ``watch_group``, so the
+    thread sleeps until something in the directory changes and its fallback
+    interval only covers missed filesystem events. Remote sources (and local
+    ones whose watch could not be established) keep the short poll, which is
+    their delivery latency. Setting ``stop_event`` wakes and stops the loop
+    immediately in every branch (a parked forwarder thread bridges it to the
+    wake event, as in the discovery tail).
+
+    A read that keeps failing is reported through ``read_failure_event`` rather
+    than retried in silence: the handle this thread reads through can go dead
+    while the host stays online (a Docker restart re-maps the SSH port), and only
+    the consume loop can swap in a re-resolved one.
     """
     warner = MalformedJsonLineWarner(source_description=f"event source '{source_path}'")
     byte_offset = initial_byte_offset
+    consecutive_read_failures = 0
+    wake_event = threading.Event()
+    start_event_forwarder(stop_event, wake_event, name=f"events-tail-stop-forwarder-{source_path}")
+    watched_dir: Path | None = None
     # Seed the switch-detection key from the target the thread was created
     # against, so the first online poll on the initial target uses the
     # pre-written offset rather than treating it as a switch (which would reset).
     last_plan = _resolve_read_plan(target_holder[0], source_path)
 
     while not stop_event.is_set():
-        # Pause all I/O while offline; wake periodically to re-check shutdown.
+        # Pause all I/O while offline. Coming back online (and shutdown) set the
+        # gate, so the timeout only bounds how late a missed set is noticed.
         if not online_event.is_set():
-            online_event.wait(timeout=FOLLOW_POLL_INTERVAL_SECONDS)
+            online_event.wait(timeout=WATCHED_TAIL_FALLBACK_POLL_SECONDS)
             continue
 
         plan = _resolve_read_plan(target_holder[0], source_path)
@@ -1066,6 +1178,18 @@ def _tail_source_thread(
                 _write_pygtail_offset_file(events_file_path, source_path, offset_dir_path, 0)
             last_plan = plan
 
+        # Keep the directory watch bound to the current plan: watch a local
+        # source's directory, drop the watch when the plan turns remote.
+        desired_watch_dir = events_file_path.parent if is_local else None
+        if desired_watch_dir != watched_dir:
+            if watched_dir is not None:
+                watch_group.unwatch(watched_dir, wake_event)
+            if desired_watch_dir is not None:
+                watched_dir = desired_watch_dir if watch_group.watch(desired_watch_dir, wake_event) else None
+            else:
+                watched_dir = None
+
+        is_read_ok = False
         try:
             if is_local:
                 _read_local_source_once(
@@ -1088,13 +1212,63 @@ def _tail_source_thread(
                     cel_include_filters,
                     cel_exclude_filters,
                 )
+            is_read_ok = True
         except (MngrError, OSError, IOError) as e:
-            logger.trace("Tail read error for source '{}': {}", source_path, e)
+            consecutive_read_failures += 1
+            if consecutive_read_failures == 1:
+                logger.debug("Tail read failed for source '{}': {}", source_path, e)
+            elif consecutive_read_failures == _TAIL_READ_FAILURES_BEFORE_WARNING:
+                logger.warning(
+                    "Tail reads for source '{}' have failed {} times in a row (last: {}); "
+                    "re-resolving the host until a read succeeds",
+                    source_path,
+                    consecutive_read_failures,
+                    e,
+                )
+            else:
+                logger.trace("Tail read error for source '{}': {}", source_path, e)
+            if consecutive_read_failures >= TAIL_READ_FAILURES_BEFORE_REPROBE:
+                read_failure_event.set()
+        if is_read_ok and consecutive_read_failures > 0:
+            logger.debug(
+                "Tail reads for source '{}' recovered after {} failure(s)", source_path, consecutive_read_failures
+            )
+            consecutive_read_failures = 0
 
-        stop_event.wait(timeout=FOLLOW_POLL_INTERVAL_SECONDS)
+        if watched_dir is not None:
+            # A change landing between the clear below and the next read sets
+            # the event again, so the next wait returns immediately -- no loss.
+            wake_event.wait(timeout=WATCHED_TAIL_FALLBACK_POLL_SECONDS)
+            wake_event.clear()
+        else:
+            stop_event.wait(timeout=FOLLOW_POLL_INTERVAL_SECONDS)
 
 
-_QUEUE_POLL_INTERVAL_SECONDS: Final[float] = 0.1
+@pure
+def _online_check_interval(is_read_failing: bool) -> float:
+    """How long the consume loop waits between host probes: short while a tail cannot read."""
+    return READ_FAILURE_REPROBE_INTERVAL_SECONDS if is_read_failing else ONLINE_CHECK_INTERVAL_SECONDS
+
+
+@pure
+def _seconds_until_next_housekeeping(
+    now: float,
+    last_source_scan_time: float,
+    last_online_check_time: float,
+    is_online: bool,
+    is_read_failing: bool,
+) -> float:
+    """How long the consume loop may block on the queue before a periodic duty is due.
+
+    The queue get returns the moment an event arrives, so this bounds only the
+    housekeeping cadence -- the new-source rescan (online targets only) and the
+    online/offline probe -- never event delivery latency. Clamped at zero so an
+    overdue duty makes the get non-blocking rather than raising.
+    """
+    deadlines = [last_online_check_time + _online_check_interval(is_read_failing)]
+    if is_online:
+        deadlines.append(last_source_scan_time + SOURCE_SCAN_INTERVAL_SECONDS)
+    return max(0.0, min(deadlines) - now)
 
 
 def _consume_event_queue(
@@ -1106,58 +1280,95 @@ def _consume_event_queue(
     cel_exclude_filters: Sequence[Any],
     stop_event: threading.Event,
     online_event: threading.Event,
+    read_failure_event: threading.Event,
     tail_threads: list[threading.Thread],
     offset_dir_path: Path | None,
+    watch_group: DirectoryWatchGroup,
     source_filters: Sequence[str] = (),
 ) -> None:
-    """Consume events from the queue, periodically re-scanning for new sources and checking online/offline."""
+    """Consume events from the queue, periodically re-scanning for new sources and checking online/offline.
+
+    The queue get blocks until an event arrives or the next housekeeping
+    deadline passes, so an idle stream wakes only for housekeeping (every
+    SOURCE_SCAN_INTERVAL_SECONDS / ONLINE_CHECK_INTERVAL_SECONDS, the latter
+    shortened to READ_FAILURE_REPROBE_INTERVAL_SECONDS while a tail reports
+    failing reads) rather than on a short fixed poll. Housekeeping runs
+    whenever its deadline has passed -- also under a continuous event stream,
+    which a queue-empty-gated design would starve.
+    """
     state.last_source_scan_time = time.monotonic()
     last_online_check_time = time.monotonic()
+    # Holds the shortened probe interval from a probe that answered failing reads until one that
+    # did not: the flag is cleared at each probe and a still-failing tail only raises it again on
+    # its next poll, so the flag alone would let the wait right after a probe fall back to the
+    # regular interval.
+    is_last_probe_for_failing_reads = False
 
     while not stop_event.is_set():
-        # Drain available events from the queue
+        timeout = _seconds_until_next_housekeeping(
+            now=time.monotonic(),
+            last_source_scan_time=state.last_source_scan_time,
+            last_online_check_time=last_online_check_time,
+            is_online=state.is_online,
+            is_read_failing=read_failure_event.is_set() or is_last_probe_for_failing_reads,
+        )
+        event: EventRecord | None
         try:
-            event = event_queue.get(timeout=_QUEUE_POLL_INTERVAL_SECONDS)
+            event = event_queue.get(timeout=timeout)
         except queue.Empty:
-            now = time.monotonic()
+            event = None
 
-            # Periodically re-scan for new source directories. A new source
-            # directory only appears when the agent writes a new kind of event,
-            # which requires a running (online) host, so while the target is
-            # offline we skip the scan and its per-directory listing cost. When
-            # the host returns, _handle_online_offline_transition flips the gate
-            # back on and the next scan picks up any genuinely new sources.
-            if state.is_online and now - state.last_source_scan_time > SOURCE_SCAN_INTERVAL_SECONDS:
-                _rescan_and_start_new_tail_threads(
-                    target_holder=target_holder,
-                    state=state,
-                    event_queue=event_queue,
-                    cel_include_filters=cel_include_filters,
-                    cel_exclude_filters=cel_exclude_filters,
-                    stop_event=stop_event,
-                    online_event=online_event,
-                    tail_threads=tail_threads,
-                    offset_dir_path=offset_dir_path,
-                    source_filters=source_filters,
-                )
-                state.last_source_scan_time = now
+        if event is not None and event.event_id not in state.emitted_event_ids:
+            state.emitted_event_ids.add(event.event_id)
+            _maybe_emit_source_mismatch_warning(event, state.warned_incorrect_sources, on_event)
+            on_event(event)
 
-            # Periodically check for online/offline transitions
-            if now - last_online_check_time > ONLINE_CHECK_INTERVAL_SECONDS:
-                _handle_online_offline_transition(
-                    target_holder=target_holder,
-                    state=state,
-                    online_event=online_event,
-                )
-                last_online_check_time = now
+        now = time.monotonic()
 
-            continue
+        # Re-scan for new source directories when due. A new source directory
+        # only appears when the agent writes a new kind of event, which requires
+        # a running (online) host, so while the target is offline we skip the
+        # scan and its per-directory listing cost. When the host returns,
+        # _handle_online_offline_transition flips the gate back on and the next
+        # scan picks up any genuinely new sources.
+        if state.is_online and now - state.last_source_scan_time > SOURCE_SCAN_INTERVAL_SECONDS:
+            _rescan_and_start_new_tail_threads(
+                target_holder=target_holder,
+                state=state,
+                event_queue=event_queue,
+                cel_include_filters=cel_include_filters,
+                cel_exclude_filters=cel_exclude_filters,
+                stop_event=stop_event,
+                online_event=online_event,
+                read_failure_event=read_failure_event,
+                tail_threads=tail_threads,
+                offset_dir_path=offset_dir_path,
+                source_filters=source_filters,
+                watch_group=watch_group,
+            )
+            state.last_source_scan_time = now
 
-        if event.event_id in state.emitted_event_ids:
-            continue
-        state.emitted_event_ids.add(event.event_id)
-        _maybe_emit_source_mismatch_warning(event, state.warned_incorrect_sources, on_event)
-        on_event(event)
+        # Check for online/offline transitions when due -- sooner while a tail reports failing
+        # reads, since the handle it holds may be dead under a host that is still online.
+        if now - last_online_check_time > _online_check_interval(
+            read_failure_event.is_set() or is_last_probe_for_failing_reads
+        ):
+            is_read_failing = read_failure_event.is_set()
+            # Cleared before the probe: a failure landing after this point is a fresh signal for
+            # the next probe, so a swap that did not help is retried rather than forgotten.
+            read_failure_event.clear()
+            is_transitioned = _handle_online_offline_transition(
+                target_holder=target_holder,
+                state=state,
+                online_event=online_event,
+                is_read_failing=is_read_failing,
+            )
+            if is_transitioned:
+                # Wake watched tails so they re-resolve the swapped target now
+                # instead of at their fallback interval.
+                watch_group.wake_all()
+            last_online_check_time = now
+            is_last_probe_for_failing_reads = is_read_failing
 
 
 def _rescan_and_start_new_tail_threads(
@@ -1168,8 +1379,10 @@ def _rescan_and_start_new_tail_threads(
     cel_exclude_filters: Sequence[Any],
     stop_event: threading.Event,
     online_event: threading.Event,
+    read_failure_event: threading.Event,
     tail_threads: list[threading.Thread],
     offset_dir_path: Path | None,
+    watch_group: DirectoryWatchGroup,
     source_filters: Sequence[str] = (),
 ) -> None:
     """Re-scan for new event source directories and start tail threads for them."""
@@ -1205,8 +1418,10 @@ def _rescan_and_start_new_tail_threads(
                 cel_exclude_filters=cel_exclude_filters,
                 stop_event=stop_event,
                 online_event=online_event,
+                read_failure_event=read_failure_event,
                 offset_dir_path=offset_dir_path,
                 initial_byte_offset=byte_offsets.get(source.source_path, 0),
+                watch_group=watch_group,
             )
             tail_threads.append(thread)
 
@@ -1243,29 +1458,44 @@ def _handle_online_offline_transition(
     target_holder: list[EventsTarget],
     state: _AllEventsStreamState,
     online_event: threading.Event,
-) -> None:
+    is_read_failing: bool,
+) -> bool:
     """Detect an online/offline transition and update shared state accordingly.
 
     On a net change this swaps ``target_holder[0]`` to the refreshed target and
-    sets/clears ``online_event``. The persistent tail threads read both on their
-    next poll: they follow the new target and either resume reading (online) or
-    park doing no I/O (offline). No threads are created or torn down here -- that
-    churn, and its teardown races, is gone. Event deduplication via
-    ``emitted_event_ids`` ensures no events are emitted twice when tailing
-    resumes (a thread re-reads its source from the start after the switch).
+    sets/clears ``online_event``, and returns True so the caller can wake the
+    tail threads (a watched tail otherwise notices the swap only at its fallback
+    interval). The persistent tail threads read both on their next poll: they
+    follow the new target and either resume reading (online) or park doing no
+    I/O (offline). No threads are created or torn down here -- that churn, and
+    its teardown races, is gone. Event deduplication via ``emitted_event_ids``
+    ensures no events are emitted twice when tailing resumes (a thread re-reads
+    its source from the start after the switch).
+
+    ``is_read_failing`` covers the restart no state flip announces: a host that
+    went down and came back between two probes (a Docker restart, which also
+    re-maps the SSH port) is online before and after, yet the handle the tails
+    hold is dead. When the tails report failing reads, the refreshed target is
+    adopted whenever its handle is not the one the tails hold, even though the
+    state did not change. The tails keep their offsets, since the file itself
+    did not move.
     """
     target = target_holder[0]
     try:
         new_target = refresh_events_target(target)
     except (MngrError, OSError) as e:
         logger.trace("Failed to check online status: {}", e)
-        return
+        return False
 
     was_online = state.is_online
     is_now_online = isinstance(new_target.host, OnlineHostInterface)
 
     if was_online == is_now_online:
-        return
+        if is_now_online and is_read_failing and new_target.host is not target.host:
+            logger.debug("Target {} re-resolved after failing reads", target.display_name)
+            target_holder[0] = new_target
+            return True
+        return False
 
     logger.debug(
         "Target {} {}",
@@ -1279,3 +1509,4 @@ def _handle_online_offline_transition(
         online_event.set()
     else:
         online_event.clear()
+    return True

@@ -13,8 +13,10 @@ from imbue.mngr.primitives import TransferMode
 from imbue.mngr_mapreduce.data_types import AgentKind
 from imbue.mngr_mapreduce.data_types import LaunchConfig
 from imbue.mngr_mapreduce.launching import ROLE_LABEL_KEY
+from imbue.mngr_mapreduce.launching import TASK_ID_LABEL_KEY
 from imbue.mngr_mapreduce.launching import _build_agent_options
 from imbue.mngr_mapreduce.launching import _make_reducer_identity
+from imbue.mngr_mapreduce.launching import is_host_pool_failure_ratio_exceeded
 
 
 def _make_config(
@@ -103,6 +105,29 @@ def test_build_agent_options_stamps_role_label_for_each_kind() -> None:
         assert opts.label_options.labels.get(ROLE_LABEL_KEY) == kind.value
 
 
+# A TMR task id is a pytest node id, so the label value carries slashes,
+# colons and brackets.
+_PYTEST_NODE_ID_TASK_ID = "libs/mngr/imbue/mngr/api/create_test.py::test_create_agent[modal-snapshot]"
+
+
+def test_build_agent_options_stamps_task_id_label_on_a_mapper() -> None:
+    """The reintegrate flow keys mappers by this label, so every mapper must carry it."""
+    opts = _build_agent_options(
+        AgentName("test"), "branch", _make_config(), AgentKind.MAPPER, task_id=_PYTEST_NODE_ID_TASK_ID
+    )
+    assert opts.label_options.labels == {
+        ROLE_LABEL_KEY: AgentKind.MAPPER.value,
+        TASK_ID_LABEL_KEY: _PYTEST_NODE_ID_TASK_ID,
+    }
+
+
+def test_build_agent_options_omits_task_id_label_for_the_reducer_and_snapshotter() -> None:
+    """Neither agent belongs to a task, and reintegrate selects on the role label alone."""
+    for kind in (AgentKind.REDUCER, AgentKind.SNAPSHOTTER):
+        opts = _build_agent_options(AgentName("test"), "branch", _make_config(), kind)
+        assert TASK_ID_LABEL_KEY not in opts.label_options.labels
+
+
 def test_build_agent_options_target_path_pins_work_dir() -> None:
     opts = _build_agent_options(
         AgentName("test"), "branch", _make_config("modal"), AgentKind.MAPPER, target_path=Path("/code")
@@ -179,3 +204,28 @@ def test_reducer_suffix_distinguishes_a_reintegration() -> None:
     _, reintegrated, _ = _make_reducer_identity("tmr-mngr", "20260721085455", "r12345")
     assert reintegrated == "tmr-mngr/20260721085455/reducer-r12345"
     assert reintegrated != original
+
+
+# --- host pool failure ratio ---
+
+
+def test_full_host_pool_is_accepted() -> None:
+    assert not is_host_pool_failure_ratio_exceeded(created_host_count=87, requested_host_count=87)
+
+
+def test_host_pool_missing_under_a_third_is_accepted() -> None:
+    assert not is_host_pool_failure_ratio_exceeded(created_host_count=80, requested_host_count=87)
+
+
+def test_host_pool_missing_exactly_a_third_is_rejected() -> None:
+    assert is_host_pool_failure_ratio_exceeded(created_host_count=2, requested_host_count=3)
+
+
+def test_collapsed_host_pool_is_rejected() -> None:
+    """The shape of the 20260823 TMR run: 5 of 87 hosts, which put ~69 agents on each survivor."""
+    assert is_host_pool_failure_ratio_exceeded(created_host_count=5, requested_host_count=87)
+
+
+def test_no_requested_hosts_is_accepted() -> None:
+    """A run with nothing to place (no tasks, or a local provider) has no pool to judge."""
+    assert not is_host_pool_failure_ratio_exceeded(created_host_count=0, requested_host_count=0)

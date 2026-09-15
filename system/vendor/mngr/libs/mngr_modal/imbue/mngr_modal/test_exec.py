@@ -50,17 +50,27 @@ def _exec_on_agent(
     args = ["uv", "run", "mngr", "exec", agent_name, command]
     if extra_args:
         args.extend(extra_args)
+    # The first exec after create establishes the SSH connection, and a fresh
+    # Modal sandbox transiently accepts TCP before sshd answers the banner.
+    # mngr's bounded banner-retry rides out the common case but can outlast a
+    # tight bound, so give a valid-but-slow exec generous headroom -- still well
+    # under the per-test 300s pytest timeout, which remains the hang backstop.
     return subprocess.run(
         args,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
         env=modal_subprocess_env.env,
     )
 
 
 @pytest.mark.acceptance
 @pytest.mark.rsync
+# Creating the agent deploys the snapshot_and_shutdown function into the shared
+# Modal app, which races concurrent deploys from the rest of the suite; the
+# deploy's own bounded retry can be exhausted under load, so offload retries the
+# whole test.
+@pytest.mark.flaky
 @pytest.mark.timeout(300)
 def test_exec_echo_on_modal(
     temp_source_dir: Path,
@@ -78,6 +88,8 @@ def test_exec_echo_on_modal(
 
 @pytest.mark.acceptance
 @pytest.mark.rsync
+# Same shared-Modal-app deploy race as test_exec_echo_on_modal.
+@pytest.mark.flaky
 @pytest.mark.timeout(300)
 def test_exec_cwd_override_on_modal(
     temp_source_dir: Path,
@@ -95,6 +107,8 @@ def test_exec_cwd_override_on_modal(
 
 @pytest.mark.acceptance
 @pytest.mark.rsync
+# Same shared-Modal-app deploy race as test_exec_echo_on_modal.
+@pytest.mark.flaky
 @pytest.mark.timeout(300)
 def test_exec_failure_propagates_exit_code_on_modal(
     temp_source_dir: Path,
@@ -111,6 +125,8 @@ def test_exec_failure_propagates_exit_code_on_modal(
 
 @pytest.mark.acceptance
 @pytest.mark.rsync
+# Same shared-Modal-app deploy race as test_exec_echo_on_modal.
+@pytest.mark.flaky
 @pytest.mark.timeout(300)
 def test_exec_json_output_on_modal(
     temp_source_dir: Path,

@@ -19,6 +19,7 @@ from pydantic import Field
 from imbue.imbue_common.mutable_model import MutableModel
 from imbue.mngr.config.data_types import AgentTypeConfig
 from imbue.mngr.config.data_types import MngrContext
+from imbue.mngr.errors import MngrError
 from imbue.mngr.errors import SendMessageError
 from imbue.mngr.interfaces.data_types import FileTransferSpec
 from imbue.mngr.interfaces.live_output import LiveOutputReader
@@ -160,6 +161,15 @@ class AgentInterface(MutableModel, ABC, Generic[AgentConfigT]):
         is the local machine.
         """
         return LifecycleProbeResult(state=self.get_lifecycle_state())
+
+    def is_blocked_on_dialog(self) -> bool:
+        """Whether the agent is holding on a dialog only the user can answer.
+
+        Such an agent's lifecycle is WAITING rather than RUNNING. Best-effort: each agent
+        type detects the dialogs it knows about, so False means none was detected, not
+        that none is open.
+        """
+        return False
 
     @abstractmethod
     def get_initial_message(self) -> str | None:
@@ -501,16 +511,18 @@ class HasCommonTranscriptMixin(HasTranscriptMixin):
 
     Subclasses promise to produce a JSONL transcript at
     ``$MNGR_AGENT_STATE_DIR/events/<agent_type>/common_transcript/events.jsonl``
-    using the shared event envelope (``timestamp``, ``type``, ``event_id``,
-    ``source``) and one of three message types: ``user_message``,
-    ``assistant_message``, ``tool_result``. ``mngr transcript`` discovers
-    any such file regardless of agent type, so any agent that satisfies
-    this contract gets ``mngr transcript`` support for free.
+    in the ATIF-shaped stream format defined by
+    :mod:`imbue.mngr.agents.common_transcript_records`: a ``header`` line pinning
+    the ATIF revision, then one ``step`` record per turn and an ``observation``
+    record per streamed tool result. ``mngr transcript`` discovers any such file
+    regardless of agent type, so any agent that satisfies this contract gets
+    ``mngr transcript`` support for free.
 
-    Because the common schema is lossy (truncated previews, dropped
-    metadata), the converter always runs on top of the raw transcript
-    captured by :class:`HasTranscriptMixin`. Subclasses therefore inherit
-    from that mixin and must also implement ``get_raw_transcript_scripts``.
+    The stream is full-fidelity (complete tool arguments and outputs), but it is
+    an agent-agnostic projection of the native transcript, so the converter always
+    runs on top of the raw transcript captured by :class:`HasTranscriptMixin`.
+    Subclasses therefore inherit from that mixin and must also implement
+    ``get_raw_transcript_scripts``.
 
     Subclasses implement ``get_common_transcript_scripts`` to return the
     per-agent converter scripts that read the raw transcript and write to
@@ -763,6 +775,76 @@ def require_interactive_agent(agent: AgentInterface[Any]) -> InteractiveAgentMix
         raise SendMessageError(
             str(agent.name), f"agent type '{agent.agent_type}' does not accept interactive messages"
         )
+    return agent
+
+
+class HasCompactionMixin(ABC):
+    """Mixin for agent types that support context compaction.
+
+    Context compaction reduces or summarizes past conversation turns so the agent
+    can stay within model context limits and benefit from fresh prompt cache windows.
+    Harnesses implement this mixin to expose their compaction command/API, their
+    model's prompt cache TTL (in minutes), and (optionally) turn prompt token counts.
+    """
+
+    @abstractmethod
+    def request_compaction(self, instructions: str | None = None) -> None:
+        """Request the agent to perform context compaction.
+
+        Some agents support passing additional free-form instructions to the
+        compaction command. Agents that support additional compaction instructions
+        will pass the instructions string on if provided, while agents that don't
+        support it will silently ignore it.
+        """
+        ...
+
+    def get_cache_ttl_minutes(self) -> int | None:
+        """Return the context cache TTL in minutes for the agent's current model/harness, or None if unknown."""
+        return None
+
+    def get_context_tokens(self) -> int | None:
+        """Return the total prompt context token count from the agent's most recent turn, or None if unknown/unsupported."""
+        return None
+
+    def get_idle_since(self) -> datetime | None:
+        """Return the UTC timestamp when the agent last became idle, or None if actively running/unknown."""
+        return None
+
+
+def require_compaction_agent(agent: AgentInterface[Any]) -> HasCompactionMixin:
+    """Return ``agent`` narrowed to :class:`HasCompactionMixin`, or raise if it does not support compaction."""
+    if not isinstance(agent, HasCompactionMixin):
+        raise MngrError(f"Agent '{agent.name}' of type '{agent.agent_type}' does not support context compaction")
+    return agent
+
+
+class SupportsKeyChordMixin(ABC):
+    """Mixin for agent types whose runtime lives in a tmux pane we can press keys into.
+
+    The contract is a single ``press_key_chord`` that delivers ONE tmux key token
+    (e.g. ``"M-q"``, ``"C-c"``) into the agent's pane, serialized against concurrent
+    text sends by the same per-agent message lock. Only keystroke-driven agents
+    (``SendKeysAgent`` / ``InteractiveTuiAgent``) can honor it -- headless and
+    server/extension-driven agents (opencode, pi) drive their input over an API and
+    have no pane to press into, so they do not inherit this. Callers narrow with
+    ``require_key_chord_agent`` to refuse those with a clear error.
+    """
+
+    @abstractmethod
+    def press_key_chord(self, key: str) -> None:
+        """Press a single tmux key token (e.g. ``"M-q"``) in the running agent's pane."""
+        ...
+
+
+def require_key_chord_agent(agent: AgentInterface[Any]) -> SupportsKeyChordMixin:
+    """Return ``agent`` narrowed to :class:`SupportsKeyChordMixin`, or raise if it takes no key chords.
+
+    Used by the key-chord delivery path (``send_key_chord_to_agents``) to refuse an
+    agent type whose input is not a tmux pane (headless, or an API-driven harness)
+    with a clear error rather than an attribute error.
+    """
+    if not isinstance(agent, SupportsKeyChordMixin):
+        raise SendMessageError(str(agent.name), f"agent type '{agent.agent_type}' does not accept key chords")
     return agent
 
 

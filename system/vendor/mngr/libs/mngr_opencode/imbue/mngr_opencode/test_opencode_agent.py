@@ -112,7 +112,7 @@ class _OpenCodeReleaseProfile(AgentReleaseProfile):
 
         work_dir = tmp_path / "work"
         init_git_repo(work_dir, initial_commit=True)
-        return AgentReleaseContext(env=env, workspace=work_dir, host_dir=Path(env["MNGR_HOST_DIR"]))
+        return AgentReleaseContext(env=env, project_dir=work_dir, host_dir=Path(env["MNGR_HOST_DIR"]))
 
     def create_extra_args(self, ctx: AgentReleaseContext) -> Sequence[str]:
         # auto_allow_permissions injects a wildcard permission allow so the forced bash
@@ -120,7 +120,7 @@ class _OpenCodeReleaseProfile(AgentReleaseProfile):
         return [
             "--no-ensure-clean",
             "--source",
-            str(ctx.workspace),
+            str(ctx.project_dir),
             "-S",
             "agent_types.opencode.auto_allow_permissions=true",
         ]
@@ -191,11 +191,11 @@ def test_opencode_waiting_reason_reports_permissions(tmp_path: Path) -> None:
     Under a ``bash: ask`` policy a bash tool call blocks on an approval prompt; the
     lifecycle plugin raises ``permissions_waiting`` on opencode's real
     ``permission.asked`` event, which is what the ``waiting_reason`` field generator
-    reports as ``PERMISSIONS`` (and what promotes the agent RUNNING -> WAITING). This is
-    the only check that exercises that event wiring against the live opencode binary --
-    the sdk type stubs disagree with the binary on the event name, so a unit test alone
-    would not catch a regression to the real contract. The idle-side ``END_OF_TURN``
-    (marker absent) is asserted right after create.
+    reports as ``PERMISSIONS`` (and what makes the lifecycle read WAITING rather than
+    RUNNING). This is the only check that exercises that event wiring against the live
+    opencode binary -- the sdk type stubs disagree with the binary on the event name, so
+    a unit test alone would not catch a regression to the real contract. The idle-side
+    ``END_OF_TURN`` (marker absent) is asserted right after create.
     """
     profile = _OpenCodePermissionReleaseProfile()
     reason = profile.unavailable_reason()
@@ -237,8 +237,8 @@ def test_opencode_waiting_reason_reports_permissions(tmp_path: Path) -> None:
         assert poll_until(
             condition=permissions_marker.exists, timeout=_PERMISSION_MARKER_TIMEOUT_SECONDS, poll_interval=0.5
         ), "permissions_waiting never appeared -> opencode never reported a blocking approval prompt"
-        # The session stays busy (active present) while a prompt is open, so the base
-        # state is RUNNING and get_lifecycle_state promotes it to WAITING.
+        # The session stays busy (active present) while a prompt is open; the block
+        # marker is what makes the lifecycle read WAITING rather than RUNNING.
         assert active_marker.exists(), "expected the active marker present while blocked on an approval prompt"
     finally:
         profile.run_mngr(ctx, "destroy", agent_name, "--force", timeout=_LIFECYCLE_TIMEOUT_SECONDS)

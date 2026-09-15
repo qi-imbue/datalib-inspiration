@@ -15,7 +15,7 @@
 #     context even though it's never committed.
 [private]
 _generate-dockerignore:
-    grep -vE '^/?\.dockerignore$|^/libs/mngr/imbue/mngr/resources/Dockerfile\.release$' .gitignore > .dockerignore
+    bash scripts/generate_dockerignore.sh
 
 # Generate Dockerfile.release from Dockerfile + Dockerfile.release.extras so the
 # two Dockerfiles stay in sync without duplicating the base layers. Strips the
@@ -36,8 +36,10 @@ _generate-release-dockerfile:
 test-offload args="":
     #!/bin/bash
     set -ueo pipefail
-    : "${MODAL_TOKEN_ID:?must be set}"
-    : "${MODAL_TOKEN_SECRET:?must be set}"
+    # No MODAL_TOKEN_ID / MODAL_TOKEN_SECRET check here: this recipe passes them
+    # nowhere. offload's Modal client resolves credentials itself, the same way
+    # the `modal` CLI does -- the environment first (CI injects the pair), else
+    # ~/.modal.toml -- so demanding them here only blocks local runs.
     just _generate-dockerignore
     trap "rm -f .dockerignore" EXIT
     offload -c offload-modal.toml run --trace \
@@ -213,40 +215,68 @@ tmr-mngr *args:
 tmr-minds *args:
   uv run --project libs/mngr_tmr mngr tmr apps/minds --name tmr-minds --mapper-prompt apps/minds/tmr/mapper.j2 {{args}} -- -m 'release and not minds_deployment and not minds_services and not minds_snapshot_resume'
 
+# minds behavior corpus (`mngr tmr-behaviors`: one agent per feature file, creating
+# and updating the tests that witness the behaviors). No testing flags after `--`:
+# behavior mappers run the specific witness tests they touch by node id, and
+# host-capability guardrails live in the variant prompt's infra_blockers block.
+[group("minds test")]
+tmr-behaviors-minds *args:
+  uv run --project libs/mngr_tmr mngr tmr-behaviors --root apps/minds/behaviors --name tmr-behaviors-minds --mapper-prompt apps/minds/tmr/behaviors_mapper.j2 {{args}}
+
 # === minds deployment / services test orchestrator ===
-# Wraps apps/minds/scripts/test_deployments.py. See specs/minds-deployment-tests.md
+# Wraps apps/minds_admin/scripts/test_deployments.py. See specs/minds-deployment-tests.md
 # and apps/minds/deployment_tests/README.md for the full design + usage.
 
 # Full run: shared env stand-up + sequential pytest x2 + teardown.
+# MINDS_ALLOW_EMPTY_POOL=1: this flow mints a fresh shared env with no bake
+# stage, so its pool is empty by construction -- the pool-consuming tests skip
+# here instead of failing (use `minds-test-deployment-up` + `bake-ci-slices`
+# to run them for real; the CI release flow never sets this, where an empty
+# pool means the bake stage broke and must fail).
 [group("minds test")]
 minds-test-deployment *args:
-  uv run python apps/minds/scripts/test_deployments.py run {{args}}
+  MINDS_ALLOW_EMPTY_POOL=1 uv run python apps/minds_admin/scripts/test_deployments.py run {{args}}
 
 # Wipe everything from prior runs that the ledger still tracks as active or leaked.
 [group("minds test")]
 minds-test-deployment-cleanup:
-  uv run python apps/minds/scripts/test_deployments.py cleanup
+  uv run python apps/minds_admin/scripts/test_deployments.py cleanup
 
 # Local iterate: stand up one shared env + print a ready-to-paste pytest command.
 [group("minds test")]
 minds-test-deployment-up role="default":
-  uv run python apps/minds/scripts/test_deployments.py up "{{role}}"
+  uv run python apps/minds_admin/scripts/test_deployments.py up "{{role}}"
 
 # Local iterate: tear down whatever `minds-test-deployment-up` last stood up.
 [group("minds test")]
 minds-test-deployment-down role="default":
-  uv run python apps/minds/scripts/test_deployments.py down "{{role}}"
+  uv run python apps/minds_admin/scripts/test_deployments.py down "{{role}}"
 
 # Point minds_services tests at an already-deployed dev env (e.g. dev-josh).
+# MINDS_ALLOW_EMPTY_POOL=1: an arbitrary dev env may legitimately have no baked
+# pool capacity, so the pool-consuming tests skip there instead of failing (the
+# CI release flow never sets it -- an empty pool there means the bake stage
+# broke and must fail). See specs/remote-workspaces-in-ci.md.
 [group("minds test")]
 minds-test-services-against env_name *tests:
-  uv run python apps/minds/scripts/test_deployments.py services-against "{{env_name}}" {{tests}}
+  MINDS_ALLOW_EMPTY_POOL=1 uv run python apps/minds_admin/scripts/test_deployments.py services-against "{{env_name}}" {{tests}}
+
+# Pre-bake leasable pool slices for the env `minds-test-deployment-up` stood up
+# (the local twin of CI's bake stage): sweep stale CI slices, import the standing
+# CI boxes into the env's DB, bake from the given template ref (or --template-dir),
+# and record the stamped repo_branch_or_tag for the pool tests to lease against.
+# Slices are CONSUMED by each test's release, so top up between re-runs (warm
+# content re-bakes in minutes). See specs/remote-workspaces-in-ci.md.
+#   just bake-ci-slices --count 2 --template-dir "$PWD/.external_worktrees/default-workspace-template"
+[group("minds test")]
+bake-ci-slices *args:
+  uv run python apps/minds_admin/scripts/test_deployments.py bake-pool {{args}}
 
 # Run only the minds_deployment pytest batch (each test mints its own ephemeral env).
 # No shared env stand-up, no mail.tm account -- fast iteration for the deploy tests.
 [group("minds test")]
 minds-test-deployment-only *tests:
-  uv run python apps/minds/scripts/test_deployments.py deployment-only {{tests}}
+  uv run python apps/minds_admin/scripts/test_deployments.py deployment-only {{tests}}
 
 # End-to-end acceptance test that drives the real Electron minds app to create
 # a local Docker workspace from default-workspace-template (which boots with no
@@ -256,16 +286,14 @@ minds-test-deployment-only *tests:
 # with a real display can run the underlying pytest directly without xvfb-run.
 # Requires apps/minds/node_modules/ (`cd apps/minds && pnpm install`) and a real
 # ANTHROPIC_API_KEY exported (the key is typed into the modal and talks to the
-# official Anthropic API; the test skips without it). Depends on `minds-css` because the test launches
-# `electron main.js` directly (not via `pnpm start`), so nothing else compiles
-# the gitignored stylesheet. The test lives in the snapshot-resume suite (it
+# official Anthropic API; the test skips without it). The test lives in the snapshot-resume suite (it
 # runs in CI in the snapshot offload stage, reusing that image's warm Electron
 # toolchain) but creates its own fresh workspace, so it runs fine locally too.
 # The test itself only consumes the DEFAULT_WORKSPACE_TEMPLATE worktree (erroring if absent), so this
 # recipe first materializes it (paired DEFAULT_WORKSPACE_TEMPLATE branch + vendored mngr) unless an
 # operator worktree is already present, mirroring the CI snapshot bake.
 [group("minds test")]
-minds-test-electron *args: minds-css
+minds-test-electron *args:
   uv run python -c 'from imbue.minds.desktop_client.default_workspace_template_worktree import materialize_paired_default_workspace_template_worktree; materialize_paired_default_workspace_template_worktree()'
   xvfb-run -a uv run pytest apps/minds/test_snapshot_resume.py::test_create_workspace_and_sign_in_via_modal_then_chat_via_electron -v --no-cov --cov-fail-under=0 {{args}}
 
@@ -275,32 +303,128 @@ minds-test-electron *args: minds-css
 # Linux. Unlike `minds-test-electron` (create-only pytest acceptance test), this
 # is an operator/debug harness: it needs Docker + live AI creds, so activate an
 # env with a logged-in account first, e.g.
-#   eval "$(uv run minds env activate dev-josh-1)"
+#   eval "$(uv run minds-admin env activate dev-josh-1)"
 # It also needs the DEFAULT_WORKSPACE_TEMPLATE external worktree's system/vendor/mngr synced to this checkout
 # (otherwise the initial chat agent fails to create on settings the vendored mngr
 # doesn't recognize, and the chat step hangs on "Waiting for initial chat
-# agent..."); run `just sync-vendor-mngr .external_worktrees/default-workspace-template`
-# first (the minds-dev-workflow does this on every startup).
+# agent..."); run `just sync-vendor-mngr-live` first -- the same sync
+# `just minds-start` does on every startup, carrying uncommitted changes and
+# committing nothing.
 # Screenshots of each step land in /tmp/minds-electron-flow/.
 [group("minds test")]
-minds-test-electron-flow *args: minds-css
+minds-test-electron-flow *args:
   xvfb-run -a uv run --package minds python apps/minds/scripts/electron_full_flow_e2e.py {{args}}
 
-# Compile the minds desktop client's Tailwind v4 stylesheet
-# (static/app.css -> static/app.min.css, minified + tree-shaken) via the
-# pinned @tailwindcss/cli. `just minds-start` rebuilds + watches it live (its
-# `prestart` hook builds it once, then `watch:css` keeps it fresh), and
-# packaged builds compile it in scripts/build.js, so normally you do not need
-# to invoke this recipe -- use it after nuking static/ or to force a rebuild.
-[group("minds build")]
-minds-css:
-  bash -c '. apps/minds/scripts/select_node_version.sh && cd apps/minds && pnpm run build:css'
+# Run the MIND-205 right-click Copy/Cut/Paste/Select All menu e2e: Playwright
+# `_electron` launches a minimal entry (test/e2e/context-menu-app.js) that wires
+# the shipped registerContextMenuFor from electron/context-menu.js, then drives a
+# real right-click and a Copy->Paste round trip, asserting the menu's items and
+# that text actually moves. Wrapped in `xvfb-run` for headless Linux; macOS users
+# with a real display can run the underlying `pnpm exec playwright test` directly.
+# Needs apps/minds/node_modules (`just minds-install` once); no backend, Docker,
+# or env activation required.
+[group("minds test")]
+minds-test-electron-menu *args:
+    #!/bin/bash
+    set -ueo pipefail
+    . apps/minds/scripts/select_node_version.sh || exit 2
+    cd apps/minds
+    xvfb-run -a pnpm exec playwright test --config=test/e2e/playwright.config.js context-menu.spec.js {{args}}
+
+# Generate a harbor task dataset from a minds eval config (one task per persona
+# case). Datasets default OUTSIDE the repo tree: each generated task embeds a
+# full mngr-internal clone, which must not sit under the repo's apps/ scan (it
+# would trip the snapshot-resume marked-test discovery). They are regenerable
+# from the checked-in config, so a scratch dir is fine; pass a unique <output>
+# per dataset.
+[group("minds evals")]
+minds-evals-generate config output="/tmp/minds-evals/datasets/generated":
+    uv run --project apps/minds_evals minds-evals generate --config "{{config}}" --output "{{output}}"
+
+# Run a generated dataset on Modal with the persona driver. Requires
+# ANTHROPIC_API_KEY (decider + judge) and ~/.modal.toml. Each trial boots its
+# own 6-CPU/16-GB box, so this is a scheduled/nightly regression job, not a
+# per-PR gate. `concurrency` bounds simultaneous boxes -- set it to the case
+# count so all cases run in one wave (cost = concurrency * box size). Extra
+# harbor args pass through last; --ak snapshot_mode=per-turn overrides the
+# default of final. Results stay in the local job dir: archival belongs to
+# whatever runs the eval on a schedule, which needs its own credentials rather
+# than a developer's.
+[group("minds evals")]
+minds-evals-run dataset job_name concurrency="4" *harbor_args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY -- the decider and judge call the Anthropic API}"
+    # just splices a variadic parameter in as raw text, so `{{harbor_args}}` below is subject to
+    # word splitting (which is how several --ak flags arrive as several words) AND to pathname
+    # expansion, which nothing here wants: `--ak model=opus[1m]` is a valid glob bracket
+    # expression, and a matching file in the working directory would rewrite the model.
+    set -f
+    # --project selects the standalone minds_evals venv (harbor and the driver
+    # package live only there); it leaves cwd at the repo root, so the
+    # root-relative -o/-p paths below stay correct.
+    cmd=(uv run --project apps/minds_evals harbor run
+        -p "{{dataset}}"
+        -a imbue.minds_evals.driver:MindsPersonaDriver
+        -e modal
+        -n "{{concurrency}}"
+        -y
+        --job-name "{{job_name}}"
+        -o apps/minds_evals/jobs
+        --agent-setup-timeout-multiplier 3
+        --ak snapshot_mode=final
+        --ek sandbox_timeout_secs=14400
+        {{harbor_args}})
+    echo ">> ${cmd[*]}"
+    "${cmd[@]}"
+
+# List the Modal environments YOUR OWN run left behind, without deleting any of
+# them. A trial never destroys its environment: it outlives the sandboxes inside
+# it and is where a failed trial's workspace state is recovered from. So every
+# run leaks one environment per trial, on purpose, and removing them is opt-in.
+[group("minds evals")]
+minds-evals-list-environments job_dir:
+    uv run --project apps/minds_evals minds-evals cleanup-environments --job-dir "{{job_dir}}" --dry-run
+
+# Delete exactly the Modal environments the trials in JOB_DIR recorded, and
+# nothing else -- the names come from each trial's own state.json, never from a
+# pattern. Run the list recipe above first and read what it prints. There is
+# deliberately no developer-facing sweep: a sweep by name is the scheduled job's
+# backstop for its own runs, and pointing one at a shared prefix would take out
+# somebody else's environments along with yours.
+[group("minds evals")]
+minds-evals-cleanup-environments job_dir:
+    uv run --project apps/minds_evals minds-evals cleanup-environments --job-dir "{{job_dir}}"
+
+# Browse a harbor job or task directory with the vendored viewer
+# (apps/minds_evals/viewer, a copy of harbor's own frontend -- see its
+# VENDORED_FROM.md). The backend is stock harbor; only the frontend is ours,
+# which is how eval-specific annotations get rendered without forking harbor's
+# Python. Which of the two viewer modes to serve is read off the folder, the
+# same way `harbor view` reads it. Builds first if the sources are newer than
+# the last build, bootstrapping bun into the project on first use; expect ~10s
+# once and ~2s after.
+[group("minds evals")]
+minds-evals-view folder="apps/minds_evals/jobs" port="8080":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    apps/minds_evals/scripts/build_viewer.sh
+    # --project selects the standalone minds_evals venv, where harbor lives; it
+    # leaves cwd at the repo root, so the root-relative folder path stays correct.
+    uv run --project apps/minds_evals python -m imbue.minds_evals.viewer_server \
+        --folder "{{folder}}" --port "{{port}}"
+
+
 # Create an independent default-workspace-template checkout nested in the
 # current mngr checkout at .external_worktrees/default-workspace-template -- the
 # CLAUDE.md convention for developing default_workspace_template alongside mngr. Defaults the default_workspace_template branch
 # to the current mngr branch; override with a positional arg. Errors if a checkout
 # already exists or the branch is already on default_workspace_template. It is a full clone (survives
 # deletion of any other clone/cache) and needs no configuration.
+# The checkout is reviewed by the code-guardian stop hook alongside mngr: the recipe
+# writes a gitignored .reviewer/settings.local.json enabling the gates there, so
+# stopping merges main into it, pushes its branch to the default_workspace_template
+# remote, and blocks until a PR exists on it.
 # Set DEFAULT_WORKSPACE_TEMPLATE_DIR (gitignored apps/minds/.env or your shell) to a local default_workspace_template clone to
 # make the clone fast -- purely a speed hint, no lasting dependency is created.
 [group("minds install")]
@@ -315,8 +439,9 @@ default-workspace-template-worktree branch="" base="origin/main":
 # checkout at the exact commit you want to vendor first -- your release PR branch
 # HEAD / the verified release SHA, NOT blindly `main`, which can drift past it
 # between verification and merge. The recipe archives HEAD, replaces system/vendor/mngr/
-# with that snapshot, and commits in DEFAULT_WORKSPACE_TEMPLATE. Does not push. Aborts if DEFAULT_WORKSPACE_TEMPLATE is dirty.
-# Full release flow: apps/minds/docs/release.md.
+# with that snapshot, relocks DEFAULT_WORKSPACE_TEMPLATE's root uv.lock, and commits both there.
+# Does not push. Aborts if DEFAULT_WORKSPACE_TEMPLATE is dirty.
+# Full release flow: apps/minds/docs/deploy/ops/app-release.md.
 [group("minds dev")]
 sync-vendor-mngr default_workspace_template="":
     #!/bin/bash
@@ -358,21 +483,87 @@ sync-vendor-mngr default_workspace_template="":
     rm -rf ./* ./.[!.]*
     tar -xf "$tarball"
     cd "$default_workspace_template"
-    git add -A system/vendor/mngr/
-    if git diff --cached --quiet -- system/vendor/mngr/; then
-        echo "system/vendor/mngr already in sync with mngr ${short}; nothing to commit"
+    # The template's root uv.lock pins the vendored mngr libs as editable path
+    # deps, so a refresh that moves their dependencies strands it.
+    uv lock
+    git add -A system/vendor/mngr/ uv.lock
+    if git diff --cached --quiet -- system/vendor/mngr/ uv.lock; then
+        echo "system/vendor/mngr and uv.lock already in sync with mngr ${short}; nothing to commit"
         exit 0
     fi
     git commit -m "Sync system/vendor/mngr to ${branch} (${short})" -m "Tracks ${full} in mngr."
     echo "Synced system/vendor/mngr to ${branch} (${short}). To publish: (cd $default_workspace_template && git push origin ${branch})"
 
+# Sync this checkout's LIVE working tree (uncommitted changes included) into a
+# DEFAULT_WORKSPACE_TEMPLATE worktree's system/vendor/mngr/, leaving it as an
+# ordinary uncommitted diff there. This is the dev-loop counterpart to
+# `just sync-vendor-mngr`, which vendors `git archive HEAD` and commits: use
+# that one for a release, this one to iterate.
+#
+# `just minds-start` runs this at launch so the first Create picks up your local
+# mngr code. Run it directly to re-sync without relaunching the app -- notably
+# after dropping system/vendor/mngr to let a base-branch merge through (see
+# CLAUDE.md, "Vendored mngr in the default-workspace-template worktree").
+#
+# `default_workspace_template` defaults to
+# .external_worktrees/default-workspace-template; an absolute path is used
+# as-is, a relative one is resolved against the mngr root. Unlike
+# `sync-vendor-mngr`, this does NOT fall back to DEFAULT_WORKSPACE_TEMPLATE_DIR:
+# it has to target whatever worktree `minds-start` launches against, and that is
+# the nested one. DEFAULT_WORKSPACE_TEMPLATE_DIR names a standalone clone, which
+# is the right default for a release sync and the wrong one for the dev loop.
+#
+# Sync the LIVE mngr working tree into DEFAULT_WORKSPACE_TEMPLATE's system/vendor/mngr (no commit)
+[group("minds dev")]
+sync-vendor-mngr-live default_workspace_template="":
+    #!/bin/bash
+    set -ueo pipefail
+    if [ -n "{{default_workspace_template}}" ]; then
+        case "{{default_workspace_template}}" in
+            /*) default_workspace_template_wt="{{default_workspace_template}}" ;;
+            *)  default_workspace_template_wt="$(pwd)/{{default_workspace_template}}" ;;
+        esac
+    else
+        default_workspace_template_wt="$(pwd)/.external_worktrees/default-workspace-template"
+    fi
+    if [ ! -e "$default_workspace_template_wt/.git" ]; then
+        echo "error: no DEFAULT_WORKSPACE_TEMPLATE worktree at $default_workspace_template_wt" >&2
+        echo "       run \`just default-workspace-template-worktree\` to create it," >&2
+        echo "       or pass a custom default_workspace_template path." >&2
+        exit 2
+    fi
+    vendor_mngr="$default_workspace_template_wt/system/vendor/mngr"
+    mkdir -p "$vendor_mngr"
+    # The system/vendor/mngr sync below uses `rsync --filter=':- .gitignore'`, a GNU
+    # rsync feature. Recent macOS ships Apple's openrsync at /usr/bin/rsync,
+    # which doesn't support it and fails the sync with a confusing error --
+    # fail fast here with the fix. See apps/minds/docs/dev-setup.md.
+    if rsync --version 2>&1 | grep -qi openrsync; then
+        echo "error: your 'rsync' is Apple's openrsync, which lacks the" >&2
+        echo "       --filter=':- .gitignore' support this sync needs." >&2
+        echo "       Install GNU rsync and put it ahead of /usr/bin on PATH:" >&2
+        echo "         brew install rsync" >&2
+        echo "         rsync --version | head -1   # must NOT say 'openrsync'" >&2
+        exit 2
+    fi
+    echo "Syncing $(pwd) -> $vendor_mngr (rsync, uncommitted-friendly, no DEFAULT_WORKSPACE_TEMPLATE commit)"
+    # Exclusions must match _VENDOR_RSYNC_MANUAL_EXCLUDES + _GITIGNORE_RSYNC_FILTER
+    # in libs/mngr_imbue_cloud/.../bake/pool_bake.py and the RSYNC_EXCLUDES array
+    # in apps/minds/scripts/propagate_changes -- all three paths populate the same
+    # system/vendor/mngr/ destination. apps/minds/docs/vendor-mngr-sync.md is the
+    # canonical account of the form and why each exclude is there.
+    rsync -a --delete \
+        --filter=':- .gitignore' \
+        --exclude=.git \
+        --exclude=uv.lock \
+        ./ "$vendor_mngr/"
 
 # === Modal deploy / minds iteration helpers ===
 #
 # Every recipe below requires an activated minds env. Activate first via
-# `eval "$(uv run minds env activate <name>)"`, then run the recipe in
+# `eval "$(uv run minds-admin env activate <name>)"`, then run the recipe in
 # the same shell. Tier (dev / staging / production) is derived from the
-# activated env name -- see `apps/minds/imbue/minds/cli/env.py`.
+# activated env name -- see `apps/minds_admin/imbue/minds_admin/cli/env.py`.
 
 # Push every tier-shared Vault secret to Modal Secrets AND deploy both
 # Modal apps (litellm-proxy, remote-service-connector) for the activated
@@ -382,8 +573,311 @@ sync-vendor-mngr default_workspace_template="":
 # (which require --yes-i-mean-<tier>) this only pushes Vault secrets
 # to Modal and runs `modal deploy`; no local files change.
 [group("minds ops")]
-deploy *args:
-    uv run minds env deploy {{args}}
+services-deploy *args:
+    uv run minds-admin env deploy {{args}}
+
+# Stand up the activated dev/ci env's OWN share relay in one shot:
+# provision an OVH instance, register it in THIS env's connector fleet
+# inventory (relays table), install frps + config pointed at the env's
+# connector, and reconcile the region DNS records. The region label is
+# the env name (underscores mapped to hyphens) -- each dev env gets its
+# own relay instead of competing for one shared dev relay whose frps
+# plugin-auth URL can only serve a single env's connector. Reads the
+# relay SSH key, frps auth secret, admin key, OVH + Cloudflare creds
+# from the tier's Vault entries (requires a vault login). Idempotent-ish:
+# re-running provisions a NEW instance; use `just list-share-relays` /
+# `just destroy-share-relay` + `just deregister-share-relay` to clean up
+# an old one (DNS self-heals via the connector's health sweep).
+[group("minds ops")]
+provision-dev-relay ovh_region="US-EAST-VA-1" ordinal="1":
+    #!/bin/bash
+    set -ueo pipefail
+    root_name="${MINDS_ROOT_NAME:?activate a dev env first: eval \"\$(uv run minds-admin env activate <env>)\"}"
+    config_path="${MINDS_CLIENT_CONFIG_PATH:?activate a dev env first (MINDS_CLIENT_CONFIG_PATH is unset)}"
+    env_name="${root_name#minds-}"
+    case "$env_name" in
+        dev-*) tier="dev" ;;
+        ci-*) tier="ci" ;;
+        *) echo "error: provision-dev-relay serves dev/ci envs only (got '$env_name')" >&2; exit 2 ;;
+    esac
+
+    # Everything derived: region label from the env name, content domain from
+    # the tier deploy config, connector URL from the activated client.toml,
+    # creds + relay SSH key + admin key from the tier's Vault entries.
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    uv run python scripts/provision_dev_relay_config.py "$env_name" "$tier" "$config_path" "$tmp"
+
+    region="$(jq -r .region "$tmp/params.json")"
+    content_domain="$(jq -r .content_domain "$tmp/params.json")"
+    plugin_auth_url="$(jq -r .plugin_auth_url "$tmp/params.json")"
+    connector_url="$(jq -r .connector_url "$tmp/params.json")"
+    set -a; . "$tmp/relay.env"; set +a
+
+    echo "Provisioning relay for env '$env_name' (region '$region', domain '$content_domain', OVH {{ovh_region}})"
+    provision_json="$(uv run share-relay provision --env-name "$env_name" --region "$region" \
+        --ordinal "{{ordinal}}" --ovh-region "{{ovh_region}}" --ssh-public-key-file "$tmp/relay_key.pub" | tail -n 1)"
+    ip="$(jq -r .ip <<<"$provision_json")"
+    instance_name="$(jq -r .name <<<"$provision_json")"
+
+    echo "Registering relay in the connector fleet inventory"
+    register_json="$(uv run share-relay register --connector-url "$connector_url" --region "$region" \
+        --tunnel-endpoint "$ip:7000" --ip "$ip" --instance-name "$instance_name" | tail -n 1)"
+    relay_id="$(jq -r .relay_id <<<"$register_json")"
+
+    echo "Instance up at $ip (relay_id $relay_id); installing frps + config"
+    ssh-agent bash -c "ssh-add '$tmp/relay_key' 2>/dev/null && \
+        uv run share-relay deploy --host '$ip' --relay-id '$relay_id' --region '$region' \
+            --content-domain '$content_domain' --plugin-auth-url '$plugin_auth_url'"
+    # Seed DNS with THIS relay's IP only. `share-relay dns` reconciles the
+    # record set, so on a second relay (ordinal >= 2) this transiently drops
+    # the sibling's IP -- the connector's per-minute health sweep restores the
+    # full region set from the relays table right after.
+    uv run share-relay dns --region "$region" --content-domain "$content_domain" --ip "$ip"
+
+    # Install the observability collector on the fresh relay; skips gracefully
+    # (exit 3 from collector-env) while the shared dev instance is not
+    # provisioned yet or its relays credential is still empty.
+    set +e
+    uv run python scripts/provision_observability_config.py collector-env dev relays "$tmp"
+    observability_status=$?
+    set -e
+    if [ "$observability_status" -eq 0 ]; then
+        set -a; . "$tmp/collector.env"; set +a
+        echo "Installing the observability collector on $ip"
+        ssh-agent bash -c "ssh-add '$tmp/relay_key' 2>/dev/null && \
+            uv run observability install-collector --host '$ip' --role relay --tier dev \
+                --ingest-url \"$OBSERVABILITY_INGEST_URL\" --credential-env-var OBSERVABILITY_INGEST_CREDENTIAL"
+    elif [ "$observability_status" -ne 3 ]; then
+        exit "$observability_status"
+    fi
+
+    echo
+    echo "Relay ready for env '$env_name':"
+    echo "  relay_id:  $relay_id (registered; workspaces learn the endpoint via GET /shares/assignment)"
+    echo "  wildcard:  *.$region.$content_domain -> $ip"
+    echo "Re-enable sharing on any workspace whose share was created against another region."
+
+# Shared shell block for the observability recipes: derive the tier
+# (production / staging / dev) served by the activated env's instance --
+# dev-*/ci-* envs all map to the single shared `dev` instance.
+_derive_observability_tier := '''
+root_name="${MINDS_ROOT_NAME:?activate a minds env first: eval \"\$(uv run minds-admin env activate <env>)\"}"
+if [ "$root_name" = "minds" ]; then env_name="production"; else env_name="${root_name#minds-}"; fi
+case "$env_name" in
+    production|staging) tier="$env_name" ;;
+    dev-*|ci-*) tier="dev" ;;
+    *) echo "error: cannot derive a tier from env '$env_name'" >&2; exit 2 ;;
+esac
+'''
+
+# Shared shell block for the observability recipes (requires `$tier` from
+# `_derive_observability_tier`): resolve the tier's Vault entries into a
+# self-cleaning temp work dir and source the resulting environment.
+_resolve_observability_config := '''
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+uv run python scripts/provision_observability_config.py resolve "$tier" "$tmp"
+set -a; . "$tmp/observability.env"; set +a
+'''
+
+# Stand up the activated tier's observability instance: provision an OVH VPS,
+# install the pinned OpenObserve + caddy ingest gate + self-monitoring
+# collector, mint the per-sender-class ingest credentials (written back to
+# Vault), and point the Cloudflare-proxied `telemetry.<domain>` record at it.
+# dev-*/ci-* envs all map to the single shared `dev` instance. Reads the
+# tier's `observability`, `ovh`, and
+# `cloudflare` Vault entries (requires a vault login); see
+# .minds/template/observability.sh for the schema and
+# specs/minds-openobserve-telemetry.md for the design. Idempotent-ish:
+# re-running provisions a NEW instance (bump `ordinal` for a replacement
+# generation). For a replacement, FIRST quiesce the old instance (stop caddy +
+# openobserve there and wait out the ~2 minute WAL window, per the spec's
+# "Replacing an instance") -- the deploy below starts openobserve immediately,
+# and only one writer may ever run against the tier's storage -- THEN run this,
+# then destroy the old one via `just list-observability-instances` /
+# `just destroy-observability-instance`.
+[group("minds ops")]
+provision-observability ovh_region="US-EAST-VA-1" ordinal="1":
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_observability_config}}
+    hostname="$(jq -r .telemetry_hostname "$tmp/params.json")"
+
+    echo "Provisioning observability instance for tier '$tier' (hostname $hostname, OVH {{ovh_region}})"
+    provision_json="$(uv run observability provision --tier "$tier" --ordinal "{{ordinal}}" \
+        --ovh-region "{{ovh_region}}" --ssh-public-key-file "$tmp/ssh_key.pub" | tail -n 1)"
+    ip="$(jq -r .ip <<<"$provision_json")"
+
+    echo "Instance up at $ip; installing OpenObserve + ingest gate + self collector"
+    ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability deploy --host '$ip' --tier '$tier' --telemetry-hostname '$hostname' \
+            --work-dir '$tmp/deploy'"
+
+    echo "Minting ingest credentials + applying log-stream retention"
+    accounts_json="$(ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability provision-accounts --ssh-host '$ip'" | tail -n 1)"
+    printf '%s\n' "$accounts_json" | uv run python scripts/provision_observability_config.py store-credentials "$tier"
+
+    uv run observability dns --hostname "$hostname" --ip "$ip"
+
+    echo
+    echo "Observability instance ready for tier '$tier':"
+    echo "  ingest:   https://$hostname (OTLP routes + /healthz only)"
+    echo "  UI:       ssh -L 5080:127.0.0.1:5080 debian@$ip  ->  http://localhost:5080"
+    echo "Manual follow-ups:"
+    echo "  1. Create the workspace OTel secret and configure the integration by hand:"
+    echo "     see 'Configure the Modal workspace integration' in the bring-up runbook"
+    echo "     (endpoint https://$hostname -- the BARE base URL; secret observability-otel-ingest"
+    echo "     carrying only OTEL_HEADER_Authorization; the ingest gate stamps stream-name)."
+    echo "  2. Roll the fleet collectors: re-run \`just server-prep <id>\` per box; relays pick it up on provision."
+    echo "  3. Once data flows, run \`just provision-observability-accounts $ip\` to apply the"
+    echo "     log-stream retention overrides (do NOT re-run this recipe: it provisions a new VPS)."
+
+# Re-run the account/retention pass against an EXISTING instance (IP from
+# `just list-observability-instances` or the provisioning output): mint any
+# ingest credential whose Vault leaf is empty (writing it back to Vault) and
+# re-apply the log-stream retention overrides. Idempotent, and the right tool
+# once data flows (streams only exist after first ingest) or after clearing a
+# credential leaf for rotation -- unlike `just provision-observability`, which
+# always provisions a NEW VPS.
+[group("minds ops")]
+provision-observability-accounts ip:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_observability_config}}
+    echo "Minting ingest credentials + applying log-stream retention on {{ip}} (tier '$tier')"
+    accounts_json="$(ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability provision-accounts --ssh-host '{{ip}}'" | tail -n 1)"
+    printf '%s\n' "$accounts_json" | uv run python scripts/provision_observability_config.py store-credentials "$tier"
+
+# List the OVH instances backing observability (all tiers share the OVH
+# project of the creds you source; run with the tier activated).
+[group("minds ops")]
+list-observability-instances:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_observability_config}}
+    uv run observability list
+
+# Destroy one observability instance VPS by OVH instance id (from
+# `just list-observability-instances`). Follow the spec's "Replacing an
+# instance": stop caddy + openobserve on the old host and wait out the WAL
+# quiesce window (~2 minutes) BEFORE destroying, so the tail flushes to R2.
+[group("minds ops")]
+destroy-observability-instance instance_id:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_observability_config}}
+    uv run observability destroy --instance-id "{{instance_id}}"
+
+# Shared shell block for the bugsink recipes (requires `$tier` from
+# `_derive_observability_tier`): resolve the tier's Vault entries into a
+# self-cleaning temp work dir and source the resulting environment.
+_resolve_bugsink_config := '''
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+uv run python scripts/provision_bugsink_config.py resolve "$tier" "$tmp"
+set -a; . "$tmp/bugsink.env"; set +a
+'''
+
+# Stand up the activated tier's Bugsink error-tracker instance: provision an
+# OVH VPS, install the hash-locked Bugsink venv + caddy ingest gate +
+# nftables firewall, mint a REST API token + get-or-create the per-service
+# projects (DSNs + token written back to Vault), and point the
+# Cloudflare-proxied `errors.<domain>` record at it. dev-*/ci-* envs all map
+# to the single shared `dev` instance. Reads the tier's `bugsink`, `ovh`,
+# and `cloudflare` Vault entries (requires a vault login); see
+# .minds/template/bugsink.sh for the schema and
+# specs/minds-bugsink-error-tracking.md for the design. `ovh_region` is
+# REQUIRED: pick the OVH region nearest the tier's Neon project (Bugsink's
+# digestion issues ~70 sequential DB queries per event, so ingest throughput
+# scales with ~1/RTT; dev Neon is us-west-2 -> US-WEST-OR-1). Re-running
+# provisions a NEW instance (bump `ordinal` for a replacement generation).
+# For a replacement, FIRST stop the bugsink service on the old instance
+# (every acked event is already in Postgres -- no quiesce window needed, but
+# only one writer may ever run against the tier's database) THEN run this,
+# then destroy the old one via `just list-bugsink-instances` /
+# `just destroy-bugsink-instance`. After first bring-up (or whenever the
+# DSNs change), re-run the tier's normal deploy so the reporting services
+# pick up the freshly stamped sentry-<tier>-<deploy-id> Modal Secret.
+[group("minds ops")]
+provision-bugsink ovh_region ordinal="1":
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_bugsink_config}}
+    hostname="$(jq -r .errors_hostname "$tmp/params.json")"
+
+    echo "Provisioning bugsink instance for tier '$tier' (hostname $hostname, OVH {{ovh_region}})"
+    provision_json="$(uv run observability bugsink provision --tier "$tier" --ordinal "{{ordinal}}" \
+        --ovh-region "{{ovh_region}}" --ssh-public-key-file "$tmp/ssh_key.pub" | tail -n 1)"
+    ip="$(jq -r .ip <<<"$provision_json")"
+
+    echo "Instance up at $ip; installing Bugsink + ingest gate (first boot runs migrations)"
+    ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability bugsink deploy --host '$ip' --tier '$tier' --errors-hostname '$hostname' \
+            --work-dir '$tmp/deploy'"
+
+    echo "Minting the API token + creating the per-service projects"
+    projects_json="$(ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability bugsink provision-projects --ssh-host '$ip' --tier '$tier'" | tail -n 1)"
+    printf '%s\n' "$projects_json" | uv run python scripts/provision_bugsink_config.py store-dsns "$tier"
+
+    uv run observability dns --hostname "$hostname" --ip "$ip"
+
+    echo
+    echo "Bugsink instance ready for tier '$tier':"
+    echo "  ingest:   https://$hostname (Sentry DSN routes only)"
+    echo "  UI:       ssh -L 8300:127.0.0.1:8300 debian@$ip  ->  http://localhost:8300"
+    echo "Manual follow-ups:"
+    echo "  1. Re-run the tier's normal deploy so the reporting services pick up the"
+    echo "     freshly stamped sentry-$tier-<deploy-id> Modal Secret."
+    echo "  2. Invite the tier's operator account via the UI's invite-link flow (no SMTP;"
+    echo "     sign in over the SSH tunnel with the break-glass CREATE_SUPERUSER account)."
+
+# Re-run the token/projects pass against an EXISTING bugsink instance (IP
+# from `just list-bugsink-instances` or the provisioning output): mints a
+# fresh API token, get-or-creates the team + per-service projects, and
+# writes the DSNs (+ token) back to Vault. Idempotent (existing projects
+# keep their DSNs) -- unlike `just provision-bugsink`, which always
+# provisions a NEW VPS.
+[group("minds ops")]
+provision-bugsink-projects ip:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_bugsink_config}}
+    echo "Minting the API token + creating the per-service projects on {{ip}} (tier '$tier')"
+    projects_json="$(ssh-agent bash -c "ssh-add '$tmp/ssh_key' 2>/dev/null && \
+        uv run observability bugsink provision-projects --ssh-host '{{ip}}' --tier '$tier'" | tail -n 1)"
+    printf '%s\n' "$projects_json" | uv run python scripts/provision_bugsink_config.py store-dsns "$tier"
+
+# List the OVH instances backing bugsink (all tiers share the OVH project of
+# the creds you source; run with the tier activated).
+[group("minds ops")]
+list-bugsink-instances:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_bugsink_config}}
+    uv run observability list --name-prefix bugsink-
+
+# Destroy one bugsink instance VPS by OVH instance id (from
+# `just list-bugsink-instances`). Every acked event is already durable in the
+# tier's Neon Postgres, so no quiesce window is needed -- but stop the
+# bugsink service on the old host BEFORE a replacement starts (single-writer).
+[group("minds ops")]
+destroy-bugsink-instance instance_id:
+    #!/bin/bash
+    set -ueo pipefail
+    {{_derive_observability_tier}}
+    {{_resolve_bugsink_config}}
+    uv run observability destroy --instance-id "{{instance_id}}"
 
 # Start the minds desktop client (electron) in dev mode against the
 # activated env. Sources .env if present, scrubs any ambient
@@ -405,14 +899,16 @@ deploy *args:
 # including staging / production -- instead of only on per-developer dev envs.
 #
 # Always re-syncs the live mngr working tree into the DEFAULT_WORKSPACE_TEMPLATE worktree's
-# system/vendor/mngr/ first, so the very first Create after starting the app
-# picks up your local mngr code rather than whatever stale snapshot the
-# DEFAULT_WORKSPACE_TEMPLATE worktree was created from. Uses rsync (vs `just sync-vendor-mngr`'s
-# git archive) so uncommitted mngr changes flow through and the DEFAULT_WORKSPACE_TEMPLATE
-# worktree's git state stays as a normal diff.
+# system/vendor/mngr/ first (via `just sync-vendor-mngr-live`), so the very first
+# Create after starting the app picks up your local mngr code rather than
+# whatever stale snapshot the DEFAULT_WORKSPACE_TEMPLATE worktree was created
+# from. That recipe uses rsync (vs `just sync-vendor-mngr`'s git archive) so
+# uncommitted mngr changes flow through and the DEFAULT_WORKSPACE_TEMPLATE
+# worktree's git state stays as a normal diff. Run it on its own to re-sync
+# without relaunching the app.
 #
 # Requires that you've activated a minds env in this shell first --
-# `eval "$(uv run minds env activate dev-<your-user>)"` is the typical
+# `eval "$(uv run minds-admin env activate dev-<your-user>)"` is the typical
 # dev case (add `--create` on the very first activation of a fresh dev env
 # to make its data root). Refuses without activation so the recipe never
 # silently writes to the wrong env's data root.
@@ -449,6 +945,7 @@ minds-install:
 #   just minds-start                     # launch against the worktree's branch
 #   just minds-start my-branch           # pin the DEFAULT_WORKSPACE_TEMPLATE branch to `my-branch`
 #   just minds-start "" .external_worktrees/my-default-workspace-template-worktree   # 2nd arg = default_workspace_template
+#   just minds-start "" "" 9223          # 3rd arg = Chromium remote-debugging port (CDP on 127.0.0.1)
 # `default_workspace_template` defaults to .external_worktrees/default-workspace-template; an absolute
 # path is used as-is, a relative one is resolved against the mngr root. This
 # is what gets synced (system/vendor/mngr/) and exported as MINDS_WORKSPACE_GIT_URL,
@@ -457,17 +954,17 @@ minds-install:
 # worktree (PID file under /tmp keyed by worktree path). Use `just
 # minds-stop` to kill the running instance first.
 [group("minds dev")]
-minds-start branch="" default_workspace_template="":
+minds-start branch="" default_workspace_template="" debug_port="":
     #!/bin/bash
     set -ueo pipefail
     if [ -z "${MINDS_ROOT_NAME:-}" ]; then
         echo "error: no minds env activated in this shell." >&2
-        echo "       Run \`eval \"\$(uv run minds env activate <name>)\"\` first" >&2
+        echo "       Run \`eval \"\$(uv run minds-admin env activate <name>)\"\` first" >&2
         echo "       (e.g. \`dev-<your-user>\` for your personal dev env), then" >&2
         echo "       re-run \`just minds-start\` from the same shell." >&2
         echo "       On the first activation of a fresh dev env, add --create to" >&2
         echo "       make its data root:" >&2
-        echo "         eval \"\$(uv run minds env activate --create dev-<your-user>)\"" >&2
+        echo "         eval \"\$(uv run minds-admin env activate --create dev-<your-user>)\"" >&2
         echo "" >&2
         echo "       Without activation, an inherited MNGR_HOST_DIR from the parent" >&2
         echo "       shell would silently win and minds would read a different mngr" >&2
@@ -488,38 +985,7 @@ minds-start branch="" default_workspace_template="":
         echo "       then re-run minds-start." >&2
         exit 2
     fi
-    vendor_mngr="$default_workspace_template_wt/system/vendor/mngr"
-    mkdir -p "$vendor_mngr"
-    # The system/vendor/mngr sync below uses `rsync --filter=':- .gitignore'`, a GNU
-    # rsync feature. Recent macOS ships Apple's openrsync at /usr/bin/rsync,
-    # which doesn't support it and fails the sync with a confusing error --
-    # fail fast here with the fix. See apps/minds/README.md (Getting started).
-    if rsync --version 2>&1 | grep -qi openrsync; then
-        echo "error: your 'rsync' is Apple's openrsync, which lacks the" >&2
-        echo "       --filter=':- .gitignore' support minds-start needs." >&2
-        echo "       Install GNU rsync and put it ahead of /usr/bin on PATH:" >&2
-        echo "         brew install rsync" >&2
-        echo "         rsync --version | head -1   # must NOT say 'openrsync'" >&2
-        exit 2
-    fi
-    echo "Syncing $(pwd) -> $vendor_mngr (rsync, uncommitted-friendly, no DEFAULT_WORKSPACE_TEMPLATE commit)"
-    # Exclusions must match _RSYNC_MANUAL_EXCLUDES + _GITIGNORE_RSYNC_FILTER
-    # in libs/mngr_imbue_cloud/.../cli/admin.py and apps/minds/.../cli/pool.py,
-    # and the RSYNC_EXCLUDES array in apps/minds/scripts/propagate_changes --
-    # all four paths populate the same system/vendor/mngr/ destination.
-    #
-    # `--filter=:- .gitignore` reads .gitignore at each directory level under
-    # the source and applies its exclude rules, so __pycache__, .venv,
-    # node_modules, .test_output, .mypy_cache, .ruff_cache, .pytest_cache,
-    # .external_worktrees, etc. are all covered without listing them here.
-    # `.git` and `uv.lock` aren't in .gitignore (`.git` is git's internal
-    # dir; `uv.lock` is intentionally committed but each install context
-    # regenerates its own), so we exclude those manually.
-    rsync -a --delete \
-        --filter=':- .gitignore' \
-        --exclude=.git \
-        --exclude=uv.lock \
-        ./ "$vendor_mngr/"
+    just sync-vendor-mngr-live "$default_workspace_template_wt"
     pid_file="/tmp/minds-start-$(echo -n "$PWD" | sha1sum | cut -c1-12).pid"
     if [ -f "$pid_file" ]; then
         existing=$(cat "$pid_file" 2>/dev/null || echo "")
@@ -570,9 +1036,20 @@ minds-start branch="" default_workspace_template="":
         echo "       Then re-run \`just minds-start\`." >&2
         exit 2
     fi
+    if [ -n "{{debug_port}}" ]; then
+        # Read by electron/main.js, which appends Chromium's
+        # --remote-debugging-port switch (CDP, bound to 127.0.0.1).
+        export MINDS_REMOTE_DEBUGGING_PORT="{{debug_port}}"
+        echo "MINDS_REMOTE_DEBUGGING_PORT=$MINDS_REMOTE_DEBUGGING_PORT (CDP at http://127.0.0.1:$MINDS_REMOTE_DEBUGGING_PORT)"
+    fi
     # Put the Node version apps/minds pins (.nvmrc) first on PATH so pnpm's
     # engine-strict check passes regardless of the shell's default node.
     . apps/minds/scripts/select_node_version.sh || exit 2
+    # Build the SPA the app server actually serves. `pnpm start` only builds
+    # the legacy JinjaX stylesheet; static/ui/ is produced at wheel-build time
+    # and is gitignored, so without this a dev run serves whatever bundle
+    # happened to be built last -- or 404s on a fresh worktree.
+    (cd apps/minds/frontend && pnpm install --silent && pnpm run generate && pnpm run build) || exit 2
     cd apps/minds && pnpm start
 
 # Launch the minds desktop client (electron) in dev mode against the
@@ -583,11 +1060,11 @@ minds-start branch="" default_workspace_template="":
 # canonical default-workspace-template remote + FALLBACK_BRANCH (the
 # minds-v<version> release tag baked into production slices). Those shipped
 # defaults are exactly the identity stamped into a slice by
-# `just bake-slice-prod <region> minds-v<version>`, so an IMBUE_CLOUD create
+# `just pool-bake <region> minds-v<version>`, so an IMBUE_CLOUD create
 # gets a fast-path lease of that slice instead of falling back to the slow
 # rebuild path. (The local-worktree defaults that minds-start exports point
 # at a filesystem path + dev branch that no pool host can clone or match --
-# see _operator_workspace_default in desktop_client/templates.py.)
+# see _operator_workspace_default in desktop_client/workspace_defaults.py.)
 #
 # It also skips the live-mngr -> system/vendor/mngr/ rsync that minds-start does on
 # every launch: a leased pool slice already carries the mngr snapshot baked
@@ -597,13 +1074,15 @@ minds-start branch="" default_workspace_template="":
 # minds-start). In the form's advanced settings, pick the SAME region the
 # slice was baked in -- region is a hard match and is never relaxed. Stop it
 # with `just minds-stop` (shared PID file, keyed by worktree path).
+#
+#   just minds-start-cloud 9223   # optional arg = Chromium remote-debugging port (CDP on 127.0.0.1)
 [group("minds dev")]
-minds-start-cloud:
+minds-start-cloud debug_port="":
     #!/bin/bash
     set -ueo pipefail
     if [ -z "${MINDS_ROOT_NAME:-}" ]; then
         echo "error: no minds env activated in this shell." >&2
-        echo "       Run \`eval \"\$(uv run minds env activate <name>)\"\` first," >&2
+        echo "       Run \`eval \"\$(uv run minds-admin env activate <name>)\"\` first," >&2
         echo "       then re-run \`just minds-start-cloud\` from the same shell." >&2
         exit 2
     fi
@@ -634,9 +1113,19 @@ minds-start-cloud:
         echo "       Run \`just minds-install\` first, then re-run \`just minds-start-cloud\`." >&2
         exit 2
     fi
+    if [ -n "{{debug_port}}" ]; then
+        # Read by electron/main.js, which appends Chromium's
+        # --remote-debugging-port switch (CDP, bound to 127.0.0.1).
+        export MINDS_REMOTE_DEBUGGING_PORT="{{debug_port}}"
+        echo "MINDS_REMOTE_DEBUGGING_PORT=$MINDS_REMOTE_DEBUGGING_PORT (CDP at http://127.0.0.1:$MINDS_REMOTE_DEBUGGING_PORT)"
+    fi
     # Put apps/minds's pinned Node (.nvmrc) first on PATH so pnpm's
     # engine-strict check passes regardless of the shell's default node.
     . apps/minds/scripts/select_node_version.sh || exit 2
+    # Build the SPA the app server actually serves, same as minds-start:
+    # `pnpm start` only launches electron, and static/ui/ is gitignored
+    # (produced at wheel-build time), so a fresh worktree would 404 without this.
+    (cd apps/minds/frontend && pnpm install --silent && pnpm run generate && pnpm run build) || exit 2
     cd apps/minds && pnpm start
 
 # Stop the minds desktop client started in this worktree by `just minds-start`
@@ -691,13 +1180,24 @@ minds-stop:
     # (portable: pstree is not preinstalled on macOS, and macOS ps has no
     # `cmd=` keyword). We'll use this both to identify electron's main
     # process and to verify the whole tree exits.
-    descendants=$(ps -eo pid=,ppid= | awk -v root="$pid" '
-        { ppid_of[$1] = $2 }
+    #
+    # Subtrees rooted at a process that started its own session (setsid) are
+    # skipped: those are intentionally detached daemons -- the `mngr latchkey
+    # forward` supervisor and its gateway / `mngr observe` children -- which
+    # are DESIGNED to outlive the desktop client so agents keep working across
+    # restarts (see the spawn comment in apps/minds/imbue/minds/cli/run.py).
+    # They are neither waited on nor killed here.
+    root_sess=$(ps -o sess= -p "$pid" | tr -d ' ')
+    descendants=$(ps -eo pid=,ppid=,sess= | awk -v root="$pid" -v root_sess="$root_sess" '
+        { ppid_of[$1] = $2; sess_of[$1] = $3 }
         END {
             n = 1; queue[0] = root; seen[root] = 1
             for (i = 0; i < n; i++)
                 for (p in ppid_of)
-                    if (ppid_of[p] == queue[i] && !(p in seen)) { seen[p] = 1; queue[n++] = p }
+                    if (ppid_of[p] == queue[i] && !(p in seen)) {
+                        if (sess_of[p] != root_sess) continue
+                        seen[p] = 1; queue[n++] = p
+                    }
             for (i = 0; i < n; i++) print queue[i]
         }' | sort -u)
     # Locate Electron's main process: the descendant whose command contains
@@ -726,11 +1226,15 @@ minds-stop:
         echo "Stopping minds-start (pid=$pid, electron not yet spawned)"
         kill -TERM "$pid"
     fi
-    # Wait up to 10s for the whole tree to exit.
-    for i in $(seq 1 10); do
+    # Wait up to 15s for the whole (same-session) tree to exit. Zombies are
+    # not counted as alive: they cannot be killed and resolve on their own
+    # once their parent reaps them or exits.
+    for i in $(seq 1 15); do
         still_alive=""
         for descendant in $descendants; do
             if kill -0 "$descendant" 2>/dev/null; then
+                stat=$(ps -o stat= -p "$descendant" 2>/dev/null || true)
+                case "$stat" in Z*) continue ;; esac
                 still_alive="$still_alive $descendant"
             fi
         done
@@ -743,7 +1247,7 @@ minds-stop:
     # Force-kill anything that survived the grace period. Each kill targets
     # a specific PID we observed under the recipe shell -- never a broad
     # pgrep-style match.
-    echo "Tree did not exit after 10s SIGTERM grace; force-killing leftovers:$still_alive"
+    echo "Tree did not exit after 15s SIGTERM grace; force-killing leftovers:$still_alive"
     for descendant in $still_alive; do
         kill -9 "$descendant" 2>/dev/null || true
     done
@@ -766,7 +1270,7 @@ minds-build:
 # profiles/.../docker/.../keys/).
 #
 # Requires an activated minds env: reads MNGR_HOST_DIR from the shell
-# (set by `minds env activate`). Refuses without activation so this
+# (set by `minds-admin env activate`). Refuses without activation so this
 # recipe never silently targets the wrong env's docker keys.
 [group("minds dev")]
 propagate-changes agent_name:
@@ -774,7 +1278,7 @@ propagate-changes agent_name:
     set -ueo pipefail
     if [ -z "${MNGR_HOST_DIR:-}" ]; then
         echo "error: MNGR_HOST_DIR is not set. Run" >&2
-        echo "       \`eval \"\$(uv run minds env activate <name>)\"\` first" >&2
+        echo "       \`eval \"\$(uv run minds-admin env activate <name>)\"\` first" >&2
         echo "       then re-run \`just propagate-changes ${1}\` from the same shell." >&2
         exit 2
     fi
@@ -825,14 +1329,14 @@ propagate-changes agent_name:
 # DNS+target is already registered.
 #
 # Requires an activated minds env: reads MNGR_HOST_DIR / MNGR_PREFIX from
-# the shell (set by `minds env activate`).
+# the shell (set by `minds-admin env activate`).
 [group("minds dev")]
 forward-system-interface agent_name:
     #!/bin/bash
     set -ueo pipefail
     if [ -z "${MNGR_HOST_DIR:-}" ] || [ -z "${MNGR_PREFIX:-}" ]; then
         echo "error: MNGR_HOST_DIR / MNGR_PREFIX are not set. Run" >&2
-        echo "       \`eval \"\$(uv run minds env activate <name>)\"\` first" >&2
+        echo "       \`eval \"\$(uv run minds-admin env activate <name>)\"\` first" >&2
         echo "       then re-run \`just forward-system-interface ${1}\` from the same shell." >&2
         exit 2
     fi
@@ -1003,25 +1507,25 @@ create-new-mind-repo repo_name parent_dir="$HOME/project":
 
 # === minds pool hosts (leased mode) ===
 #
-# Thin wrappers around the env-aware `minds pool {create,list,destroy}` CLI,
+# Thin wrappers around the env-aware `minds-admin pool {create,list,destroy}` CLI,
 # which resolves the pool SSH key AND (for staging / production) the host_pool
 # DSN from the activated tier's Vault entries automatically -- so you never
 # export creds or pass --database-url by hand. dev / ci envs auto-resolve the
 # DSN from their per-env secrets.toml. Activate a minds env first:
-#   eval "$(uv run minds env activate <name>)"
+#   eval "$(uv run minds-admin env activate <name>)"
 #
 # Pool hosts are baked as bare-metal SLICES (recipes below). List them with
-# `just list-pool-hosts` and remove them with `just destroy-pool-hosts`.
+# `just pool-list` and remove them with `just pool-destroy`.
 
 # === minds bare-metal SLICES (carved on a pre-registered bare-metal box) ===
 #
 # These bake "slices": lima/QEMU VMs carved on a bare-metal box you already
-# ordered, `mngr imbue_cloud admin server register`ed, and `... prep`ped
-# (status `ready`). They are thin wrappers over `minds pool create`, which
+# ordered, `minds-admin server register`ed, and `... prep`ped
+# (status `ready`). They are thin wrappers over `minds-admin pool create`, which
 # resolves the tier's pool key (+ host_pool DSN for shared tiers) from Vault
 # automatically.
 #
-# Prereqs: activate a minds env first (`eval "$(uv run minds env activate <name>)"`)
+# Prereqs: activate a minds env first (`eval "$(uv run minds-admin env activate <name>)"`)
 # AND `vault login -method=oidc` (the wrapper's Vault reads need a live token).
 #
 # `region` is the lease-region LABEL stamped on each row (what the connector
@@ -1029,19 +1533,69 @@ create-new-mind-repo repo_name parent_dir="$HOME/project":
 # datacenter code. Server selection picks the `ready` box with the most free
 # slots and is not region-filtered today, so the box must have a free slot.
 
+# Deploy the fixed per-tier OAuth redirector (apps/oauth_redirector) -- once per
+# dev/CI tier, NOT part of `minds-admin env deploy` (it is tier-level and holds no
+# secrets). Bakes the tier's connector-hostname allowlist at deploy time and
+# prints the deployed URL; register that URL as the sole redirect URI on the
+# tier's shared Google Web client and set it as OAUTH_REDIRECTOR_URL in the
+# tier's `sharing` Vault entry. Production/staging register their stable
+# accounts domain directly and never need this.
+#   just deploy-oauth-redirector dev    # deploys into the minds-dev workspace's main env
+#   just deploy-oauth-redirector ci
+[group("minds ops")]
+deploy-oauth-redirector tier:
+    #!/usr/bin/env bash
+    set -ueo pipefail
+    tier="{{tier}}"
+    case "$tier" in
+        dev) workspace="minds-dev" ;;
+        ci) workspace="minds-ci" ;;
+        *) echo "error: the redirector is only for the dev/ci tiers (got '$tier')" >&2; exit 2 ;;
+    esac
+    # Per-env connector hosts follow <workspace>-<env>--rsc-<tier>-api.modal.run
+    # (see per_env_deploy.per_env_connector_url); the tier-shared shape without
+    # an env segment is also allowed for completeness.
+    allowed_host_regex="${workspace}(-[a-z0-9-]+)?--rsc-${tier}-api\.modal\.run"
+    # Best-effort: bake the tier's Bugsink DSN (error reporting) when the
+    # Vault entry is populated and a vault token is live; empty simply
+    # disables reporting in the deployed redirector.
+    sentry_dsn="$(uv run python - "$tier" 2>/dev/null <<'PYEOF' || true
+    import sys
+
+    from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
+    from imbue.minds.envs.vault_reader import VaultPath
+    from imbue.minds.envs.vault_reader import read_vault_kv
+
+    with ConcurrencyGroup(name="oauth-redirector-sentry-dsn") as cg:
+        values = read_vault_kv(VaultPath(f"secrets/minds/{sys.argv[1]}/sentry"), parent_concurrency_group=cg)
+    print(values.get("OAUTH_REDIRECTOR_SENTRY_DSN", ""))
+    PYEOF
+    )"
+    if [ -z "$sentry_dsn" ]; then
+        echo "note: no OAUTH_REDIRECTOR_SENTRY_DSN in secrets/minds/$tier/sentry (or no vault token); deploying without error reporting"
+    fi
+    MNGR_DEPLOY_ENV="$tier" OAUTH_REDIRECTOR_ALLOWED_HOST_REGEX="$allowed_host_regex" \
+        OAUTH_REDIRECTOR_SENTRY_DSN="$sentry_dsn" \
+        uv run modal deploy --name "oauth-redirector-$tier" --env main \
+        apps/oauth_redirector/imbue/oauth_redirector/app.py
+    echo
+    echo "Deployed. The forward endpoint is https://${workspace}--oauth-redirector-${tier}-redirect.modal.run/forward"
+    echo "1. Register that URL as the sole authorized redirect URI on the $tier tier's shared Google Web client."
+    echo "2. Set OAUTH_REDIRECTOR_URL to it in the tier's 'sharing' Vault entry and redeploy the connector."
+
 # Dev slice bake from a working tree (identity = its origin remote + current branch).
 # workspace_dir resolves: explicit arg, else DEFAULT_WORKSPACE_TEMPLATE_DIR (shell or gitignored
 # apps/minds/.env), else the .external_worktrees/default-workspace-template checkout
 # that `just default-workspace-template-worktree` creates. No personal path baked in.
 [group("minds ops")]
-bake-slice-dev region workspace_dir="" count="1" *extra_args:
+pool-bake-from-worktree region workspace_dir="" count="1" *extra_args:
     #!/usr/bin/env bash
     set -ueo pipefail
     wd="{{workspace_dir}}"
     if [ -z "$wd" ]; then
         [ -f apps/minds/.env ] && { set -a; . apps/minds/.env; set +a; }
         # $PWD is the repo root (just runs recipes from the justfile dir); keeps
-        # the fallback absolute, which minds pool create's --workspace-dir wants.
+        # the fallback absolute, which minds-admin pool create's --workspace-dir wants.
         wd="${DEFAULT_WORKSPACE_TEMPLATE_DIR:-$PWD/.external_worktrees/default-workspace-template}"
     fi
     if [ ! -d "$wd/.git" ]; then
@@ -1050,7 +1604,7 @@ bake-slice-dev region workspace_dir="" count="1" *extra_args:
         echo "       to your default_workspace_template clone." >&2
         exit 2
     fi
-    uv run minds pool create \
+    uv run minds-admin pool create \
         --count "{{count}}" \
         --region "{{region}}" \
         --workspace-dir "$wd" \
@@ -1061,8 +1615,8 @@ bake-slice-dev region workspace_dir="" count="1" *extra_args:
 # tag). Pass `--dry-run` through extra args first to confirm server selection +
 # per-slice sizing without baking.
 [group("minds ops")]
-bake-slice-prod region tag count="1" *extra_args:
-    uv run minds pool create \
+pool-bake region tag count="1" *extra_args:
+    uv run minds-admin pool create \
         --count "{{count}}" \
         --region "{{region}}" \
         --from-tag "{{tag}}" \
@@ -1070,64 +1624,123 @@ bake-slice-prod region tag count="1" *extra_args:
 
 # Add a paid user to the activated minds env. Resolves the connector URL (from the
 # env's client.toml) and the paid-list admin key (from the tier's Vault) automatically,
-# so this is a one-shot. Activate first: eval "$(uv run minds env activate <name>)" and
-# `vault login`. Use `minds paid remove`/`list` for the other operations.
+# so this is a one-shot. Activate first: eval "$(uv run minds-admin env activate <name>)" and
+# `vault login`. Use `minds-admin paid email remove`/`list` (or `paid domain ...`)
+# for the other operations.
 #   just add-paid-email someone@example.com
 [group("minds ops")]
 add-paid-email email:
-    uv run minds paid add "{{email}}"
+    uv run minds-admin paid email add "{{email}}"
 
 # List pool_hosts rows for the activated minds env (read-only).
 [group("minds ops")]
-list-pool-hosts:
-    uv run minds pool list
+pool-list:
+    uv run minds-admin pool list
 
 # List bare-metal servers (per-server + fleet slot accounting) for the activated
 # minds env (read-only; DSN resolved from the env, no manual exports).
+#
+# NOTE: the slot columns are derived from THIS env's pool_hosts rows, so a box
+# shared with another env reads as emptier than it is. Use `just server-audit` for
+# true occupancy before deciding you have free slots.
 [group("minds ops")]
-list-servers:
-    uv run minds server list
+server-list:
+    uv run minds-admin server list
+
+# Audit every bare-metal box for the activated env: SSH each one and report its
+# REAL occupancy (all envs' slices, not just this env's rows) plus any cross-tier
+# contamination -- a slice stamped for another TIER, or an extra key in the lima
+# user's authorized_keys (prep writes exactly one, so a second was added by hand).
+#
+# Tiers are isolated by construction (each has its own pool keypair, and there is
+# meant to be zero cross-tier reach), so a box serving two tiers is a box both
+# tiers' keys can SSH -- each tier's operators and connector gain limactl, and so
+# root, over the other's workspaces. A bake onto a contaminated box now refuses;
+# this is how you find one WITHOUT a failed bake.
+# Read-only. Activate first and `vault login` (the pool SSH key comes from Vault).
+#
+#   eval "$(uv run minds-admin env activate staging)" && just server-audit
+[group("minds ops")]
+server-audit:
+    uv run minds-admin server list --verify-occupancy
+
+# Preview + place a bare-metal box order with OVH (env-aware: OVH creds from the
+# activated tier's ovh Vault entry, pool DSN from the tier -- no manual exports).
+# Pass --dry-run first to print the real OVH price preview + derived specs
+# without charging; the real order records a bare_metal_servers row at 'ordered'
+# and echoes its server id for `just server-await-delivery` / `just server-setup`.
+#
+#   just server-order --dry-run --plan-code 24sys03-v1-us --region vin --memory-gb 128 --storage softraid-2x960nvme ...
+[group("minds ops")]
+server-order *args:
+    uv run minds-admin server order {{args}}
+
+# Wait for OVH to deliver an ordered box (assign a serviceName + IP), then mark
+# its row 'delivered'. Resumable; a no-op once delivered. Env-aware like
+# `server-order` (OVH creds + DSN from the activated tier).
+#
+#   just server-await-delivery <bare-metal-server-id>
+[group("minds ops")]
+server-await-delivery server_id:
+    uv run minds-admin server await-delivery --server-id "{{server_id}}"
+
+# Provision a delivered box to 'ready': reinstall our OS (destructive, injects
+# our SSH host key), wait for SSH, then run the same composed prep as
+# `server-prep` (qemu/lima/tooling + image staging + the observability collector
+# when the tier has a boxes ingest credential, verified active -- a failed
+# collector fails the prep and the box is NOT marked ready). Env-aware: OVH
+# creds, pool DSN, and pool SSH key from the activated tier. Resumable via status.
+#
+#   just server-setup <bare-metal-server-id>
+[group("minds ops")]
+server-setup server_id *extra_args:
+    uv run minds-admin server setup --server-id "{{server_id}}" {{extra_args}}
 
 # (Re-)prep a bare-metal box for slice baking: qemu/lima/tooling + image staging +
 # the per-box default-workspace-template image cache dir. Pool SSH key + DSN come from
 # the activated tier's Vault entry / env secrets, so no manual exports. Idempotent.
 # The cache-lock path also `mkdir -p`s the cache dir on demand, so boxes prepped
 # under the old dir name do not need a re-prep for production --from-tag bakes.
+# The observability collector is handled in-process by `minds-admin server prep`:
+# when the tier's observability Vault entry carries a boxes ingest credential, the
+# prep installs/refreshes the pinned OpenTelemetry Collector and verifies its unit
+# is active (fail-closed); absent credential = clean skip. Re-prepping is also how
+# the collector rolls out to the existing fleet.
 #
-#   just prep-server <bare-metal-server-id>
+#   just server-prep <bare-metal-server-id>
 [group("minds ops")]
-prep-server server_id *extra_args:
-    uv run minds server prep --server-id "{{server_id}}" {{extra_args}}
+server-prep server_id *extra_args:
+    uv run minds-admin server prep --server-id "{{server_id}}" {{extra_args}}
 
 # One-time host-key backfill for the activated minds env. Keyscans every
 # pre-existing pool host + bare-metal box whose recorded sshd host key columns
 # are still null and records them, so rows baked before host-key pinning become
 # leasable / prep-able again. Run ONCE per tier right after deploying the
-# host-key-pinning connector (`just deploy`); after it runs, leasing and prep
+# host-key-pinning connector (`just services-deploy`); after it runs, leasing and prep
 # fail closed on any row still missing a pinned key. Idempotent -- rows that
 # already have keys are skipped. Activate first (use-only is enough; this needs
 # Vault + the host_pool DB + ssh-keyscan, not Modal) and `vault login`.
 #
-#   eval "$(uv run minds env activate staging)" && just backfill-pool-host-keys
+#   eval "$(uv run minds-admin env activate staging)" && just pool-backfill-host-keys
 [group("minds ops")]
-backfill-pool-host-keys:
-    uv run minds pool backfill-host-keys
+pool-backfill-host-keys:
+    uv run minds-admin pool backfill-host-keys
 
 # Destroy pool hosts in parallel: atomically claim each row (so a user cannot lease
 # it mid-destroy), destroy its slice lima VM (freeing the box slot), then drop the
-# row. Find the ids with `just list-pool-hosts`. Extra flags forward to
-# `minds pool destroy` (e.g. --force to also destroy a leased row, --drop-row-only
+# row. Find the ids with `just pool-list`. Extra flags forward to
+# `minds-admin pool destroy` (e.g. --force to also destroy a leased row, --drop-row-only
 # for rows whose box record is gone or whose machine is permanently dead).
 #
-#   just destroy-pool-hosts <pool-host-id> [<pool-host-id> ...]
+#   just pool-destroy <pool-host-id> [<pool-host-id> ...]
 #
 # Note: the steady-state teardown is automatic -- the connector destroys a host's
-# slice VM when its lease ends. `minds env destroy` tears down a whole env's
+# slice VM when its lease ends. `minds-admin env destroy` tears down a whole env's
 # unleased slices. This recipe is the manual escape hatch (e.g. retiring the old
 # `available` rows after baking a new pool generation).
 [group("minds ops")]
-destroy-pool-hosts *args:
-    uv run minds pool destroy {{args}}
+pool-destroy *args:
+    uv run minds-admin pool destroy {{args}}
 
 # Args forward as-is, e.g. `just release patch`, `just release patch --dry-run
 # --minor mngr`, or `just release --watch`. See scripts/release.py's header for
@@ -1170,3 +1783,17 @@ changelog-trigger:
     uv run mngr schedule run changelog-consolidation --provider "$provider" $disable_args
 
 alias dwt-worktree := default-workspace-template-worktree
+
+# Transitional aliases for the pre-rename names (drop once nothing references them).
+alias deploy := services-deploy
+alias bake-slice-prod := pool-bake
+alias bake-slice-dev := pool-bake-from-worktree
+alias list-pool-hosts := pool-list
+alias destroy-pool-hosts := pool-destroy
+alias backfill-pool-host-keys := pool-backfill-host-keys
+alias list-servers := server-list
+alias audit-boxes := server-audit
+alias order-server := server-order
+alias await-delivery := server-await-delivery
+alias setup-server := server-setup
+alias prep-server := server-prep

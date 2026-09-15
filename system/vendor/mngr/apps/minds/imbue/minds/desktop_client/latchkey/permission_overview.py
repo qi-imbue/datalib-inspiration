@@ -27,21 +27,25 @@ narrowing) an existing grant is done through the ordinary agent-driven
 permission-request flow, not here.
 """
 
+import threading
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Final
 
 from loguru import logger
 from pydantic import Field
 
+from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.minds.desktop_client.backend_resolver import BackendResolverInterface
 from imbue.minds.desktop_client.latchkey.gateway_client import LatchkeyGatewayClient
-from imbue.minds.desktop_client.workspace_color import DEFAULT_WORKSPACE_COLOR
 from imbue.mngr.primitives import AgentId
 from imbue.mngr.primitives import HostId
 from imbue.mngr_latchkey.core import DEFAULT_ACCOUNT
 from imbue.mngr_latchkey.core import Latchkey
+from imbue.mngr_latchkey.core import LatchkeyServiceInfo
 from imbue.mngr_latchkey.core import ServiceAccountCredential
 from imbue.mngr_latchkey.services_catalog import ServicePermissionInfo
 from imbue.mngr_latchkey.services_catalog import ServicesCatalog
@@ -59,25 +63,27 @@ _WILDCARD_DESCRIPTION = "Unrestricted access: any request to this service is per
 # unions per-feature permission schemas onto it rather than minting dedicated
 # scopes). So the whole ``latchkey-self`` rule must never be deleted; each
 # feature is read back by its permission-name prefix and revoked by removing
-# only its own permission names from the rule.
-_SELF_SCOPE = "latchkey-self"
+# only its own permission names from the rule. Public because the
+# per-workspace toggle screen (:mod:`permission_toggles`) rewrites the same
+# rule.
+SELF_SCOPE = "latchkey-self"
 
 # File-sharing grants: per-path permission schemas named
 # ``minds-file-server-<access>-<absolute-path>`` (see the gateway's
 # ``permission_requests.mjs``).
-_FILE_SHARING_PERMISSION_PREFIX = "minds-file-server-"
+FILE_SHARING_PERMISSION_PREFIX = "minds-file-server-"
 _FILE_SHARING_READ = "read"
 _FILE_SHARING_WRITE = "write"
 # User-facing labels: a write grant is a read+write superset, so it reads as
 # "read and write"; a read-only grant reads as "read".
-_FILE_SHARING_READ_LABEL = "read"
-_FILE_SHARING_WRITE_LABEL = "read and write"
+FILE_SHARING_READ_LABEL = "read"
+FILE_SHARING_WRITE_LABEL = "read and write"
 
 # Cross-workspace-management grants: verb permission schemas named
 # ``minds-workspaces-<verb>`` (an all-workspaces grant) or
 # ``minds-workspaces-<verb>-<target_agent_id>`` (a grant pinned to one target
 # workspace). ``read`` / ``create`` are all-or-nothing; the rest are targeted.
-_WORKSPACE_PERMISSION_PREFIX = "minds-workspaces-"
+WORKSPACE_PERMISSION_PREFIX = "minds-workspaces-"
 _WORKSPACE_VERB_BY_PERMISSION = {verb.permission: verb for verb in WORKSPACE_VERBS}
 _TARGETED_WORKSPACE_VERB_PERMISSIONS = tuple(verb.permission for verb in WORKSPACE_VERBS if verb.is_targeted)
 
@@ -103,23 +109,6 @@ class SharedPath(FrozenModel):
     access_label: str = Field(description="User-facing access level: ``read`` or ``read and write``.")
 
 
-class WorkspaceFileSharingGrant(FrozenModel):
-    """The file-sharing access a single workspace's host has been granted.
-
-    ``paths`` lists every shared path with its effective access level (a path that
-    has a write grant reads as ``read and write``; read-only paths read as
-    ``read``), sorted by path. The settings template renders these as full-width
-    cards, one path per row, so the individual paths are visible rather than
-    hidden behind a tooltip.
-    """
-
-    workspace_agent_id: str = Field(description="Primary workspace agent id (used to resolve the host on revoke).")
-    workspace_name: str = Field(description="Human-readable workspace display name shown as the card header.")
-    host_id: str = Field(description="Host the grant lives on (every agent on the host shares it).")
-    color: str = Field(description="Workspace accent color hex (``#rrggbb``) for the card header dot.")
-    paths: tuple[SharedPath, ...] = Field(description="Shared paths with their access level, sorted by path.")
-
-
 # Label shown for a service's single unnamed "default" account (latchkey keys it
 # by the empty string). Users never typed a name for it, so we show a neutral
 # placeholder rather than an empty row.
@@ -133,105 +122,6 @@ class ServiceAccount(FrozenModel):
         description='Latchkey account key (an e-mail / handle; ``""`` for the unnamed default); the disconnect key.',
     )
     label: str = Field(description="User-facing account label (the default account reads as ``Default account``).")
-
-
-class ServiceAccountOverview(FrozenModel):
-    """All active-workspace grants held for one account of a predefined service.
-
-    One of these renders as one Connectors section: the account's own header
-    (with its Disconnect / Revoke-all actions) and a card per workspace that
-    holds permissions for it. Sections exist for accounts with no grants too,
-    so a freshly-connected account is visible (and disconnectable) right away.
-    """
-
-    account: str = Field(
-        description='Latchkey account key (an e-mail / handle; ``""`` for the unnamed default); the revoke key.',
-    )
-    label: str = Field(description="User-facing account label (the default account reads as ``Default account``).")
-    is_connected: bool = Field(
-        description=(
-            "Whether latchkey stores credentials for the account. ``False`` for an account that "
-            "only appears in some host's rules -- its credentials were cleared elsewhere, or it "
-            "was granted before ever being connected -- which is shown so those (inert) grants "
-            "can still be revoked."
-        ),
-    )
-    workspace_grants: tuple["WorkspaceServiceGrant", ...] = Field(
-        description="One entry per active workspace that has at least one permission for this account.",
-    )
-
-
-class WorkspaceServiceGrant(FrozenModel):
-    """The permissions a single workspace's host has been granted for one service."""
-
-    workspace_agent_id: str = Field(description="Primary workspace agent id (used to resolve the host on revoke).")
-    workspace_name: str = Field(description="Human-readable workspace display name shown as the column header.")
-    host_id: str = Field(description="Host the grant lives on (every agent on the host shares it).")
-    color: str = Field(description="Workspace accent color hex (``#rrggbb``) for the column header dot.")
-    permissions: tuple[GrantedPermission, ...] = Field(
-        description="Permissions granted under this service, in catalog order, each with its tooltip description.",
-    )
-
-
-class ServicePermissionOverview(FrozenModel):
-    """Every account-scoped Connectors section belonging to one predefined service.
-
-    The service level only carries what is genuinely service-wide: its label and
-    the "+ Add account" action. All grants hang off the individual accounts.
-    """
-
-    service_name: str = Field(description="Raw service name (e.g. ``slack``); used as the revoke action key.")
-    display_name: str = Field(description="Human-readable service label shown above the account sections.")
-    accounts: tuple[ServiceAccountOverview, ...] = Field(
-        description=(
-            "One entry per account of this service: those latchkey has credentials for (read via "
-            "``latchkey auth list --offline``) plus any that only appear in a host's rules."
-        ),
-    )
-
-
-class _WorkspaceHost(FrozenModel):
-    """An active workspace resolved to its host and display metadata."""
-
-    agent_id: str
-    workspace_name: str
-    host_id: HostId
-    color: str
-
-
-def _list_active_workspace_hosts(backend_resolver: BackendResolverInterface) -> tuple[_WorkspaceHost, ...]:
-    """Resolve every active (non-destroyed) workspace to its host + display metadata.
-
-    Skips workspaces whose host cannot be resolved yet (transient discovery gap)
-    or whose resolver reports a non-:class:`HostId` placeholder (e.g. the static
-    resolver's ``"localhost"``). De-duplicates by host so a host that somehow
-    carries two primary agents is only listed once (first wins).
-    """
-    hosts: list[_WorkspaceHost] = []
-    seen_host_ids: set[HostId] = set()
-    for agent_id in backend_resolver.list_active_workspace_ids():
-        info = backend_resolver.get_agent_display_info(agent_id)
-        if info is None:
-            continue
-        try:
-            host_id = HostId(info.host_id)
-        except ValueError:
-            logger.debug("Skipping machine {} with non-HostId host {!r}", agent_id, info.host_id)
-            continue
-        if host_id in seen_host_ids:
-            continue
-        seen_host_ids.add(host_id)
-        workspace_name = backend_resolver.get_workspace_name(agent_id) or info.agent_name
-        color = backend_resolver.get_workspace_color(agent_id) or DEFAULT_WORKSPACE_COLOR
-        hosts.append(
-            _WorkspaceHost(
-                agent_id=str(agent_id),
-                workspace_name=workspace_name,
-                host_id=host_id,
-                color=color,
-            )
-        )
-    return tuple(hosts)
 
 
 def _granted_permissions(
@@ -263,76 +153,110 @@ def _granted_permissions(
     return tuple(permissions)
 
 
-def build_permission_overview(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    services_catalog: ServicesCatalog,
+# Ceiling on how long the parallel browser-support probes may take to join.
+# Must stay above latchkey's own ``services info`` timeout so a stalled probe
+# resolves the way it does on its own (degrading to "unknown") instead of
+# failing the whole settings page on the join.
+_BROWSER_SUPPORT_PROBE_EXIT_TIMEOUT_SECONDS: Final[float] = 30.0
+
+
+def probe_services_info(
     latchkey: Latchkey,
-) -> tuple[ServicePermissionOverview, ...]:
-    """Assemble the per-account, per-workspace grant overview for the settings page.
+    service_names: Sequence[str],
+) -> dict[str, LatchkeyServiceInfo]:
+    """Read ``latchkey services info`` for several services at once.
 
-    Reads each active workspace host's permissions file once (through the
-    gateway extension) and resolves its per-account grants with
-    :meth:`ServicesCatalog.list_service_account_grants` -- the single place that
-    turns a permissions file into (service, account, permissions) triples by
-    inspecting the schemas rather than the rule keys. Those grants are then
-    grouped by service and account. A service is returned when it has at least
-    one account -- either one latchkey stores credentials for or one that only
-    appears in a host's grants -- and the result is sorted by display name for a
-    stable UI.
-
-    Raises :class:`LatchkeyGatewayClientError` if a host file cannot be read.
-    Because every host shares one gateway, a read error almost always means the
-    gateway itself is unavailable, so the caller surfaces an explicit
-    "unavailable" state rather than silently rendering the page as if nothing
-    were granted (a missing file is not an error -- the client maps it to an
-    empty config).
+    How a service is signed in to (``is_browser_auth_supported``) and what
+    credentials it asks for (``set_credentials_example``) are only known from
+    this call, and it is one subprocess per service, so the probes run on a
+    thread each (they are independent, and each writes its own key) rather than
+    adding up in series on a page's critical path. ``--offline`` keeps every
+    probe a local lookup. A service whose probe did not report (``None``) is
+    absent from the result, so callers decide what an unknown service
+    defaults to instead of mistaking a guess for latchkey's answer.
     """
-    hosts = _list_active_workspace_hosts(backend_resolver)
-    plugin_data_dir = latchkey.plugin_data_dir
-    # (service, account) -> the hosts that grant it, with the granted permissions.
-    grants_by_service_account: dict[tuple[str, str], list[tuple[_WorkspaceHost, frozenset[str]]]] = {}
-    for host in hosts:
-        config = gateway_client.get_permissions_config(permissions_path_for_host(plugin_data_dir, host.host_id))
-        for grant in services_catalog.list_service_account_grants(config):
-            key = (grant.service_name, grant.account)
-            grants_by_service_account.setdefault(key, []).append((host, frozenset(grant.permissions)))
+    service_info_by_name: dict[str, LatchkeyServiceInfo] = {}
 
-    # One ``latchkey auth list --offline`` call reports every service's stored
-    # accounts, so we don't shell out per service while rendering the page.
-    accounts_by_service = latchkey.auth_list(is_offline=True)
+    def _probe_one_service(service_name: str) -> None:
+        info = latchkey.services_info(service_name, is_offline=True)
+        if info is not None:
+            service_info_by_name[service_name] = info
 
-    overviews: list[ServicePermissionOverview] = []
-    for service_name, service_infos in services_catalog.as_mapping().items():
-        if not service_infos:
-            continue
-        stored_accounts = _service_accounts(accounts_by_service.get(service_name, ()))
-        stored_account_names = frozenset(entry.account for entry in stored_accounts)
-        granted_accounts = frozenset(
-            account for granted_service, account in grants_by_service_account if granted_service == service_name
-        )
-        not_connected_accounts = _sorted_accounts_by_label(granted_accounts - stored_account_names)
-        account_overviews = tuple(
-            ServiceAccountOverview(
-                account=account,
-                label=_account_label(account),
-                is_connected=account in stored_account_names,
-                workspace_grants=_workspace_grants_for_account(
-                    service_infos,
-                    grants_by_service_account.get((service_name, account), ()),
-                ),
+    concurrency_group = ConcurrencyGroup(
+        name="connectors-browser-support",
+        exit_timeout_seconds=_BROWSER_SUPPORT_PROBE_EXIT_TIMEOUT_SECONDS,
+    )
+    with concurrency_group:
+        for service_name in service_names:
+            concurrency_group.start_new_thread(
+                target=_probe_one_service,
+                args=(service_name,),
+                name=f"browser-support-{service_name}",
             )
-            for account in tuple(entry.account for entry in stored_accounts) + not_connected_accounts
-        )
-        if account_overviews:
-            overviews.append(
-                ServicePermissionOverview(
-                    service_name=service_name,
-                    display_name=service_infos[0].display_name,
-                    accounts=account_overviews,
+    return service_info_by_name
+
+
+class ServiceSignInOptions(FrozenModel):
+    """How a service can be signed in to, from its ``services info`` probe.
+
+    The static half of that call: which auth options latchkey compiled in for
+    the service, and the credential command it advertises. Unlike the accounts
+    and credential status the same call returns, these are fixed properties of
+    the latchkey binary, which is why they can be remembered.
+    """
+
+    is_browser_auth_supported: bool = Field(description="Whether latchkey can sign this service in through a browser.")
+    set_credentials_example: str = Field(description="Advertised credential command, empty when it advertises none.")
+
+
+# Remembered per service for the life of the process. The probe is one
+# subprocess per service and the pane offers every catalog service, so probing
+# on each payload build put a burst of them on every toggle write. Only a probe
+# that reported is stored: one that timed out is retried on the next build
+# rather than remembered as a guess about how the service connects.
+_SIGN_IN_OPTIONS_BY_SERVICE: Final[dict[str, ServiceSignInOptions]] = {}
+_SIGN_IN_OPTIONS_LOCK: Final[threading.Lock] = threading.Lock()
+
+
+def clear_service_sign_in_options_cache() -> None:
+    """Forget how services connect, so the next probe asks latchkey again.
+
+    The answers are fixed for a given latchkey binary, so the only things that
+    invalidate them are that binary changing under a running process, and a
+    test swapping in a different latchkey.
+    """
+    with _SIGN_IN_OPTIONS_LOCK:
+        _SIGN_IN_OPTIONS_BY_SERVICE.clear()
+
+
+def probe_service_sign_in_options(
+    latchkey: Latchkey,
+    service_names: Sequence[str],
+) -> dict[str, ServiceSignInOptions]:
+    """How each service connects, probing only the ones not already known.
+
+    A service missing from the result is one whose probe did not report; the
+    caller decides what that defaults to.
+    """
+    with _SIGN_IN_OPTIONS_LOCK:
+        unknown = tuple(name for name in service_names if name not in _SIGN_IN_OPTIONS_BY_SERVICE)
+    if unknown:
+        probed = probe_services_info(latchkey, unknown)
+        for service_name in unknown:
+            if service_name not in probed:
+                logger.debug("No services-info probe for {}; assuming its browser sign-in", service_name)
+        with _SIGN_IN_OPTIONS_LOCK:
+            for service_name, info in probed.items():
+                _SIGN_IN_OPTIONS_BY_SERVICE[service_name] = ServiceSignInOptions(
+                    is_browser_auth_supported=info.is_browser_auth_supported,
+                    set_credentials_example=info.set_credentials_example or "",
                 )
-            )
-    return tuple(sorted(overviews, key=lambda overview: overview.display_name.lower()))
+    with _SIGN_IN_OPTIONS_LOCK:
+        return {
+            service_name: _SIGN_IN_OPTIONS_BY_SERVICE[service_name]
+            for service_name in service_names
+            if service_name in _SIGN_IN_OPTIONS_BY_SERVICE
+        }
 
 
 def _sorted_accounts_by_label(accounts: Iterable[str]) -> tuple[str, ...]:
@@ -340,38 +264,7 @@ def _sorted_accounts_by_label(accounts: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(accounts, key=lambda account: (account == DEFAULT_ACCOUNT, account.lower())))
 
 
-def _workspace_grants_for_account(
-    service_infos: Sequence[ServicePermissionInfo],
-    host_grants: Sequence[tuple[_WorkspaceHost, frozenset[str]]],
-) -> tuple[WorkspaceServiceGrant, ...]:
-    """Turn one account's per-host grants into the settings page's workspace cards.
-
-    A host may grant the same account under more than one of the service's
-    scopes (e.g. GitHub's REST and git scopes), so the permissions of all of its
-    grants are unioned into a single card.
-    """
-    permissions_by_host: dict[str, tuple[_WorkspaceHost, set[str]]] = {}
-    for host, permissions in host_grants:
-        _, granted = permissions_by_host.setdefault(host.agent_id, (host, set()))
-        granted.update(permissions)
-    cards: list[WorkspaceServiceGrant] = []
-    for host, granted in permissions_by_host.values():
-        permissions = _granted_permissions(service_infos, frozenset(granted))
-        if not permissions:
-            continue
-        cards.append(
-            WorkspaceServiceGrant(
-                workspace_agent_id=host.agent_id,
-                workspace_name=host.workspace_name,
-                host_id=str(host.host_id),
-                color=host.color,
-                permissions=permissions,
-            )
-        )
-    return tuple(cards)
-
-
-def _account_label(account: str) -> str:
+def account_label(account: str) -> str:
     """Render a latchkey account key as a user-facing label (default account is unnamed)."""
     return _DEFAULT_ACCOUNT_LABEL if account == DEFAULT_ACCOUNT else account
 
@@ -383,7 +276,7 @@ def _service_accounts(accounts: Sequence[ServiceAccountCredential]) -> tuple[Ser
     any) shown last.
     """
     return tuple(
-        ServiceAccount(account=account.account, label=_account_label(account.account))
+        ServiceAccount(account=account.account, label=account_label(account.account))
         for account in sorted(accounts, key=lambda entry: (entry.account == DEFAULT_ACCOUNT, entry.account.lower()))
     )
 
@@ -400,11 +293,14 @@ def disconnect_account(latchkey: Latchkey, service_name: str, account: str) -> b
     is_success, detail = latchkey.auth_clear(service_name, account=account)
     if not is_success:
         raise PermissionOverviewError(f"Could not disconnect account '{account or 'default'}': {detail}")
-    remaining = latchkey.services_info(service_name, is_offline=True).accounts
-    return len(remaining) == 0
+    remaining_info = latchkey.services_info(service_name, is_offline=True)
+    # The clear itself already succeeded, so a follow-up probe that does not
+    # answer reads as "none left": claiming leftover accounts would only
+    # suppress the (idempotent) revoke-all cleanup.
+    return remaining_info is None or len(remaining_info.accounts) == 0
 
 
-def _parse_file_sharing_permission(permission_name: str) -> tuple[str, str] | None:
+def parse_file_sharing_permission(permission_name: str) -> tuple[str, str] | None:
     """Split a ``minds-file-server-<access>-<path>`` name into ``(access, path)``.
 
     Returns ``None`` for any permission name that is not a well-formed
@@ -413,148 +309,19 @@ def _parse_file_sharing_permission(permission_name: str) -> tuple[str, str] | No
     before the first ``-`` after the prefix; the remainder (which starts with
     ``/``) is the absolute path.
     """
-    if not permission_name.startswith(_FILE_SHARING_PERMISSION_PREFIX):
+    if not permission_name.startswith(FILE_SHARING_PERMISSION_PREFIX):
         return None
-    remainder = permission_name[len(_FILE_SHARING_PERMISSION_PREFIX) :]
+    remainder = permission_name[len(FILE_SHARING_PERMISSION_PREFIX) :]
     access, separator, path = remainder.partition("-")
     if not separator or access not in (_FILE_SHARING_READ, _FILE_SHARING_WRITE) or not path:
         return None
     return access, path
 
 
-def build_file_sharing_overview(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    latchkey: Latchkey,
-) -> tuple[WorkspaceFileSharingGrant, ...]:
-    """Assemble the per-workspace file-sharing grant overview for the settings page.
-
-    Reads each active workspace host's permissions file once (through the gateway
-    extension), pulls the ``minds-file-server-*`` permissions out of the shared
-    ``latchkey-self`` rule, and lists every shared path with its effective access
-    level (a path that has a write grant reads as ``read and write``). Only
-    workspaces with at least one file-sharing grant are returned, sorted by
-    workspace name. Raises :class:`LatchkeyGatewayClientError` on a read failure
-    (see :func:`build_permission_overview`).
-    """
-    plugin_data_dir = latchkey.plugin_data_dir
-    grants: list[WorkspaceFileSharingGrant] = []
-    for host in _list_active_workspace_hosts(backend_resolver):
-        path = permissions_path_for_host(plugin_data_dir, host.host_id)
-        permissions = gateway_client.get_permission_rules(path).get(_SELF_SCOPE, ())
-        read_paths: set[str] = set()
-        write_paths: set[str] = set()
-        for permission_name in permissions:
-            parsed = _parse_file_sharing_permission(permission_name)
-            if parsed is None:
-                continue
-            access, shared_path = parsed
-            (write_paths if access == _FILE_SHARING_WRITE else read_paths).add(shared_path)
-        all_paths = read_paths | write_paths
-        if not all_paths:
-            continue
-        # A path with a write grant is read+write; otherwise read-only.
-        shared_paths = tuple(
-            SharedPath(
-                path=shared_path,
-                access_label=_FILE_SHARING_WRITE_LABEL if shared_path in write_paths else _FILE_SHARING_READ_LABEL,
-            )
-            for shared_path in sorted(all_paths)
-        )
-        grants.append(
-            WorkspaceFileSharingGrant(
-                workspace_agent_id=host.agent_id,
-                workspace_name=host.workspace_name,
-                host_id=str(host.host_id),
-                color=host.color,
-                paths=shared_paths,
-            )
-        )
-    return tuple(sorted(grants, key=lambda grant: grant.workspace_name.lower()))
-
-
-def _revoke_file_sharing_at_path(gateway_client: LatchkeyGatewayClient, permissions_file_path: Path) -> None:
-    """Strip every ``minds-file-server-*`` permission from the host file's ``latchkey-self`` rule.
-
-    The rule also carries unrelated baseline / accounts / workspace permissions,
-    so we rewrite it with just the file-sharing entries filtered out rather than
-    deleting the whole rule. A no-op when the host has no file-sharing grants.
-    (The now-orphaned per-path schema definitions are left in the file's
-    ``schemas`` object; they are unreferenced and harmless, and a re-grant
-    overwrites them by name.)
-    """
-    permissions = gateway_client.get_permission_rules(permissions_file_path).get(_SELF_SCOPE, ())
-    kept = tuple(name for name in permissions if _parse_file_sharing_permission(name) is None)
-    if len(kept) == len(permissions):
-        return
-    gateway_client.set_permission_rule(permissions_file_path, _SELF_SCOPE, kept)
-
-
-def revoke_file_sharing_for_workspace(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    latchkey: Latchkey,
-    workspace_agent_id: str,
-) -> None:
-    """Remove all file-sharing grants from the given workspace's host file.
-
-    Raises :class:`PermissionOverviewError` for an unresolvable workspace.
-    """
-    host_id = _resolve_host_id(backend_resolver, workspace_agent_id)
-    if host_id is None:
-        raise PermissionOverviewError(
-            f"Could not resolve host for workspace '{workspace_agent_id}'; cannot revoke.",
-        )
-    _revoke_file_sharing_at_path(gateway_client, permissions_path_for_host(latchkey.plugin_data_dir, host_id))
-
-
-def revoke_file_sharing_for_all_workspaces(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    latchkey: Latchkey,
-) -> int:
-    """Remove all file-sharing grants from every active workspace host. Returns hosts processed."""
-    plugin_data_dir = latchkey.plugin_data_dir
-    hosts = _list_active_workspace_hosts(backend_resolver)
-    for host in hosts:
-        _revoke_file_sharing_at_path(gateway_client, permissions_path_for_host(plugin_data_dir, host.host_id))
-    return len(hosts)
-
-
 # -- Cross-workspace management ("workspace") grants ---------------------------
 
 
-class WorkspaceDelegationVerb(FrozenModel):
-    """One cross-workspace verb a granting workspace holds, and the target(s) it covers."""
-
-    verb_permission: str = Field(
-        description="Detent verb schema name (e.g. ``minds-workspaces-destroy``); revoke key."
-    )
-    label: str = Field(description="Short verb label shown in the chip (e.g. ``destroy``, ``backups-export``).")
-    description: str = Field(description="Plain-English summary of the verb, shown as a tooltip.")
-    is_all_workspaces: bool = Field(description="Whether the verb is granted across all workspaces.")
-    target_names: tuple[str, ...] = Field(
-        default=(),
-        description="Specific target workspace names the verb is scoped to (empty when ``is_all_workspaces``).",
-    )
-
-
-class WorkspaceDelegationGrant(FrozenModel):
-    """The cross-workspace-management verbs one granting workspace holds.
-
-    The settings page groups the ``minds-workspaces`` grants by *granting*
-    workspace (the agent that holds the permission) and lists one row per verb,
-    each naming the target(s) it covers -- a flatter hierarchy than a card grid.
-    """
-
-    workspace_agent_id: str = Field(description="Granting workspace agent id (used to resolve the host on revoke).")
-    workspace_name: str = Field(description="Granting workspace display name shown as the group heading.")
-    host_id: str = Field(description="Host the grants live on.")
-    color: str = Field(description="Granting workspace accent color hex (``#rrggbb``) for the heading dot.")
-    verbs: tuple[WorkspaceDelegationVerb, ...] = Field(description="Granted verbs, in catalog order.")
-
-
-def _parse_workspace_permission(permission_name: str) -> tuple[str, str | None] | None:
+def parse_workspace_permission(permission_name: str) -> tuple[str, str | None] | None:
     """Split a ``minds-workspaces-*`` permission into ``(verb_permission, target)``.
 
     ``target`` is ``None`` for an all-workspaces grant (a broad verb name) and the
@@ -564,7 +331,7 @@ def _parse_workspace_permission(permission_name: str) -> tuple[str, str | None] 
     the known verb names (not naive ``-`` splitting) because verb names such as
     ``minds-workspaces-backups-export`` themselves contain hyphens.
     """
-    if not permission_name.startswith(_WORKSPACE_PERMISSION_PREFIX):
+    if not permission_name.startswith(WORKSPACE_PERMISSION_PREFIX):
         return None
     if permission_name in _WORKSPACE_VERB_BY_PERMISSION:
         return permission_name, None
@@ -577,7 +344,7 @@ def _parse_workspace_permission(permission_name: str) -> tuple[str, str | None] 
     return None
 
 
-def _resolve_target_workspace_name(backend_resolver: BackendResolverInterface, target_workspace_id: str) -> str:
+def resolve_target_workspace_name(backend_resolver: BackendResolverInterface, target_workspace_id: str) -> str:
     """Resolve a target workspace agent id to a display name, falling back to the raw id."""
     try:
         parsed = AgentId(target_workspace_id)
@@ -590,108 +357,7 @@ def _resolve_target_workspace_name(backend_resolver: BackendResolverInterface, t
     return info.agent_name if info is not None else target_workspace_id
 
 
-def build_workspace_overview(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    latchkey: Latchkey,
-) -> tuple[WorkspaceDelegationGrant, ...]:
-    """Assemble the cross-workspace-management overview, grouped by granting workspace.
-
-    Reads each active workspace host's permissions file once, pulls the
-    ``minds-workspaces-*`` verbs out of the shared ``latchkey-self`` rule, and
-    groups them by the *granting* workspace (the agent that holds the grant). For
-    each granting workspace, one entry per verb records whether it is granted for
-    all workspaces and, otherwise, the specific target workspace names. Only
-    workspaces with at least one verb are returned, sorted by name. Raises
-    :class:`LatchkeyGatewayClientError` on a read failure (see
-    :func:`build_permission_overview`).
-    """
-    plugin_data_dir = latchkey.plugin_data_dir
-    grants: list[WorkspaceDelegationGrant] = []
-    for host in _list_active_workspace_hosts(backend_resolver):
-        permissions = gateway_client.get_permission_rules(
-            permissions_path_for_host(plugin_data_dir, host.host_id)
-        ).get(_SELF_SCOPE, ())
-        # verb permission -> the targets it is granted on (``None`` == all workspaces).
-        targets_by_verb: dict[str, set[str | None]] = {}
-        for permission_name in permissions:
-            parsed = _parse_workspace_permission(permission_name)
-            if parsed is None:
-                continue
-            verb_permission, target = parsed
-            targets_by_verb.setdefault(verb_permission, set()).add(target)
-        if not targets_by_verb:
-            continue
-        verbs: list[WorkspaceDelegationVerb] = []
-        for verb in WORKSPACE_VERBS:
-            targets = targets_by_verb.get(verb.permission)
-            if targets is None:
-                continue
-            is_all_workspaces = None in targets
-            # A broad grant subsumes any specific ones, so only list specific
-            # target names when the verb is not granted across all workspaces.
-            target_names: tuple[str, ...] = ()
-            if not is_all_workspaces:
-                target_names = tuple(
-                    sorted(
-                        (_resolve_target_workspace_name(backend_resolver, target) for target in targets if target),
-                        key=str.lower,
-                    )
-                )
-            verbs.append(
-                WorkspaceDelegationVerb(
-                    verb_permission=verb.permission,
-                    label=verb.permission.removeprefix(_WORKSPACE_PERMISSION_PREFIX),
-                    description=verb.description,
-                    is_all_workspaces=is_all_workspaces,
-                    target_names=target_names,
-                )
-            )
-        grants.append(
-            WorkspaceDelegationGrant(
-                workspace_agent_id=host.agent_id,
-                workspace_name=host.workspace_name,
-                host_id=str(host.host_id),
-                color=host.color,
-                verbs=tuple(verbs),
-            )
-        )
-    return tuple(sorted(grants, key=lambda grant: grant.workspace_name.lower()))
-
-
-def _workspace_permission_has_verb(permission_name: str, verb_permission: str) -> bool:
-    """Whether ``permission_name`` is a grant of ``verb_permission`` (any target)."""
-    parsed = _parse_workspace_permission(permission_name)
-    return parsed is not None and parsed[0] == verb_permission
-
-
-def revoke_workspace_verb_for_workspace(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    latchkey: Latchkey,
-    workspace_agent_id: str,
-    verb_permission: str,
-) -> None:
-    """Remove one cross-workspace verb (across every target) for one granting workspace.
-
-    Raises :class:`PermissionOverviewError` for an unknown verb or an unresolvable
-    granting workspace. Unrelated ``latchkey-self`` permissions are preserved.
-    """
-    if verb_permission not in _WORKSPACE_VERB_BY_PERMISSION:
-        raise PermissionOverviewError(f"Unknown machine verb '{verb_permission}'.")
-    host_id = _resolve_host_id(backend_resolver, workspace_agent_id)
-    if host_id is None:
-        raise PermissionOverviewError(
-            f"Could not resolve host for workspace '{workspace_agent_id}'; cannot revoke.",
-        )
-    path = permissions_path_for_host(latchkey.plugin_data_dir, host_id)
-    permissions = gateway_client.get_permission_rules(path).get(_SELF_SCOPE, ())
-    kept = tuple(name for name in permissions if not _workspace_permission_has_verb(name, verb_permission))
-    if len(kept) != len(permissions):
-        gateway_client.set_permission_rule(path, _SELF_SCOPE, kept)
-
-
-def _resolve_host_id(
+def resolve_workspace_host_id(
     backend_resolver: BackendResolverInterface,
     workspace_agent_id: str,
 ) -> HostId | None:
@@ -739,15 +405,20 @@ def revoke_service_account_for_workspace(
     workspace_agent_id: str,
     service_name: str,
     account: str,
+    push_permissions_to_machine: Callable[[str], None],
 ) -> None:
     """Remove one account's grants for ``service_name`` from the given workspace's host file.
 
+    The edited policy is then pushed to the workspace's own machine, and this
+    does not return until it lands there.
+
     Raises :class:`PermissionOverviewError` for an unknown service or an
-    unresolvable workspace (the caller maps these to a 400 / 503).
+    unresolvable workspace (the caller maps these to a 400 / 503), and
+    :class:`MachineOperationError` when the machine would not take the policy.
     """
     if not services_catalog.get(service_name):
         raise PermissionOverviewError(f"Unknown service '{service_name}'.")
-    host_id = _resolve_host_id(backend_resolver, workspace_agent_id)
+    host_id = resolve_workspace_host_id(backend_resolver, workspace_agent_id)
     if host_id is None:
         raise PermissionOverviewError(
             f"Could not resolve host for workspace '{workspace_agent_id}'; cannot revoke.",
@@ -759,31 +430,4 @@ def revoke_service_account_for_workspace(
         service_name,
         account,
     )
-
-
-def revoke_service_account_for_all_workspaces(
-    backend_resolver: BackendResolverInterface,
-    gateway_client: LatchkeyGatewayClient,
-    services_catalog: ServicesCatalog,
-    latchkey: Latchkey,
-    service_name: str,
-    account: str,
-) -> int:
-    """Remove one account's grants for ``service_name`` from every active workspace host.
-
-    Returns the number of workspace hosts processed. Raises
-    :class:`PermissionOverviewError` for an unknown service.
-    """
-    if not services_catalog.get(service_name):
-        raise PermissionOverviewError(f"Unknown service '{service_name}'.")
-    plugin_data_dir = latchkey.plugin_data_dir
-    hosts = _list_active_workspace_hosts(backend_resolver)
-    for host in hosts:
-        _revoke_service_account_at_path(
-            gateway_client,
-            services_catalog,
-            permissions_path_for_host(plugin_data_dir, host.host_id),
-            service_name,
-            account,
-        )
-    return len(hosts)
+    push_permissions_to_machine(workspace_agent_id)

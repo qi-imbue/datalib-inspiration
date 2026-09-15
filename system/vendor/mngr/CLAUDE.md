@@ -8,6 +8,7 @@ IF YOU FAIL TO FOLLOW ONE, YOU MUST EXPLICITLY CALL THAT OUT IN YOUR RESPONSE.
 - ALWAYS run commands by calling "uv run" from the root of the git checkout (ex: "uv run mngr create ..."). Do NOT call "mngr" directly (it will refer to the wrong version).
 - NEVER amend commits or rebase--always create new commits.
 - NEVER use `pkill -f` or `killall` with broad patterns. These can kill unrelated processes (including the Claude Code session itself). Always find the specific PID first (e.g. via `pgrep -af` or `ps aux | grep`), verify it's the right process, and then `kill` that exact PID.
+- NEVER run a bare `tmux kill-server`, `tmux kill-session`, or `tmux attach` from an agent session. You are running inside a tmux pane, and when `$TMUX` is set tmux ignores `TMUX_TMPDIR` and talks to the server named in `$TMUX`: a bare call reaches the server that every agent on this machine lives in, and `kill-server` kills them all. For any manual tmux verification, use one private server for both sides of the probe: pick a short directory (a socket path over about 100 bytes fails with "File name too long", so do not put it under a long scratchpad path), run a script under test that calls bare `tmux` with `env -u TMUX TMUX_TMPDIR=<short dir>`, which makes it resolve its socket to `<short dir>/tmux-$(id -u)/default`, and pass that exact path with `-S` on every call you run yourself (`-L <name>` or any other `-S` path names a different socket, so your calls and the script's would land on two different servers). End the probe by killing its sessions by name (`-t =<name>`) rather than with `kill-server`, and check `tmux display-message -p '#{socket_path}'` still names your own server afterwards. In pytest, use `isolate_tmux_server()` from `libs/mngr/imbue/mngr/utils/testing.py`.
 - If you ever need to work with another *git* repo that is *outside* of this monorepo, you should do so by creating a worktree for that repo and putting it within a ".external_worktrees/" directory *within* this root folder (ie, at the same level as the ".git/" folder).  Use the same branch name in the worktree as the branch you are working on in this repo, and be sure to commit inside there as well.
 
 # How to get started on any task:
@@ -29,7 +30,7 @@ Only after doing all of the above should you begin writing code.
 # Important commands and conventions:
 
 - The `mngr` on your PATH is the dev shim (`scripts/mngr`), which routes `mngr` (and anything that shells out to it, e.g. minds) to the checkout you're working in instead of a stale global install. A pre-commit hook installs it automatically (a symlink in `~/.local/bin`) and verifies it's on PATH; if it fails, put `~/.local/bin` on your PATH ahead of any venv bin (then `hash -r`) -- do not bypass it.
-- Never run `uv sync`, always run `uv sync --all-packages` instead
+- Never run `uv sync`, always run `uv sync --all-packages` instead. The one exception is `apps/minds_evals`: it is a standalone uv project (excluded from the root workspace because harbor's dependency floors cannot co-resolve with the workspace), so it has its own lock and is synced with a plain `uv sync` from inside that directory. `just test-minds-evals` does that for you.
 - Never pipe the output of a non-instant command through `grep`, `jq`, `awk`, `head`, `tail`, or similar without preserving the full output. If you later need something that was discarded, you have to rerun the entire command. Instead, write the output to a file first and then filter the file, or use `tee` to capture and filter simultaneously (e.g. `some_command | tee /tmp/some_command_output.txt | grep pattern`).
 
 # Always remember these guidelines:
@@ -61,6 +62,7 @@ Only after doing all of the above should you begin writing code.
 - Do NOT create tests that code raises NotImplementedError.
 - If you see a flaky test, YOU MUST HIGHLIGHT THIS IN YOUR RESPONSE. Mark it with `@pytest.mark.flaky` so offload retries it automatically. Then try to fix the underlying flakiness in a separate commit. First investigate *why* the test is flaky. If it can be made more robust, do so. If the test is correct but it fundamentally requires additional time, increase the timeout for that individual test (but do NOT allow unreasonably long timeouts--in such a case, prefer to leave the test marked as flaky instead, eg, if this happened because of a weird infrastructure level fluke that sometimes makes an operation take *much* longer).
 - Do not add TODO or FIXME unless explicitly asked to do so
+- Mark rollout-bridging code (compat shims, migration guards) with a `# CLEANUP:` comment stating what can be removed and when (see style_guide.md); after a deploy, grep for `CLEANUP:` and remove entries whose time has come.
 - Code must work on both macOS and Linux. It's ok if it doesn't work on Windows.
 - `mngr` is installed by end users from PyPI, so the built wheel must be self-contained: it only packages the `imbue` package (`packages = ["imbue"]`), so production code must not read files outside it at runtime unless they're shipped into the package (e.g. via wheel `force-include`, as the help-topic docs are).
 - To reiterate: code correctness and quality is the most important concern when writing code.
@@ -68,7 +70,7 @@ Only after doing all of the above should you begin writing code.
 # Running tests
 
 - Before finishing your response, if you have made any changes, then you must ensure that you have run ALL tests and that they all pass. DO NOT just run a subset of the tests! However, while iterating (e.g. fixing a failing test, developing a feature), run only the relevant tests locally for rapid feedback -- save the full test run for the final check.
-- To run the full test suite, use `just test-offload` from the root of the git checkout. This fans out all unit and integration tests across isolated Modal sandboxes in parallel.
+- To run the full test suite, use `just test-offload` from the root of the git checkout. This fans out all unit and integration tests across isolated Modal sandboxes in parallel. It does NOT cover `apps/minds_evals` (a standalone uv project, absent from the offload image); if you touched that project, also run `just test-minds-evals`.
 - While iterating locally on specific tests, use `just test-quick <path>::<test_name>` for rapid feedback on individual tests. To run all tests for a single project locally, pass the package path: `just test-quick libs/mngr`. Complex argument strings (anything containing spaces, like `-m` expressions) must be wrapped in outer quotes as a single argument, for example: `just test-quick "libs/mngr -m 'not tmux and not modal and not docker and not docker_sdk and not acceptance and not release'"` — the recipe takes a single `args` parameter, so unquoted spaces get split and inner quoting is lost. `just test-quick` drops coverage and runs xdist-parallel; use the underlying `uv run pytest ...` directly only if you need different flags than `test-quick` provides.
 - When running pytest locally with a Bash tool timeout, always set `PYTEST_MAX_DURATION_SECONDS` to match the timeout (in seconds). For example, if using a 2-minute timeout: `PYTEST_MAX_DURATION_SECONDS=120 just test-quick ...`. This ensures the pytest global lock file records a deadline, allowing other pytest processes to break a stale lock if this one gets killed by the timeout.
 - Offload produces results in test-results/ (junit.xml and .coverage files). Local pytest produces files in .test_output/ for things like slow tests and coverage reports.
@@ -76,6 +78,7 @@ Only after doing all of the above should you begin writing code.
 - Release tests do *not* run in CI. If you are developing or modifying release tests, CI will not verify them for you, so you must run them yourself locally.
 - If you need to run a specific acceptance or release test to write or fix it, iterate on that specific test locally by calling "just test <full_path>::<test_name>" from the root of the git checkout. Do this rather than re-running all tests in CI.
 - Note that tasks are *not* allowed to finish without A) all tests passing in CI, B) running /autofix to verify and fix code issues, and C) running /verify-conversation to review the conversation for behavioral issues.
+- Before finishing, prune the comments on your branch's diff by running /crispy-comments: remove incidental history, defensive justification, correctness arguments, DRY restatement of volatile facts, commented-out code, and banners, keeping only comments that explain a non-obvious "why". The /autofix pass also enforces this (the `comment_cruft` category in `.reviewer/code-issue-categories.md`), but running it yourself keeps the diff clean before review.
 - Before finishing your response, create a draft PR for the current branch using `gh pr create --draft`. If a PR already exists for the branch, skip this step. The stop hook will then poll CI checks on the PR.
 - To help verify that you ran the tests, report the exact command you used to run the tests, as well as the total number of tests that passed and failed (and the number that failed had better be 0).
 
@@ -121,6 +124,8 @@ Then crystallize the verified behavior into formal tests. Assert on things that 
 
 For interactive components (TUIs, interactive prompts, etc.), use `tmux send-keys` and `tmux capture-pane` to manually verify them. This is a special case: do NOT crystallize these into pytest tests. They are inherently flaky due to timing and useless in CI, but valuable for agents to verify that interactive behavior looks right during development.
 
+Drive such checks on a private tmux server (`tmux -S <short dir>/tmux-$(id -u)/default` on every call, the socket a script run with `env -u TMUX TMUX_TMPDIR=<short dir>` resolves to; see the tmux rule under "Important things to know"), never on the default server your own session runs in.
+
 # Git and committing
 
 If desired, the user will explicitly instruct you not to commit.
@@ -134,6 +139,20 @@ By default, or if instructed to commit:
 If instructed not to commit:
 - do not commit anything! Simply leave the git state as it is at the end of your response.
 - NEVER run git commands like git reset, git checkout, etc that might change the git state (when instructed not to commit you are collaborating with others in the same directory, so should not change other files or the git state).
+
+# Vendored mngr in the default-workspace-template worktree
+
+Only applies if you have a default-workspace-template worktree (`just dwt-worktree` creates one). Its `system/vendor/mngr/` is a generated copy of this checkout, so it is dirty on purpose and the stop hook exempts it from the commit check. Git ignores that exemption and refuses to merge over it; the stop hook reports that case as `Merge blocked by uncommitted changes under an exempt path`. Drop and regenerate it -- never commit it, never resolve it as a conflict:
+
+```
+cd .external_worktrees/default-workspace-template
+git checkout HEAD -- system/vendor/mngr && git clean -fd -- system/vendor/mngr
+git merge origin/main --no-edit
+cd -
+just sync-vendor-mngr-live
+```
+
+Only for paths the hook names as exempt; anything else is a real conflict. Background: `apps/minds/docs/vendor-mngr-sync.md`.
 
 # Changelog
 

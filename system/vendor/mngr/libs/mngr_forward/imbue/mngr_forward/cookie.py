@@ -59,28 +59,28 @@ def verify_session_cookie(
     return payload == _SESSION_PAYLOAD
 
 
-def create_subdomain_auth_token(signing_key: CookieSigningKey, agent_id: str) -> str:
+def create_subdomain_auth_token(signing_key: CookieSigningKey, origin_coordinate: str) -> str:
     """Mint a short-lived signed token that authorizes setting a session cookie
-    on the ``<agent-id>.localhost`` subdomain.
+    on the ``agent-<hex>.localhost`` origin domain (or a legacy host-keyed one).
 
-    Used by the ``/goto/{agent_id}/`` bridge: the bare-origin handler (which
+    Used by the ``/goto/{coordinate}/`` bridge: the bare-origin handler (which
     can read the real session cookie) mints this token, 302-redirects the
-    browser to the subdomain with the token in the query string, and the
-    subdomain handler verifies it before setting its own subdomain-scoped
+    browser to the workspace origin with the token in the query string, and
+    the workspace handler verifies it before setting the domain-scoped
     session cookie. Short expiry (seconds) keeps the token effectively
     one-shot even though it isn't actually consumed on validation.
     """
     serializer = URLSafeTimedSerializer(secret_key=signing_key.get_secret_value())
-    return serializer.dumps(agent_id, salt=_SUBDOMAIN_AUTH_SALT)
+    return serializer.dumps(origin_coordinate, salt=_SUBDOMAIN_AUTH_SALT)
 
 
 def verify_subdomain_auth_token(
     token: str,
     signing_key: CookieSigningKey,
-    agent_id: str,
+    origin_coordinate: str,
 ) -> bool:
     """Verify that ``token`` was minted by ``create_subdomain_auth_token`` for
-    ``agent_id`` and is within the short expiry window."""
+    ``origin_coordinate`` and is within the short expiry window."""
     serializer = URLSafeTimedSerializer(secret_key=signing_key.get_secret_value())
     try:
         payload = serializer.loads(
@@ -90,4 +90,4 @@ def verify_subdomain_auth_token(
         )
     except BadSignature:
         return False
-    return payload == agent_id
+    return payload == origin_coordinate

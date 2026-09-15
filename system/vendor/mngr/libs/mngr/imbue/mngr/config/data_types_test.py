@@ -951,9 +951,10 @@ def test_settings_narrowing_ignores_unwritten_layer_field(mngr_test_prefix: str)
     assert narrowings == []
 
 
-def test_settings_narrowing_recurses_into_command_defaults(mngr_test_prefix: str) -> None:
-    """Per-key recursion through ``commands`` (a container dict) and ``CommandDefaults.defaults``
-    flags the deepest path where data is actually lost.
+def test_command_defaults_accumulate_across_layers(mngr_test_prefix: str) -> None:
+    """``CommandDefaults.defaults`` is a settings patch: a layer's ``[commands.<name>]`` table adds
+    the parameters it names to the ones lower layers set, and a key the layer leaves out is kept,
+    not dropped -- so a local ``type`` never costs the project its ``connect`` or ``env``.
     """
     base = MngrConfig(
         prefix=mngr_test_prefix,
@@ -961,19 +962,11 @@ def test_settings_narrowing_recurses_into_command_defaults(mngr_test_prefix: str
     )
     override = MngrConfig(
         prefix=mngr_test_prefix,
-        commands={"create": CommandDefaults(defaults={"env": ["X=4"], "branch": "main", "extra": "x"})},
+        commands={"create": CommandDefaults(defaults={"type": "codex", "extra": "x"})},
     )
-    # Override is a superset -- no narrowing.
-    _, narrowings = base.merge_with(override)
+    merged, narrowings = base.merge_with(override)
     assert narrowings == []
-
-    override_drops_branch = MngrConfig(
-        prefix=mngr_test_prefix,
-        commands={"create": CommandDefaults(defaults={"env": ["X=4"]})},
-    )
-    # Override drops the "branch" key from defaults -- flagged at the defaults level.
-    _, narrowings = base.merge_with(override_drops_branch)
-    assert narrowings == ["commands.create.defaults"]
+    assert merged.commands["create"].defaults == {"env": ["X=4"], "branch": "main", "type": "codex", "extra": "x"}
 
 
 def test_settings_narrowing_flags_nested_value_replacement(mngr_test_prefix: str) -> None:
@@ -1298,9 +1291,11 @@ def _build_fully_populated_mngr_config(mngr_test_prefix: str) -> MngrConfig:
         headless=True,
         is_error_reporting_enabled=False,
         is_allowed_in_pytest=True,
+        strict_host_record_parsing=True,
         default_destroyed_host_persisted_seconds=98765.0,
         default_min_online_host_age_seconds=4321.0,
         agent_ready_timeout=42.0,
+        host_detail_read_timeout_seconds=PositiveFloat(1234.0),
         allow_settings_key_assignment_narrowing=True,
     )
 

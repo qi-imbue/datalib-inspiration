@@ -6,6 +6,7 @@ that records issued commands and returns canned ``CommandResult``s, which
 keeps these unit tests fast and free of any real SSH/Docker dependency.
 """
 
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -360,6 +361,42 @@ def test_build_image_on_outer_with_docker_builder_streams_output() -> None:
 def test_build_image_on_outer_raises_on_build_failure() -> None:
     outer = _outer(CommandResult(stdout="", stderr="error: failed to fetch base image", success=False))
     with pytest.raises(MngrError, match="Remote docker build failed"):
+        build_image_on_outer(
+            outer,
+            tag="bad-image",
+            build_context_path="/tmp/build",
+            docker_build_args=[],
+            timeout_seconds=60.0,
+            on_output=None,
+            builder=DockerBuilder.DOCKER,
+        )
+
+
+def test_build_image_on_outer_failure_reports_both_stream_tails_and_exit_code() -> None:
+    # Each stream is tailed separately: a long buildkit progress tail on stderr must
+    # not push the stdout error text out of the reported window, and the exit code
+    # tells a real build failure apart from output that just stopped arriving.
+    noisy_stderr = "\n".join(f"#36 exporting layers {idx}" for idx in range(80))
+    outer = _outer(CommandResult(stdout="the real error is here", stderr=noisy_stderr, success=False, exit_code=17))
+    with pytest.raises(MngrError) as exc_info:
+        build_image_on_outer(
+            outer,
+            tag="bad-image",
+            build_context_path="/tmp/build",
+            docker_build_args=[],
+            timeout_seconds=60.0,
+            on_output=None,
+            builder=DockerBuilder.DOCKER,
+        )
+    message = str(exc_info.value)
+    assert "exit code 17" in message
+    assert "the real error is here" in message
+    assert "--- stderr tail ---" in message and "--- stdout tail ---" in message
+
+
+def test_build_image_on_outer_failure_reports_unknown_exit_code_when_absent() -> None:
+    outer = _outer(CommandResult(stdout="", stderr="boom", success=False))
+    with pytest.raises(MngrError, match="exit code unknown"):
         build_image_on_outer(
             outer,
             tag="bad-image",
@@ -726,6 +763,7 @@ def _fresh_vps_script() -> list[tuple[str, CommandResult]]:
         ("test -f /var/lib/mngr-btrfs.img", _fail()),
         ("df --output=avail", _ok(f"{100 * (1024**3)}\n")),
         ("mountpoint -q", _fail()),
+        ("test -L /mngr-btrfs", _fail()),
         ("grep -qE", _fail()),
         (f"test -d /mngr-btrfs/{_TEST_HOST_HEX}", _fail()),
     ]
@@ -808,6 +846,7 @@ def test_prepare_btrfs_on_outer_raises_when_free_space_below_reserve() -> None:
             ("command -v mkfs.btrfs", _ok()),
             ("test -f /var/lib/mngr-btrfs.img", _fail()),
             ("mountpoint -q", _fail()),
+            ("test -L /mngr-btrfs", _fail()),
             ("df --output=avail", _ok(f"{15 * (1024**3)}\n")),
         ]
     )
@@ -830,6 +869,7 @@ def test_prepare_btrfs_on_outer_raises_when_free_space_equal_to_reserve() -> Non
             ("command -v mkfs.btrfs", _ok()),
             ("test -f /var/lib/mngr-btrfs.img", _fail()),
             ("mountpoint -q", _fail()),
+            ("test -L /mngr-btrfs", _fail()),
             ("df --output=avail", _ok(f"{20 * (1024**3)}\n")),
         ]
     )
@@ -900,6 +940,34 @@ def test_prepare_btrfs_on_outer_skips_loop_when_btrfs_already_mounted() -> None:
     assert f"btrfs subvolume create /mngr-btrfs/{_TEST_HOST_HEX}" in joined
 
 
+def test_prepare_btrfs_on_outer_raises_when_mount_path_is_unmounted_symlink() -> None:
+    """Slice VM whose data disk has not mounted yet: refuse, never build a loop file.
+
+    A symlink at the mount path is the pre-mounted (slice) layout; if nothing is
+    mounted at its target yet (e.g. the guest's lima provisioning has not
+    finished), falling through to the loop-file path would silently build a
+    loop image on the VM's root disk and mask the real volume from then on.
+    """
+    outer = _scripted(
+        [
+            ("mountpoint -q", _fail()),
+            ("test -L /mngr-btrfs", _ok()),
+        ]
+    )
+    with pytest.raises(VpsProvisioningError, match="symlink"):
+        prepare_btrfs_on_outer(
+            outer,
+            host_id=_TEST_HOST_ID,
+            btrfs_mount_path=_TEST_MOUNT_PATH,
+            loop_file_path=_TEST_LOOP_FILE,
+            outer_disk_reserved_gb=_TEST_RESERVED_GB,
+        )
+    # Nothing was mutated: only the two probes ran.
+    recorded = cast(_ScriptedOuter, outer).recorded
+    for cmd in recorded:
+        assert cmd.startswith(("mountpoint -q", "test -L")), f"unexpected command issued: {cmd!r}"
+
+
 # =========================================================================
 # build_ssh_transport_for_outer
 # =========================================================================
@@ -929,9 +997,26 @@ def test_build_ssh_transport_passes_the_ssh_port() -> None:
     outer = _SshTransportOuter(info=("root", "127.0.0.1", 38519, Path("/k/key")), known_hosts_file="/k/known_hosts")
     ssh_cmd, user, hostname, port, key = build_ssh_transport_for_outer(cast(OuterHostInterface, outer))
     assert "-p 38519" in ssh_cmd
-    assert "-o UserKnownHostsFile=/k/known_hosts" in ssh_cmd
+    # Double-quoted for ssh: UserKnownHostsFile is a whitespace-separated list.
+    assert "-o UserKnownHostsFile='\"/k/known_hosts\"'" in ssh_cmd
     assert "-o StrictHostKeyChecking=yes" in ssh_cmd
     assert (user, hostname, port) == ("root", "127.0.0.1", 38519)
+
+
+def test_build_ssh_transport_quotes_a_known_hosts_path_with_spaces() -> None:
+    """A spaced known_hosts path survives both parsers of the rsync ``-e`` transport.
+
+    rsync tokenises the transport string with shell-style quoting, and ssh then splits
+    UserKnownHostsFile on whitespace itself, so the value has to carry its own quotes.
+    """
+    outer = _SshTransportOuter(
+        info=("root", "127.0.0.1", 38519, Path("/k/key")),
+        known_hosts_file="/path with spaces/known_hosts",
+    )
+    ssh_cmd, _user, _hostname, _port, _key = build_ssh_transport_for_outer(cast(OuterHostInterface, outer))
+
+    option = next(arg for arg in shlex.split(ssh_cmd) if arg.startswith("UserKnownHostsFile="))
+    assert option == 'UserKnownHostsFile="/path with spaces/known_hosts"', option
 
 
 def test_build_ssh_transport_raises_for_local_outer() -> None:

@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import docker.errors
 import docker.models.containers
 import pytest
 
+from imbue.mngr.primitives import AgentId
 from imbue.mngr.providers.docker.instance import LABEL_HOST_ID
 from imbue.mngr.providers.docker.instance import create_docker_client
 from imbue.mngr.utils.testing import get_short_random_string
@@ -418,7 +420,7 @@ def test_stop_host_recovers_container_with_dead_sshd(
 
     # mngr start brings up a fresh container with a fresh sshd, recovering the agent.
     start_result = subprocess.run(
-        ["uv", "run", "mngr", "start", agent_name, "--no-connect"],
+        ["uv", "run", "mngr", "start", agent_name, "--no-connect", "--format", "json"],
         capture_output=True,
         text=True,
         timeout=540,
@@ -427,3 +429,86 @@ def test_stop_host_recovers_container_with_dead_sshd(
     assert start_result.returncode == 0, (
         f"start after --stop-host failed with stderr: {start_result.stderr}\nstdout: {start_result.stdout}"
     )
+    # The one arm a local host cannot produce: a host that really was brought up
+    # from stopped. A caller reads this to tell a cold boot from a start that
+    # found everything already running and did nothing.
+    assert json.loads(start_result.stdout.strip())["was_host_started"] is True
+
+
+@pytest.mark.timeout(900)
+def test_same_agent_id_on_two_docker_hosts_is_independent(
+    temp_source_dir: Path,
+    docker_subprocess_env: dict[str, str],
+) -> None:
+    """The duplicate-id (migration overlap) case, end to end on real hosts.
+
+    The same agent id is created on two Docker hosts. A bare-id *single-target*
+    command must refuse with the ID@HOST disambiguation, a bare-id *plural*
+    command (exec) must operate on every instance, ID@HOST must address each
+    instance, and destroying one instance must leave the other fully
+    functional -- the keystone behavior this feature exists for.
+    """
+    shared_id = str(AgentId.generate())
+    suffix = get_short_random_string()
+    host_a = f"dup-host-a-{suffix}"
+    host_b = f"dup-host-b-{suffix}"
+
+    def run_mngr(*args: str, timeout: int = 540) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["uv", "run", "mngr", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=docker_subprocess_env,
+        )
+
+    for host_name, agent_name in ((host_a, f"dup-a-{suffix}"), (host_b, f"dup-b-{suffix}")):
+        result = run_mngr(
+            "create",
+            f"{agent_name}@{host_name}.docker",
+            "--new-host",
+            "--id",
+            shared_id,
+            "--type",
+            "command",
+            "--no-connect",
+            "--no-ensure-clean",
+            "--from",
+            str(temp_source_dir),
+            "--",
+            "sleep",
+            "581234",
+        )
+        assert result.returncode == 0, f"create on {host_name} failed: {result.stderr}\n{result.stdout}"
+
+    # A bare-id single-target command (transcript resolves exactly one agent) is
+    # ambiguous and must say so, naming ID@HOST.
+    transcript_bare = run_mngr("transcript", shared_id, timeout=120)
+    assert transcript_bare.returncode != 0
+    assert "multiple hosts" in transcript_bare.stderr
+    assert "ID@HOST" in transcript_bare.stderr
+
+    # A bare-id plural command keeps the uniform all-matches filter semantics:
+    # exec runs on BOTH instances.
+    exec_bare = run_mngr("exec", shared_id, "true", timeout=180)
+    assert exec_bare.returncode == 0, f"bare-id exec failed: {exec_bare.stderr}"
+    for agent_name in (f"dup-a-{suffix}", f"dup-b-{suffix}"):
+        assert agent_name in exec_bare.stdout
+
+    # ID@HOST addresses each instance independently.
+    for host_name in (host_a, host_b):
+        exec_scoped = run_mngr("exec", f"{shared_id}@{host_name}", "true", timeout=180)
+        assert exec_scoped.returncode == 0, f"exec on {host_name} failed: {exec_scoped.stderr}"
+
+    # Destroying the instance on host A must leave host B's instance fully functional.
+    destroy_result = run_mngr("destroy", f"{shared_id}@{host_a}", "--force", timeout=300)
+    assert destroy_result.returncode == 0, f"destroy failed: {destroy_result.stderr}\n{destroy_result.stdout}"
+
+    surviving_exec = run_mngr("exec", f"{shared_id}@{host_b}", "true", timeout=180)
+    assert surviving_exec.returncode == 0, f"surviving instance broken: {surviving_exec.stderr}"
+
+    # With only one instance left, the bare id matches exactly the survivor.
+    exec_bare_after = run_mngr("exec", shared_id, "true", timeout=180)
+    assert exec_bare_after.returncode == 0, f"bare-id exec after destroy failed: {exec_bare_after.stderr}"
+    assert f"dup-b-{suffix}" in exec_bare_after.stdout
+    assert f"dup-a-{suffix}" not in exec_bare_after.stdout

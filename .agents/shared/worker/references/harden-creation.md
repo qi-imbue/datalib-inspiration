@@ -13,6 +13,13 @@ The user has already signed off on work in the foreground; the thorough pass has
 The task now is to prove the creation actually works under test, harden it, and pass the review
 gates. The bar is that the creation is **genuinely well-tested and clean** -- not "it ran once."
 
+When another skill the flow follows sets its own economy rules -- e.g.
+`data-pipeline-builder`'s per-step minute caps -- this contract wins wherever they conflict:
+an expired budget never justifies skipping tests, and never report `done` on a
+creation whose tests were skipped because time ran out. Rules that do not
+conflict with the bar (such as that skill's ban on benchmarks, timings, and
+parameter sweeps) still hold during hardening.
+
 ## Isolation
 
 Do all of this on an **isolated branch / worktree**. Nothing should the
@@ -28,6 +35,12 @@ paths your operation/creation references specify. Surface decisions the user
 must make as `gate` reports and stop; end the run with a terminal `done` or
 `stuck` status. The operation reference names the exact gate and
 status values its flow uses.
+
+## Parallelism & Sequencing
+
+Write tests and optimize in parallel, if possible. Avoid running full test suites 
+unless necessary, such as at the very end. The long tail is often review passes
+and full test suites at the end of hardening.
 
 ## Testing and hardening contract
 
@@ -90,28 +103,6 @@ more operations in flight means more failure surface.
   persist the raw payload keyed by its source id, so the same store serves both
   resumption and later re-derivation.
 
-## Review gates
-
-Run the repo's review gates -- `/autofix` and the architecture gates -- and
-fix what they flag **before** writing the final gate report, so the user sees
-a single report that already reflects the review verdicts rather than a
-report-then-verify-then-report-again pattern.
-
-Autofix's normal final step asks the user to keep or revert each proposed fix
-via AskUserQuestion, which is unavailable in a worker -- so split that decision
-out and make it yourself. Invoke autofix so it *applies* its fixes but leaves
-the keep/revert judgment to you:
-
-    /autofix Run fully unattended: never call AskUserQuestion. Run the fix
-    loop, leave every fix commit applied, and report the fix commits (hash +
-    full message). Do not revert anything yourself -- the caller will decide.
-
-Then review those fix commits against what this branch is meant to do. You hold
-the task context the fix subagents run without, so you are the right judge of
-whether each fix is correct. Keep fixes by default; revert only the ones that
-undo intended behavior or are otherwise wrong (`git revert --no-edit <hash>`,
-newest first). Record which you kept and which you reverted in your gate report.
-
 ## Preserve and surface captured data
 
 If the creation captures data, persist each record's **raw payload and a
@@ -159,6 +150,14 @@ evicts is not hardened, no matter how well-tested its happy path is.
   store holds only what the policy allows and that the oldest entries are gone --
   the eviction path is exactly the kind of behavior that silently rots if
   nothing exercises it.
+
+## Review gates
+
+1. Ensure all in-flight changes have settled and are committed
+2. Ensure that tests pass. If there are long running tests, this is the moment to run them
+3. Fix failing tests with narrowly targeted changes
+
+When complete, report back to the lead.
 
 ## If you need to give up
 

@@ -2,6 +2,8 @@
 name: migrate-workspace
 description: "Bring everything from another (older, broken, or replaced) workspace of the user's into this one -- their apps, skills, documents, data, scheduled automations, and every past chat. Use when the user says anything like 'move my stuff over from my old workspace', 'I made a new mind, bring everything across', 'my old workspace is broken, start me fresh', 'import my other mind', or -- asked from the OLD side -- 'I'd like to move to a new workspace'. Requires the other workspace to be startable, since the transfer runs over a live connection to it."
 compatibility: Requires latchkey (the minds-api gateway) plus ssh/ssh-keygen for the live session, and mngr (vendored) for recreating the old chats.
+metadata:
+  author: imbue
 ---
 
 # Migrating another workspace into this one
@@ -77,7 +79,7 @@ every verb the whole pass needs, before the user starts using anything -- per th
 ```bash
 latchkey curl -XPOST http://latchkey-self.invalid/permission-requests \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id": "'"$MNGR_AGENT_ID"'", "type": "workspace",
+  -d '{"agent_id": "'"${MINDS_CHAT_ID:-$MNGR_AGENT_ID}"'", "type": "workspace",
        "payload": {"permissions": ["minds-workspaces-ssh", "minds-workspaces-lifecycle",
                                    "minds-workspaces-backups-export", "minds-workspaces-destroy"],
                    "target_workspace_id": "<OLD>"},
@@ -260,14 +262,14 @@ Note the ticket id, then start it (its own tool call, nothing chained):
 tk start <ticket-id>
 ```
 
-Write the task file with the two-heredoc form -- an **unquoted** frontmatter block
-so the variables expand, then a **quoted** body so its backticks stay literal:
+Write the task file with the two-heredoc form the other worker skills use --
+an **unquoted** frontmatter block, then a **quoted** body so its backticks stay
+literal:
 
 ```bash
 {
 cat << FRONTMATTER_EOF
 ---
-lead_agent: $MNGR_AGENT_NAME
 finish_report_path: data/.tasks/migrate-workspace/reports/report.md
 source_repo_root: <repo_root>
 source_host_dir: <host_dir>
@@ -327,12 +329,17 @@ workspace's own random password) and `cloudflare_tunnel.env` (a tunnel minted pe
 `agent_id`). Copying either would point this workspace at the old one's
 resources. Use `rsync` over the SSH session with an `--exclude` for each.
 
-**Creations.** Each app lands under `system/apps/<package>/`, is added to the root
-`pyproject.toml`, gets a `[program:<name>]` block in `system/supervisord.conf`
-that runs `system/scripts/forward_port.py` before its own start command, and
-re-registers its port that way -- never by copying the old registry file, which is
-runtime state. Then `uv sync --all-packages` and
-`supervisorctl reread && supervisorctl update`. An app that will not come up gets
+**Creations.** Each app lands under `system/apps/<package>/` and gets a
+`[program:<name>]` block in `system/supervisord.conf.d/<name>.conf` that runs
+`system/scripts/forward_port.py` before its own start command, and re-registers its
+port that way -- never by copying the old registry file, which is runtime state. No
+root `pyproject.toml` entry: the `system/apps/*` member glob picks the package up.
+Land the app in the shape `build-app` writes today -- `uv tool install -e
+system/apps/<package>`, and a program command ending in the app's own name --
+rather than carrying over a source command that runs it out of the root venv with
+`uv run <name>`. Then `uv sync --all-packages` (never a bare `uv sync`: that is
+root-closure-scoped, and it prunes the member and deletes the console script
+supervisord resolves on PATH) and `supervisorctl reread && supervisorctl update`. An app that will not come up gets
 a **bounded** repair attempt (read its stderr log, fix the obvious break, retry
 once or twice); whatever is still broken becomes an explicit summary item naming
 what you tried.
@@ -382,9 +389,9 @@ staging, the encoded-project-dir detail, and why the primary is excluded.
 **Branches.** Fetch every `mngr/<name>` branch regardless of state, so no commits
 are lost, and carry the merged/unmerged classification into your report.
 
-**Inspirations.** The source's `inspiration-*.md` manifests and their `.svg`
+**Templates.** The source's `template.md` manifests and their `.svg`
 thumbnails come over as ordinary user content, and the old ledger's
-`## Inspirations` and `## Adopted inspirations` entries are **merged into** this
+`## Templates` and `## Adopted templates` entries are **merged into** this
 workspace's `docs/VERSION_HISTORY.md` -- append-only, existing lines copied
 through verbatim -- so published and adopted history survives. Do **not** carry
 the old `## Workspace` lines: those record where the *old* workspace came from.
@@ -396,7 +403,8 @@ Commit on `mngr/migrate-workspace` and report `done`.
 Proxy a `question` gate per `.agents/shared/references/lead-proxy.md` (worker
 `migrate-workspace`, branch `mngr/migrate-workspace`, reports dir
 `data/.tasks/migrate-workspace/reports/`): escalate genuine decisions about the
-user's intent to the user, relay the answer with `mngr message`, consume the
+user's intent to the user, relay the answer with `create_worker.py reply
+--task-file data/.tasks/migrate-workspace/task.md -m "..."`, consume the
 report, re-arm. On `stuck` or a dead-worker timeout, follow
 `.agents/skills/launch-task/references/worker-failure.md` -- nothing has been
 applied here, and the source is untouched either way.
@@ -415,7 +423,7 @@ an assumption:
   quiescence): re-run the baseline diff with `--refresh` and re-sync anything new.
 
 Open the migrated **apps** as tabs in default positions
-(`for L in desktop mobile; do python3 system/scripts/layout.py open --layout "$L" service:<name>; done`).
+(`python3 system/scripts/layout.py open app:<name>`).
 Do **not** open the recreated chats -- there can be many, and a wall of tabs is
 worse than none. Reproducing the old workspace's arrangement is out of scope;
 offer to lay things out if the user asks.
@@ -453,9 +461,11 @@ reason. Never let an exclusion read as an oversight.
 
 **Record it in the ledger.** Append one line under a `## Migrations` section of
 `docs/VERSION_HISTORY.md` (create the section after `## Workspace` if absent),
-matching the existing line shape -- note padded to width 26, ending in a 7-char
-sha. Here the sha is **this migration's own commit in this workspace**. Then stage
-that one file **by name** and commit it; never `git add -A`.
+matching the existing line shape -- note padded to width 26 (but never fewer
+than two spaces before the sha: a long workspace name pushes its sha right
+rather than landing flush against it), ending in a 7-char sha. Here the sha is
+**this migration's own commit in this workspace**. Then stage that one file **by
+name** and commit it; never `git add -A`.
 
 ```
 - <today, YYYY-MM-DD>  migrated from <name>       <7-char sha>

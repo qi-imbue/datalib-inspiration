@@ -62,7 +62,7 @@ mngr list [OPTIONS]
 
 | Name | Type | Description | Default |
 | ---- | ---- | ----------- | ------- |
-| `--on-error` | choice (`abort` &#x7C; `continue`) | What to do when errors occur: abort (stop immediately) or continue (keep going) | `abort` |
+| `--on-error` | choice (`abort` &#x7C; `continue`) | What to do when errors occur: abort (stop immediately) or continue (keep going). The default is continue, so a single unreachable or unauthenticated provider does not block a listing the other providers can still serve -- its failure is reported in the errors channel and the process still exits non-zero (provider-inaccessible). | `continue` |
 
 ## Common
 
@@ -169,6 +169,7 @@ Fields marked `(cel only)` cannot be used in `--fields`/`--format` template stri
 - `host.ssh.host` - SSH hostname
 - `host.ssh.port` - SSH port
 - `host.ssh.key_path` - Path to SSH private key
+- `host.ssh.known_hosts_path` - Path to the known_hosts file pinning this host's SSH host key, when the provider configured strict host-key checking. Consumers should prefer this over deriving the file's location from key_path.
 - `host.ssh.command` - Full SSH command to connect
 - `host.snapshots` - List of available snapshots
 - `host.is_locked` - Whether the host is currently locked for an operation

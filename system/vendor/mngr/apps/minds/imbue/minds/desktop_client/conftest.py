@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 from collections.abc import Iterator
@@ -5,30 +6,46 @@ from collections.abc import Mapping
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import pytest
+from flask import Flask
+from flask.testing import FlaskClient
 from pydantic import AnyUrl
+from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import SecretStr
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
+from imbue.minds.desktop_client.app import create_desktop_client
+from imbue.minds.desktop_client.auth import FileAuthStore
+from imbue.minds.desktop_client.backend_resolver import BackendResolverInterface
 from imbue.minds.desktop_client.backend_resolver import MngrCliBackendResolver
 from imbue.minds.desktop_client.backend_resolver import ParsedAgentsResult
 from imbue.minds.desktop_client.backend_resolver import ServiceLogRecord
 from imbue.minds.desktop_client.backend_resolver import parse_agents_from_json
 from imbue.minds.desktop_client.backend_resolver import parse_service_log_records
+from imbue.minds.desktop_client.cookie_manager import SESSION_COOKIE_NAME
+from imbue.minds.desktop_client.cookie_manager import create_session_cookie
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudAuthAccount
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudAuthSession
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCli
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCliError
+from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudLeaseActiveCliError
 from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudSyncConflictCliError
 from imbue.minds.desktop_client.imbue_cloud_cli import LiteLLMKeyMaterial
-from imbue.minds.desktop_client.imbue_cloud_cli import TunnelInfo
+from imbue.minds.desktop_client.imbue_cloud_cli import MachineSizeCliInfo
+from imbue.minds.desktop_client.imbue_cloud_cli import ShareCliInfo
+from imbue.minds.desktop_client.imbue_cloud_cli import ShareCliRelayEndpoint
+from imbue.minds.desktop_client.latchkey.permission_overview import clear_service_sign_in_options_cache
 from imbue.minds.desktop_client.notification import NotificationDispatcher
 from imbue.minds.desktop_client.session_store import MultiAccountSessionStore
+from imbue.minds.desktop_client.testing import device_id_for_test
 from imbue.minds.desktop_client.workspace_record_store import WorkspaceRecordStore
 from imbue.minds.primitives import ServiceName
+from imbue.minds.utils.mngr_caller import MngrCallResult
 from imbue.minds.utils.mngr_caller import MngrCaller
 from imbue.minds.utils.testing import RecordingMngrCaller
 from imbue.mngr.api.discovery_events import DiscoveredProvider
@@ -43,6 +60,12 @@ DEFAULT_SERVICE_NAME: ServiceName = ServiceName("web")
 
 FAKE_CONNECTOR_URL: AnyUrl = AnyUrl("https://test--rsc-api.modal.run")
 
+# The relay set the fake CLIs hand out for a share (one us1 relay, matching
+# the workspace domains the fakes build).
+TEST_RELAY_ENDPOINTS: tuple[ShareCliRelayEndpoint, ...] = (
+    ShareCliRelayEndpoint(relay_id="relay-" + "1" * 16, endpoint="relay-us1.shares.example:7000"),
+)
+
 
 class FakeImbueCloudCli(ImbueCloudCli):
     """In-memory test double for :class:`ImbueCloudCli`.
@@ -55,24 +78,56 @@ class FakeImbueCloudCli(ImbueCloudCli):
 
     The ``mngr_caller`` defaults to a :class:`RecordingMngrCaller` (rather than
     the process-wide warm-process caller) so any code that reaches through
-    ``cli.mngr_caller`` -- e.g. the tunnel-token injection in the sharing flow --
-    is a fast in-memory no-op instead of spawning a real ``mngr`` process.
+    ``cli.mngr_caller`` is a fast in-memory no-op instead of spawning a real
+    ``mngr`` process.
     """
+
+    # ``set_plan_error_to_raise`` holds an exception instance, which pydantic
+    # cannot schema-generate; allow arbitrary types for this test double.
+    model_config = ConfigDict(frozen=False, extra="forbid", arbitrary_types_allowed=True)
 
     mngr_caller: MngrCaller = Field(default_factory=RecordingMngrCaller)
     accounts_to_return: list[ImbueCloudAuthAccount] = Field(default_factory=list)
-    oauth_session_to_return: ImbueCloudAuthSession | None = Field(
-        default=None, description="Session auth_oauth returns; raises ImbueCloudCliError when unset"
+    login_session_to_return: ImbueCloudAuthSession | None = Field(
+        default=None, description="Session auth_login returns; raises ImbueCloudCliError when unset"
+    )
+    login_url_to_write: str = Field(
+        default="https://accounts.example.com/login?next=%2Faccounts%2Fauthorize",
+        description="Sign-in URL auth_login writes to its url_file (the copy-the-link fallback)",
     )
     is_auth_list_failing: bool = Field(
         default=False,
         description="When True, auth_list raises ImbueCloudCliError (simulates a transient subprocess failure)",
     )
-    tunnels_by_account: dict[str, dict[str, str]] = Field(
-        default_factory=dict, description="account email -> {agent_id: tunnel_name}"
+    shares_by_account: dict[str, dict[str, str]] = Field(
+        default_factory=dict, description="account email -> {host_id: share state}"
     )
-    deleted_tunnel_names: list[str] = Field(
-        default_factory=list, description="Every tunnel name delete_tunnel was called with, in order"
+    deleted_share_host_ids: list[str] = Field(
+        default_factory=list, description="Every host id delete_share was called with, in order"
+    )
+    is_share_lookup_failing: bool = Field(
+        default=False,
+        description="When True, get_share_status raises ImbueCloudCliError (simulates a connector hiccup)",
+    )
+    relays_to_return: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict,
+        description=(
+            "Relay map list_share_relays returns. Empty (the default) makes the "
+            "latency-based region picker a no-op, so tests never probe the network."
+        ),
+    )
+
+    resent_verification_emails: list[str] = Field(
+        default_factory=list, description="Every email auth_resend_verification was called with, in order"
+    )
+    is_resend_suppressed: bool = Field(
+        default=False, description="When True, auth_resend_verification reports the server cooldown (sent=False)"
+    )
+    set_plan_calls: list[tuple[str, str]] = Field(
+        default_factory=list, description="(account email, plan) for every set_account_plan call, in order"
+    )
+    set_plan_error_to_raise: ImbueCloudCliError | None = Field(
+        default=None, description="When set, set_account_plan raises this instead of switching"
     )
 
     def auth_list(self) -> list[ImbueCloudAuthAccount]:
@@ -80,17 +135,26 @@ class FakeImbueCloudCli(ImbueCloudCli):
             raise ImbueCloudCliError("fake transient auth list failure")
         return list(self.accounts_to_return)
 
-    def auth_oauth(
+    def auth_resend_verification(self, account: str) -> bool:
+        self.resent_verification_emails.append(account)
+        return not self.is_resend_suppressed
+
+    def set_account_plan(self, account: str, plan: str) -> dict[str, Any]:
+        self.set_plan_calls.append((account, plan))
+        if self.set_plan_error_to_raise is not None:
+            raise self.set_plan_error_to_raise
+        return {"plan_name": plan}
+
+    def auth_login(
         self,
-        account: str,
-        provider_id: str,
-        callback_port: int | None = None,
-        no_browser: bool = False,
         success_redirect_url: str | None = None,
+        url_file: Path | None = None,
     ) -> ImbueCloudAuthSession:
-        if self.oauth_session_to_return is None:
-            raise ImbueCloudCliError("auth oauth: no fake OAuth session configured on FakeImbueCloudCli")
-        return self.oauth_session_to_return
+        if url_file is not None:
+            url_file.write_text(self.login_url_to_write + "\n")
+        if self.login_session_to_return is None:
+            raise ImbueCloudCliError("auth login: no fake login session configured on FakeImbueCloudCli")
+        return self.login_session_to_return
 
     def set_accounts(self, accounts: list[ImbueCloudAuthAccount]) -> None:
         self.accounts_to_return = list(accounts)
@@ -114,22 +178,31 @@ class FakeImbueCloudCli(ImbueCloudCli):
     def remove_account(self, user_id: str) -> None:
         self.accounts_to_return = [a for a in self.accounts_to_return if a.user_id != user_id]
 
-    # -- In-memory tunnels (drives the teardown tests) --
+    # -- In-memory machine shares (drives the teardown tests) --
 
-    def add_tunnel(self, account: str, agent_id: str) -> None:
-        self.tunnels_by_account.setdefault(account, {})[agent_id] = f"fake--{agent_id[:16]}"
+    def add_share(self, account: str, host_id: str) -> None:
+        self.shares_by_account.setdefault(account, {})[host_id] = "active"
 
-    def find_tunnel_for_agent(self, account: str, agent_id: str) -> TunnelInfo | None:
-        tunnel_name = self.tunnels_by_account.get(account, {}).get(agent_id)
-        if tunnel_name is None:
+    def get_share_status(self, *, account: str, host_id: str) -> ShareCliInfo | None:
+        if self.is_share_lookup_failing:
+            raise ImbueCloudCliError("fake transient share lookup failure")
+        state = self.shares_by_account.get(account, {}).get(host_id)
+        if state is None:
             return None
-        return TunnelInfo(tunnel_name=tunnel_name, tunnel_id=f"id-{tunnel_name}")
+        return ShareCliInfo(
+            host_id=host_id,
+            workspace_domain=f"{host_id}.owner1234.us1.shares.example",
+            region="us1",
+            state=state,
+            relay_endpoints=TEST_RELAY_ENDPOINTS,
+        )
 
-    def delete_tunnel(self, account: str, tunnel_name: str) -> None:
-        self.deleted_tunnel_names.append(tunnel_name)
-        for agent_id, name in list(self.tunnels_by_account.get(account, {}).items()):
-            if name == tunnel_name:
-                del self.tunnels_by_account[account][agent_id]
+    def delete_share(self, *, account: str, host_id: str) -> None:
+        self.deleted_share_host_ids.append(host_id)
+        self.shares_by_account.get(account, {}).pop(host_id, None)
+
+    def list_share_relays(self, *, account: str) -> dict[str, tuple[str, ...]]:
+        return {region: tuple(endpoints) for region, endpoints in self.relays_to_return.items()}
 
     # -- In-memory storage-cleanup backend (drives the backup-trim tests) --
 
@@ -153,15 +226,40 @@ class FakeImbueCloudCli(ImbueCloudCli):
         self.cleanup_grant_call_count += 1
         return dict(self.cleanup_grant_result)
 
+    # -- In-memory machine listing (drives the stop-kind tracker) --
+
+    machines: list[MachineSizeCliInfo] = Field(
+        default_factory=list, description="The machines list_machines and show_machine answer from, every account"
+    )
+    is_machine_listing_failing: bool = Field(
+        default=False, description="When True, list_machines raises ImbueCloudCliError (connector unreachable)"
+    )
+    machine_list_call_count: int = Field(default=0, description="How many times list_machines was called")
+    machine_show_call_count: int = Field(default=0, description="How many times show_machine was called")
+
+    def list_machines(self, account: str) -> list[MachineSizeCliInfo]:
+        self.machine_list_call_count += 1
+        if self.is_machine_listing_failing:
+            raise ImbueCloudCliError("machines show: connector unreachable (fake)")
+        return list(self.machines)
+
+    def show_machine(self, account: str, machine_ref: str) -> MachineSizeCliInfo | None:
+        self.machine_show_call_count += 1
+        return next((machine for machine in self.machines if machine.host_id == machine_ref), None)
+
     # -- In-memory workspace-sync backend (mirrors the connector's semantics) --
 
     sync_records_by_email: dict[str, dict[str, dict[str, object]]] = Field(
-        default_factory=dict, description="email -> host_id -> wire record (the fake server state)"
+        default_factory=dict, description="email -> workspace id -> wire record (the fake server state)"
     )
     sync_bundle_by_email: dict[str, dict[str, object]] = Field(
         default_factory=dict, description="email -> key bundle (the fake server state)"
     )
     is_sync_offline: bool = Field(default=False, description="When True, every sync call raises (connector down)")
+    lease_holding_workspace_ids: set[str] = Field(
+        default_factory=set,
+        description="Workspace ids whose record delete the fake connector refuses with lease_active (a live lease)",
+    )
 
     def _check_sync_online(self, command_repr: str) -> None:
         if self.is_sync_offline:
@@ -173,28 +271,33 @@ class FakeImbueCloudCli(ImbueCloudCli):
 
     def sync_record_push(self, account: str, record: Mapping[str, object]) -> dict[str, object]:
         self._check_sync_online("sync records push")
-        by_host = self.sync_records_by_email.setdefault(account, {})
-        host_id = str(record["host_id"])
-        existing = by_host.get(host_id)
+        # Mirrors the workspace-keyed connector: one row per workspace id,
+        # host_id is a mutable attribute, CAS on the row's revision.
+        by_workspace = self.sync_records_by_email.setdefault(account, {})
+        workspace_id = str(record["agent_id"])
+        existing = by_workspace.get(workspace_id)
         pushed_revision = int(str(record["revision"]))
         if existing is not None and pushed_revision != int(str(existing["revision"])) + 1:
             conflict = ImbueCloudSyncConflictCliError("sync records push: revision conflict")
             conflict.stored_record = dict(existing)
             raise conflict
-        if str(record.get("state")) == "active":
-            for other_host_id, other in by_host.items():
-                is_other = other_host_id != host_id
-                if is_other and other.get("agent_id") == record.get("agent_id") and other.get("state") == "active":
-                    agent_conflict = ImbueCloudSyncConflictCliError("sync records push: active agent conflict")
-                    agent_conflict.stored_record = None
-                    raise agent_conflict
         stored = dict(record)
-        by_host[host_id] = stored
+        by_workspace[workspace_id] = stored
         return dict(stored)
 
-    def sync_record_delete(self, account: str, host_id: str) -> None:
+    def sync_record_delete(self, account: str, record_id: str) -> None:
         self._check_sync_online("sync records delete")
-        self.sync_records_by_email.get(account, {}).pop(host_id, None)
+        if record_id in self.lease_holding_workspace_ids:
+            raise ImbueCloudLeaseActiveCliError("sync records delete: the workspace still holds its cloud lease")
+        by_workspace = self.sync_records_by_email.get(account, {})
+        if record_id in by_workspace:
+            del by_workspace[record_id]
+            return
+        # Legacy host-id addressing resolves through the row's host column.
+        for workspace_id, record in list(by_workspace.items()):
+            if record.get("host_id") == record_id:
+                del by_workspace[workspace_id]
+                return
 
     def sync_scrub_secrets(self, account: str) -> int:
         self._check_sync_online("sync scrub-secrets")
@@ -217,6 +320,51 @@ class FakeImbueCloudCli(ImbueCloudCli):
     def sync_bundle_delete(self, account: str) -> None:
         self._check_sync_online("sync bundle delete")
         self.sync_bundle_by_email.pop(account, None)
+
+
+class SucceedingCreateShareCli(FakeImbueCloudCli):
+    """A ``create_share`` returning real relay coordinates, so the full client-side bring-up runs.
+
+    The returned share carries a relay endpoint + token, letting the share
+    flow continue through share-env rendering and materials injection (the
+    default ``RecordingMngrCaller`` records the exec writes). Every call is
+    recorded for seam assertions.
+    """
+
+    create_share_calls: list[tuple[str, str, str | None, str | None, str | None]] = Field(
+        default_factory=list,
+        description=(
+            "(account email, host id, entry label, preferred region, workspace id) for every create_share call, in order"
+        ),
+    )
+    chrome_origin_to_return: str | None = Field(
+        default=None,
+        description=(
+            "chrome_origin the returned share carries; None (the default) simulates a connector "
+            "that predates the field or a tier with no hosted chrome configured"
+        ),
+    )
+
+    def create_share(
+        self,
+        *,
+        account: str,
+        host_id: str,
+        entry_label: str | None = None,
+        preferred_region: str | None = None,
+        workspace_id: str | None = None,
+    ) -> ShareCliInfo:
+        self.create_share_calls.append((account, host_id, entry_label, preferred_region, workspace_id))
+        self.add_share(account, host_id)
+        return ShareCliInfo(
+            host_id=host_id,
+            workspace_domain=f"{host_id}.owner1234.us1.shares.example",
+            region="us1",
+            state="active",
+            relay_endpoints=TEST_RELAY_ENDPOINTS,
+            relay_token=SecretStr("relay-token-xyz"),
+            chrome_origin=self.chrome_origin_to_return,
+        )
 
 
 class RecordingImbueCloudCli(FakeImbueCloudCli):
@@ -255,6 +403,34 @@ class RecordingImbueCloudCli(FakeImbueCloudCli):
         )
 
 
+def make_share_probe_result(
+    is_gateway_present: bool = True,
+    is_share_env_present: bool = False,
+    grants_toml_text: str | None = None,
+) -> MngrCallResult:
+    """A canned ``mngr exec --format json`` result answering the share state probe.
+
+    Tests hand this to a :class:`RecordingMngrCaller` so the enable flow's
+    one-exec probe (``probe_share_state_in_agent``) parses a realistic
+    envelope. The same result is returned for every later call too, which is
+    harmless: the write exec only inspects the returncode.
+    """
+    grants_line = (
+        "MNGR_SHARE_GRANTS_B64=" + base64.b64encode(grants_toml_text.encode()).decode("ascii")
+        if grants_toml_text is not None
+        else "MNGR_SHARE_GRANTS_B64=ABSENT"
+    )
+    stdout = "\n".join(
+        [
+            f"MNGR_SHARE_GATEWAY={1 if is_gateway_present else 0}",
+            f"MNGR_SHARE_ENV={1 if is_share_env_present else 0}",
+            grants_line,
+        ]
+    )
+    envelope = {"results": [{"agent": "probe", "stdout": stdout, "stderr": "", "success": True}]}
+    return MngrCallResult(returncode=0, stdout=json.dumps(envelope))
+
+
 def make_fake_imbue_cloud_cli() -> FakeImbueCloudCli:
     """Build a :class:`FakeImbueCloudCli` rooted at a fresh ``ConcurrencyGroup``."""
     return FakeImbueCloudCli(
@@ -262,26 +438,95 @@ def make_fake_imbue_cloud_cli() -> FakeImbueCloudCli:
     )
 
 
-def make_session_store_for_test(data_dir: Path, cli: ImbueCloudCli | None = None) -> MultiAccountSessionStore:
-    """Build a :class:`MultiAccountSessionStore` (with its record store) over a fake CLI by default."""
+def make_session_store_for_test(
+    data_dir: Path, cli: ImbueCloudCli | None = None, mngr_host_dir: Path | None = None
+) -> MultiAccountSessionStore:
+    """Build a :class:`MultiAccountSessionStore` (with its record store) over a fake CLI by default.
+
+    ``mngr_host_dir`` (default None: disabled) enables the identity cache's
+    on-disk sessions-dir coherence check, exactly as the app wires it.
+    """
     effective_cli = cli or make_fake_imbue_cloud_cli()
     record_store = WorkspaceRecordStore(
-        paths=WorkspacePaths(data_dir=data_dir),
+        paths=InstallationPaths(data_dir=data_dir),
         cli=effective_cli,
-        device_id="device-test",
+        device_id=device_id_for_test("session-store"),
         device_label="test-device",
     )
-    return MultiAccountSessionStore(data_dir=data_dir, cli=effective_cli, record_store=record_store)
+    return MultiAccountSessionStore(
+        data_dir=data_dir, cli=effective_cli, record_store=record_store, mngr_host_dir=mngr_host_dir
+    )
+
+
+def make_profiled_device_for_test(
+    base: Path, name: str, cli: FakeImbueCloudCli
+) -> tuple[InstallationPaths, WorkspaceRecordStore, MultiAccountSessionStore, Path]:
+    """A device (paths, record store, session store) whose mngr profile dir exists, plus that profile dir.
+
+    SSH material collection and materialization need the profile dir; the
+    per-host key of a cloud machine lives under it.
+    """
+    paths = InstallationPaths(data_dir=base / name)
+    paths.data_dir.mkdir(parents=True, exist_ok=True)
+    mngr_host_dir = base / name / "mngr"
+    profile_id = uuid4().hex
+    profile_dir = mngr_host_dir / "profiles" / profile_id
+    profile_dir.mkdir(parents=True)
+    (mngr_host_dir / "config.toml").write_text(f'profile = "{profile_id}"\n')
+    record_store = WorkspaceRecordStore(
+        paths=paths,
+        mngr_host_dir=mngr_host_dir,
+        cli=cli,
+        device_id=device_id_for_test(name),
+        device_label=name,
+    )
+    session_store = MultiAccountSessionStore(data_dir=paths.data_dir, cli=cli, record_store=record_store)
+    return paths, record_store, session_store, profile_dir
+
+
+def build_desktop_client_for_test(
+    tmp_path: Path,
+    is_authenticated: bool,
+    backend_resolver: BackendResolverInterface | None = None,
+    **create_kwargs: Any,
+) -> tuple[FlaskClient, Flask, FileAuthStore]:
+    """Build a desktop-client Flask app over a fresh ``FileAuthStore`` and return its test client.
+
+    ``backend_resolver`` defaults to a bare ``MngrCliBackendResolver``; any extra
+    keyword arguments are forwarded to ``create_desktop_client``. When
+    ``is_authenticated`` is True the returned client already carries a valid
+    session cookie signed with the auth store's key.
+    """
+    auth_store = FileAuthStore(data_directory=tmp_path / "auth")
+    effective_resolver = backend_resolver if backend_resolver is not None else MngrCliBackendResolver()
+    app = create_desktop_client(
+        auth_store=auth_store,
+        backend_resolver=effective_resolver,
+        http_client=None,
+        **create_kwargs,
+    )
+    client = app.test_client()
+    if is_authenticated:
+        client.set_cookie(SESSION_COOKIE_NAME, create_session_cookie(signing_key=auth_store.get_signing_key()))
+    return client, app, auth_store
+
+
+@pytest.fixture
+def agent_id() -> AgentId:
+    """A fresh workspace agent id, for tests that need exactly one."""
+    return AgentId.generate()
 
 
 @pytest.fixture
 def root_concurrency_group() -> Iterator[ConcurrencyGroup]:
-    """Root ``ConcurrencyGroup`` for tests that construct an ``AgentCreator``.
+    """Root ``ConcurrencyGroup`` for tests that construct something requiring one.
 
-    ``AgentCreator.root_concurrency_group`` is required (in production it is
-    owned by ``start_desktop_client`` and brackets the FastAPI lifespan); this
-    fixture enters an equivalent group for the test's duration and exits it
-    cleanly afterwards so any strand tracking / shutdown semantics match.
+    Several components take it as a required field -- ``AgentCreator``,
+    ``ConnectivityDetector``, ``WorkspaceViewRefresher`` -- and in production all
+    of them are handed the one group ``start_desktop_client`` owns, which
+    brackets the app's lifespan. This fixture enters an equivalent group for the
+    test's duration and exits it cleanly afterwards so any strand tracking /
+    shutdown semantics match.
     """
     cg = ConcurrencyGroup(name="test-root")
     with cg:
@@ -334,9 +579,16 @@ def make_agents_json(*agent_ids: AgentId, labels: dict[str, str] | None = None, 
     return json.dumps({"agents": [_agent(agent_id) for agent_id in agent_ids]})
 
 
-def make_service_log(service: str, url: str) -> str:
-    """Build a single JSONL line matching the services/events.jsonl format."""
-    return json.dumps({"service": service, "url": url}) + "\n"
+def make_service_log(service: str, url: str, label: str = "") -> str:
+    """Build a single JSONL line matching the services/events.jsonl format.
+
+    ``label`` is the service's origin label (``<name>-<rand>``); omit it for the
+    legacy (label-less) shape.
+    """
+    entry: dict[str, str] = {"service": service, "url": url}
+    if label:
+        entry["label"] = label
+    return json.dumps(entry) + "\n"
 
 
 def seed_provider_snapshots(
@@ -409,9 +661,25 @@ def make_resolver_with_data(
         for agent_id_str, log_content in service_logs.items():
             records = parse_service_log_records(log_content)
             services: dict[str, str] = {}
+            labels: dict[str, str] = {}
             for record in records:
                 if isinstance(record, ServiceLogRecord):
                     services[str(record.service)] = record.url
-            resolver.update_services(AgentId(agent_id_str), services)
+                    if record.label:
+                        labels[str(record.service)] = record.label
+            resolver.update_services(AgentId(agent_id_str), services, labels)
 
     return resolver
+
+
+@pytest.fixture(autouse=True)
+def _forget_service_sign_in_options() -> Iterator[None]:
+    """Keep each test's latchkey double out of the next test's sign-in cache.
+
+    How a service connects is remembered for the life of the process, since it
+    is a property of the latchkey binary. Tests swap that binary for a double
+    per test, so the memo has to go with it.
+    """
+    clear_service_sign_in_options_cache()
+    yield
+    clear_service_sign_in_options_cache()

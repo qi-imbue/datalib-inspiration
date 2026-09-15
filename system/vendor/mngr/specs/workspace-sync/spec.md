@@ -71,7 +71,7 @@ Status: **Implemented** (branch `mngr/account-association`). Written as a bluepr
 - New `desktop_client/dek_store.py`: per-account DEK files at `~/.minds/keys/<user_id>.dek` (0600, atomic writes); create-if-absent; lock status (`is_unlocked(user_id)`); unlock (fetch bundle via CLI → unwrap → write file); wrap-and-push; per-account results for the "which accounts are still locked" surface.
 - New `desktop_client/workspace_record_store.py`: the local replica + sync engine —
   - replica persistence (`~/.minds/workspace_records/<user_id>.json`, dirty flags, last-pulled snapshot);
-  - record assembly: metadata from the resolver (name, color, provider, host_id, agent_id) + `device_id` (minds env's mngr `host_id`) + `device_label` (hostname);
+  - record assembly: metadata from the resolver (name, color, provider, host_id, agent_id) + `device_id` (the minds-owned per-install id at `<data_dir>/device_id`, adopted from the legacy mngr `host_id` on first run) + `device_label` (hostname);
   - secrets assembly per provider: the SSH private key that grants access (per-host key when the provider has one, e.g. imbue_cloud's `hosts/<host_id>/ssh_key`; else the provider-wide key), its known_hosts entries, and the canonical `restic.env` text when present;
   - push (CAS retry loop), pull, merge, and the post-discovery reconcile (migrate unmigrated, push dirty, tombstone definitively-absent, one-shot legacy conversion with `.pre-sync` renames).
 - `desktop_client/imbue_cloud_cli.py`: typed wrappers for the new `sync` verbs.
@@ -100,6 +100,17 @@ Status: **Implemented** (branch `mngr/account-association`). Written as a bluepr
 - **Acceptance** (dev-tier connector, `@pytest.mark.acceptance`): sign in, provision a workspace record + bundle from data dir A; from a fresh data dir B: sign in, pull, verify metadata renders without a password, unlock with the master password, decrypt secrets, materialize the backup env, and read backup status.
 - **Edge cases**: empty-password tier (records without secrets; banner behavior); clear-password scrub; multi-account partial unlock reporting; offline rename queueing; associate offline (clean failure); out-of-band destroy tombstoning (definitively-absent rule vs failed poll); destroyed-workspace backup download.
 - No e2e/`deployment_tests` changes.
+
+## The lease invariant (added 2026-08)
+
+A 2026-08-25 production audit found leased pool rows with no ACTIVE record -- running VMs no client listed (CLI leases never wrote records, pre-record-sync leases predated the concept, and client destroy paths tombstoned or removed records without the release completing). Records stay client-driven in general (the E2EE secrets constraint above), but the connector now enforces the record *state* at the points only it controls:
+
+- **Lease grant writes the record.** `POST /hosts/lease` / `POST /hosts/claim` insert a metadata-only ACTIVE stub (no secrets; `provider_kind = imbue_cloud_<account-slug>`, the desktop's per-account provider instance name) in the same DB transaction as the lease. The desktop's create-time seed push conflicts on the stub's revision and rebases (local content wins), then the reconcile's metadata refresh enriches it. Invariant: every lease-holding row has a record, always.
+- **Release retires the record.** Every release path (owner, operator, failed-claim rollback, sweep) acts on the record in the same transaction as the row's flip to `removing`: a record a client has written to is flipped to `destroyed` -- stamping `destroyed_at` and bumping the revision so stale client pushes CAS-conflict instead of resurrecting -- while a record still at its lease-time stub (revision 1, no secrets, no backup bucket) is deleted, since a create or claim that failed after the lease must not leave a ghost in every device's "recently destroyed" list. Closes the CLI-destroy gap: the desktop reconcile deliberately never tombstones cloud rows (any device may see them), so without this an out-of-band `mngr destroy` left an ACTIVE record forever.
+- **Tombstone-first deletes.** The connector refuses a hard `DELETE /sync/records/...` while the workspace holds a pool lease (409 `lease_active`); the retention reaper skips tombstones whose lease still exists. Hard-delete is allowed only once the lease is gone -- which the release chain does itself.
+- **The sweep.** An hourly connector cron joins lease-holding rows against records: lease + tombstone older than 6h -> release (destroy intent is durable, the release evidently failed); rows `removing` for longer than the same window -> re-driven, whether or not a record remains (a fresh flip is a release in flight); any other lease + no record -> alarm only, never reaped.
+
+Association for leased imbue_cloud workspaces remains immutable and cannot be disassociated from the desktop; the record follows the lease.
 
 ## Open questions
 

@@ -23,6 +23,7 @@ from imbue.mngr.interfaces.agent import AgentInterface
 from imbue.mngr.interfaces.data_types import ActivityConfig
 from imbue.mngr.interfaces.data_types import CertifiedHostData
 from imbue.mngr.interfaces.data_types import CommandResult
+from imbue.mngr.interfaces.data_types import HostBootInfo
 from imbue.mngr.interfaces.data_types import HostLifecycleOptions
 from imbue.mngr.interfaces.data_types import HostResources
 from imbue.mngr.interfaces.data_types import PyinfraConnector
@@ -80,6 +81,11 @@ class HostInterface(MutableModel, ABC):
     @abstractmethod
     def get_name(self) -> HostName:
         """Return the human-readable name of this host."""
+        ...
+
+    @abstractmethod
+    def get_provider_name(self) -> ProviderInstanceName:
+        """Return the name of the provider instance this host belongs to."""
         ...
 
     # =========================================================================
@@ -395,6 +401,17 @@ class OuterHostInterface(HostFileReadInterface, HostFileWriteInterface, ABC):
         """
         ...
 
+    def get_ssh_known_hosts_path(self) -> Path | None:
+        """Path of the known_hosts file that pins this host's SSH host key, when configured.
+
+        Returns ``None`` by default. A host whose connector was provisioned with
+        strict host-key checking surfaces the pin file here so consumers handed
+        only connection endpoints (``mngr list --format json``, discovery
+        events, the forward SSH tunnel) can verify the host key without
+        guessing the file's location from the private key's directory.
+        """
+        return None
+
     def get_outer_ssh_port(self) -> int | None:
         """Port of the host's outer/management sshd, when distinct from the agent connection.
 
@@ -433,6 +450,21 @@ class OuterHostInterface(HostFileReadInterface, HostFileWriteInterface, ABC):
         if self.is_local:
             return path.exists()
         return self.execute_idempotent_command(f"test -e {shlex.quote(str(path))}", timeout_seconds=5.0).success
+
+    def is_directory(self, path: Path) -> bool:
+        """Whether ``path`` is a directory on this host.
+
+        Uses the local filesystem for local hosts and ``test -d`` over SSH for
+        remote hosts. Implemented on the interface so callers (including plugins)
+        don't have to branch on ``is_local`` themselves.
+
+        Note that this is reachable only where a host models ``is_local``. Code
+        holding an always-remote outer-host double (see ``mngr_vps``) still issues
+        its own ``test -d``.
+        """
+        if self.is_local:
+            return path.is_dir()
+        return self.execute_idempotent_command(f"test -d {shlex.quote(str(path))}", timeout_seconds=5.0).success
 
     def get_directory_size(self, path: Path) -> SizeBytes:
         """Disk space used by ``path`` and its contents, or 0 if it is not a directory.
@@ -601,17 +633,12 @@ class OnlineHostInterface(HostInterface, OuterHostInterface, ABC):
     # =========================================================================
 
     @abstractmethod
-    def get_boot_time(self) -> datetime | None:
-        """Get the host boot time as a datetime.
+    def read_boot_info(self) -> HostBootInfo:
+        """Read the host's boot time and uptime together in a single host-side probe.
 
-        Returns the actual boot time from the OS, not computed from uptime,
-        to avoid timing inconsistencies.
+        Uptime is measured on the host (not the local clock minus the host's boot
+        time), so it is unaffected by clock skew between here and the host.
         """
-        ...
-
-    @abstractmethod
-    def get_uptime_seconds(self) -> float:
-        """Return the number of seconds since this host was last started."""
         ...
 
     @abstractmethod
@@ -742,6 +769,16 @@ class OnlineHostInterface(HostInterface, OuterHostInterface, ABC):
 
         Called when an agent's data.json is updated. Providers that support
         persistent agent state (like Modal) will sync this to their storage.
+        """
+        ...
+
+    @abstractmethod
+    def remove_agent_data(self, agent_id: AgentId) -> None:
+        """Remove agent data from external storage (the inverse of save_agent_data).
+
+        Called when an agent's id no longer identifies state on this host (the
+        agent was destroyed or its state was re-keyed). A no-op for providers
+        without an external agent store, or when no copy exists for the id.
         """
         ...
 

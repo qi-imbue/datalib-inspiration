@@ -70,7 +70,9 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 from collections.abc import Iterator
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Final
 
@@ -97,7 +99,7 @@ _RUNC_VERSION: Final[str] = "v1.3.0"
 # Keep these in sync with apps/minds/.nvmrc and apps/minds/package.json engines.
 _NODE_VERSION: Final[str] = "24.15.0"
 _PNPM_VERSION: Final[str] = "10.33.4"
-_CLAUDE_CODE_VERSION: Final[str] = "2.1.207"
+_CLAUDE_CODE_VERSION: Final[str] = "2.1.269"
 
 # In-sandbox entrypoint that invokes the shared e2e workspace runner the
 # pytest test also uses, but without the test's mngr-destroy cleanup. The
@@ -118,7 +120,6 @@ _IN_SANDBOX_RUNNER_PROGRAM: Final[str] = textwrap.dedent(
     import os
     import subprocess
     import tempfile
-    import time
     from pathlib import Path
 
     from imbue.minds.desktop_client.e2e_workspace_runner import (
@@ -141,6 +142,12 @@ _IN_SANDBOX_RUNNER_PROGRAM: Final[str] = textwrap.dedent(
     # Snapshot builds are test infrastructure, not a real install, so they
     # must not count toward Latchkey's usage.
     _write_to_os_environ("LATCHKEY_DISABLE_COUNTING", "1")
+    # Opt into Modal's V2 Sandbox backend, matching the mngr-wide default. Uses
+    # setdefault (not _write_to_os_environ) so an explicit MODAL_SANDBOX_V2=0
+    # still wins: this sandbox pairs vm_runtime with snapshot_filesystem, and if
+    # that combination is ever unsupported on V2 the workflow can fall back to
+    # V1 without a code change.
+    os.environ.setdefault("MODAL_SANDBOX_V2", "1")
     # Force the local-docker workspace to runc: the dockerd inside this Modal
     # vm_runtime sandbox only has the default runc registered (no gVisor), so a
     # runsc container fails with "unknown or invalid runtime name: runsc". The
@@ -153,6 +160,25 @@ _IN_SANDBOX_RUNNER_PROGRAM: Final[str] = textwrap.dedent(
     # stacked template's docker_runtime outranks it.) Mirrors the pytest path in
     # apps/minds/test_snapshot_resume.py.
     _write_to_os_environ("MINDS_DOCKER_RUNTIME_DEFAULT", "RUNC")
+    # The workspace image build is network-bound (apt and pip mirrors, the
+    # pi extension npm installs in setup_system.sh) and a healthy one runs
+    # 8 to 10.5 minutes here, so the docker provider's 600-second default
+    # build timeout would be the tighter of the two deadlines on the create
+    # flow. The runner's create-flow wait sits above this so the boot after
+    # the build still fits.
+    _write_to_os_environ("MNGR__PROVIDERS__DOCKER__BUILD_TIMEOUT_SECONDS", "900")
+    # The snapshot-resume suite never exercises the browser stack, so the
+    # workspace skips its env.d browser unit -- most importantly the
+    # hundreds-of-MB Fortress engine download -- making this build faster and
+    # deterministic by construction (no deferred install left to race). The
+    # switch rides MINDS_EXTRA_PASS_HOST_ENV -> `mngr create --pass-host-env`
+    # -> the host env file on the workspace's persistent volume, so it is in
+    # the agent environment on EVERY boot: the unit re-evaluates it each boot,
+    # which also keeps resumed test sandboxes from starting the download
+    # mid-suite. Xvfb itself is baked into the DEFAULT_WORKSPACE_TEMPLATE
+    # image, so no supervisord service depends on the skipped unit.
+    _write_to_os_environ("DWT_SKIP_BROWSER_UNIT", "1")
+    _write_to_os_environ("MINDS_EXTRA_PASS_HOST_ENV", "DWT_SKIP_BROWSER_UNIT")
     # The paired DEFAULT_WORKSPACE_TEMPLATE worktree was materialized on the runner and baked into the
     # image at ``.external_worktrees/default-workspace-template``; resolve it
     # (errors loudly if the bake did not stage it).
@@ -161,59 +187,11 @@ _IN_SANDBOX_RUNNER_PROGRAM: Final[str] = textwrap.dedent(
     debug_port = find_free_port()
     print(f"[snapshot] workspace={workspace_name} debug_port={debug_port}", flush=True)
     create_workspace_via_electron(default_workspace_template_path, workspace_name, debug_port)
-    # The workspace's deferred install (the env.d browser unit) apt-installs the
-    # Fortress engine and then Xvfb in the background after the create returns.
-    # A snapshot taken before both land bakes a workspace whose xvfb service can
-    # never start in resumed sandboxes: `supervisorctl restart all` (e.g. after a
-    # backup restore) then reports `xvfb: ERROR (spawn error)` on every retry,
-    # because all test attempts share this one snapshot. Wait for both artifacts
-    # inside the workspace's own container (matched by the workspace name --
-    # other running containers, like the docker-state holder, never install
-    # Xvfb and must not gate the snapshot); a genuinely wedged install should
-    # fail this build loudly rather than mint a snapshot that fails the test
-    # stage mysteriously. The install runs concurrently with the multi-minute
-    # create above (it starts on the container's first boot), so the residual
-    # wait here is normally seconds; 5 minutes is a generous bound for an apt
-    # hiccup, not the install's full duration.
-    deferred_install_check = (
-        "command -v Xvfb >/dev/null 2>&1 && test -x /opt/fortress/tilion-fortress/tilion"
-    )
-    deferred_install_deadline = time.monotonic() + 300.0
-    while True:
-        running_names = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        ).stdout.split()
-        workspace_containers = [name for name in running_names if workspace_name in name]
-        if not workspace_containers:
-            raise RuntimeError(
-                f"no running container carries the workspace name {workspace_name!r} "
-                f"(running: {running_names!r}); cannot verify the deferred install"
-            )
-        pending = [
-            name
-            for name in workspace_containers
-            if subprocess.run(
-                ["docker", "exec", name, "sh", "-c", deferred_install_check],
-                check=False,
-                timeout=60,
-            ).returncode
-            != 0
-        ]
-        if not pending:
-            print("[snapshot] deferred install complete in the workspace container", flush=True)
-            break
-        if time.monotonic() > deferred_install_deadline:
-            raise RuntimeError(
-                "deferred install (Xvfb + Fortress engine) did not complete in "
-                f"container(s) {pending!r} within 5 minutes; refusing to snapshot "
-                "a workspace whose xvfb service cannot start"
-            )
-        print(f"[snapshot] waiting for deferred install in {pending!r}", flush=True)
-        time.sleep(10)
+    # No deferred-install wait here: DWT_SKIP_BROWSER_UNIT (set above) turns
+    # the env.d browser unit off entirely, and Xvfb is baked into the image,
+    # so there is nothing racing this snapshot -- the bounded wait that used
+    # to sit here guarded a snapshot-without-Xvfb failure mode that can no
+    # longer occur.
     # IMPORTANT: do NOT call destroy_agent_best_effort here. The whole
     # point of this script is to leave the workspace agent + Docker
     # container's on-disk state (volumes, /home/user/workspace, the
@@ -277,6 +255,11 @@ _IN_SANDBOX_RUNNER_PROGRAM: Final[str] = textwrap.dedent(
 _STAGING_RSYNC_EXCLUDES: Final[tuple[str, ...]] = (
     ".venv",
     "node_modules",
+    # Host-built bundled binaries, re-provisioned in-image by ensure-binaries.js
+    # below. Excluding them keeps the largest single item out of the upload, and
+    # keeps a macOS host's arm64 binaries from landing in this Linux image, where
+    # ensure-binaries would see them as present and skip.
+    "/apps/minds/resources",
     "test-results",
     ".test_output",
     "__pycache__",
@@ -294,7 +277,8 @@ _STAGING_RSYNC_EXCLUDES: Final[tuple[str, ...]] = (
 # install third-party deps in layers that change only when the manifests do
 # (see _build_snapshot_image). The python tree is the root pyproject/lockfile
 # plus every uv workspace member's pyproject.toml (uv needs the member
-# manifests to construct the workspace even with --no-install-workspace).
+# manifests to construct the workspace even with --no-install-workspace);
+# _python_manifest_relative_paths drops the excluded standalone projects.
 # The pnpm tree is what `pnpm install --frozen-lockfile` reads (apps/minds is
 # a single-package pnpm workspace with no install-time scripts that need
 # source files -- its package.json has no preinstall/postinstall/prepare).
@@ -307,17 +291,30 @@ _PNPM_MANIFEST_RELATIVE_PATHS: Final[tuple[str, ...]] = (
     "apps/minds/pnpm-lock.yaml",
     "apps/minds/pnpm-workspace.yaml",
     "apps/minds/.npmrc",
+    # The desktop client's Mithril frontend is its own pnpm workspace root
+    # (separate lockfile); its manifests ride in the same cacheable layer.
+    "apps/minds/frontend/package.json",
+    "apps/minds/frontend/pnpm-lock.yaml",
+    "apps/minds/frontend/pnpm-workspace.yaml",
 )
 
 
 def _python_manifest_relative_paths(repo_root: Path) -> tuple[str, ...]:
     """Return the repo-relative paths uv needs for a manifests-only sync."""
-    member_manifests = sorted(
-        path.relative_to(repo_root).as_posix()
-        for pattern in _PY_WORKSPACE_MEMBER_MANIFEST_GLOBS
-        for path in repo_root.glob(pattern)
-    )
-    return ("pyproject.toml", "uv.lock", *member_manifests)
+    # Directories the root pyproject excludes from the workspace are standalone
+    # uv projects: uv does not read their manifests when constructing this
+    # workspace, so staging them would only make their dependency churn
+    # invalidate this image layer for nothing.
+    root_pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text())
+    excluded_globs = tuple(root_pyproject["tool"]["uv"]["workspace"].get("exclude", ()))
+    member_manifests: list[str] = []
+    for pattern in _PY_WORKSPACE_MEMBER_MANIFEST_GLOBS:
+        for path in repo_root.glob(pattern):
+            relative = path.relative_to(repo_root).as_posix()
+            if any(fnmatch(relative, f"{glob}/*") for glob in excluded_globs):
+                continue
+            member_manifests.append(relative)
+    return ("pyproject.toml", "uv.lock", *sorted(member_manifests))
 
 
 def _copy_relative_paths(source_root: Path, relative_paths: tuple[str, ...], target_root: Path) -> None:
@@ -540,7 +537,10 @@ def _build_snapshot_image(
             'if [ $attempt -ge 3 ]; then echo "pnpm install: all 3 attempts failed" >&2; exit 1; fi; '
             'echo "pnpm install attempt $attempt failed; retrying in $((attempt * 10))s..." >&2; '
             "sleep $((attempt * 10)); "
-            "done",
+            "done && "
+            # The frontend workspace's deps warm the same cacheable layer; no
+            # retry loop needed (its only postinstall is esbuild's tiny check).
+            "cd /code/mngr/apps/minds/frontend && pnpm install --frozen-lockfile",
         )
         # Third-party Python deps layer: only the uv manifests. `--no-install-workspace`
         # installs just the locked third-party deps (uv constructs the
@@ -574,27 +574,26 @@ def _build_snapshot_image(
         # venv / node_modules with the actual checkout (e.g. a member
         # pyproject.toml whose metadata changed).
         #
-        # ensure-binaries + build:css then run (both need what pnpm install
-        # provides), mirroring `pnpm start`'s prestart hook, which the e2e
-        # runner never triggers because it runs the app straight from source.
+        # ensure-binaries then runs (it needs what pnpm install provides),
+        # mirroring `pnpm start`'s prestart hook, which the e2e runner never
+        # triggers because it runs the app straight from source.
         # ensure-binaries downloads the bundled binaries (restic, uv, git,
         # limactl, desync) into apps/minds/resources/ -- without restic there,
         # the sync-e2e backup flows fail with "restic binary not found".
-        # build:css produces the gitignored Tailwind stylesheet app.min.css:
-        # without it app.min.css 404s in the renderer -- and since the
-        # onboarding driver detects a screen advancing via
-        # `wait_for_selector(state="hidden")` and the `.hidden` rule lives in
-        # that stylesheet, a missing stylesheet makes every onboarding screen
-        # look stuck. Mirrors the Electron e2e test setup.
         #
         # The /app -> /code/mngr symlink (independent) works around offload
         # v0.9.7's create_from_image hardcoding workdir="/app": our project is at
         # /code/mngr, so the symlink lets `uv run pytest` find the project venv
         # from offload's chosen workdir.
+        # The SPA bundle build produces the Mithril UI: static/ui/ is
+        # gitignored build output, and without it every hub route serves the
+        # "frontend not built" page, so the e2e onboarding driver never sees
+        # the create form.
         .run_commands(
             "( cd /code/mngr && uv sync --all-packages ) && "
             "( cd /code/mngr/apps/minds && pnpm install --frozen-lockfile ) && "
-            "( cd /code/mngr/apps/minds && node scripts/ensure-binaries.js && pnpm run build:css ) && "
+            "( cd /code/mngr/apps/minds && node scripts/ensure-binaries.js ) && "
+            "( cd /code/mngr/apps/minds/frontend && pnpm install --frozen-lockfile && pnpm generate && pnpm build ) && "
             "ln -s /code/mngr /app",
         )
     )
@@ -685,12 +684,14 @@ def _create_workspace_in_sandbox(sandbox: modal.Sandbox) -> None:
     because Electron needs an X display.
     """
     command = "cd /code/mngr && xvfb-run -a uv run python -c {}".format(shlex.quote(_IN_SANDBOX_RUNNER_PROGRAM))
-    # Budget: 1500s, sized for the Electron create itself (the in-sandbox
-    # DEFAULT_WORKSPACE_TEMPLATE container build, the headline phase -- a few
-    # minutes in practice, so this carries large headroom). The runner
-    # program's bounded 300s deferred-install wait fits inside that headroom,
-    # so a slow install hits the program's own deadline (which names the
-    # pending containers) rather than this generic exec timeout.
+    # Budget: 1500s. The wrapped runner budgets 1200s for the post-submit create
+    # phase alone (its headline cost is the in-sandbox DEFAULT_WORKSPACE_TEMPLATE
+    # container build, legitimately ~8-10.5 minutes in CI and given 900s by the
+    # MNGR__PROVIDERS__DOCKER__BUILD_TIMEOUT_SECONDS set in the program above),
+    # plus the Electron launch/attach and system-interface phases. Keeping this
+    # exec timeout above any realistic run total means a stall hits the runner's
+    # own per-phase deadline (which names the stuck phase) rather than this
+    # generic exec timeout.
     returncode = _exec_in_sandbox(
         sandbox,
         command,

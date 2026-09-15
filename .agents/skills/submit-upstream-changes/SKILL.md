@@ -1,6 +1,8 @@
 ---
 name: submit-upstream-changes
 description: Push local improvements to shared infrastructure (skills, scripts, CLAUDE.md scaffolding, Dockerfile, system/supervisord.conf) back to the parent template repo so other agents derived from the template benefit. Opens a separate per-feature PR per logical fix; never pushes directly to upstream `main`. Do not push agent-specific content (PURPOSE.md, memory, runtime state). For pulling updates from upstream, use the `update-self` skill instead.
+metadata:
+  author: imbue
 ---
 
 # Pushing changes upstream
@@ -15,7 +17,7 @@ Push **shared infrastructure** that benefits other agents derived from the templ
 - Scripts (`system/scripts/`, `.agents/shared/scripts/`)
 - CLAUDE.md scaffolding (template-level sections only)
 - Dockerfile
-- `system/supervisord.conf` (template-level service programs)
+- `system/supervisord.conf` and `system/supervisord.conf.d/` (template-level service programs)
 
 Do **not** push agent-specific content:
 
@@ -23,6 +25,12 @@ Do **not** push agent-specific content:
 - Memory contents
 - Workspace data and runtime state (`data/`)
 - Agent-specific services, settings, or CLAUDE.md sections
+
+Do **not** include changes under `system/vendor/mngr/` -- that is a vendored
+snapshot of the mngr repo, and mngr changes get their own PR on the mngr repo,
+not a template PR. See [references/mngr-changes.md](references/mngr-changes.md)
+for the flow (test in the vendored tree, then prepare the mngr PR from a
+standalone checkout at `.external_worktrees/mngr`).
 
 ## PR conventions
 

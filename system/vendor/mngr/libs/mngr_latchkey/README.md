@@ -63,6 +63,9 @@ mngr latchkey link-permissions --host-id "$HOST_ID" --opaque-path "$OPAQUE_PATH"
 # request whose ``<id>`` is not in the host's allowed-agent enum, so
 # every minds agent that wants to call the Minds API must be registered
 # here. Idempotent: re-running for an already-registered agent is a no-op.
+# A host with a machine of its own (a remote workspace whose gateway was
+# provisioned from this computer) is also handed the updated file, since
+# its gateway enforces its own copy; the command fails if it cannot be.
 mngr latchkey register-agent --host-id "$HOST_ID" --agent-id "$AGENT_ID"
 ```
 
@@ -115,6 +118,59 @@ CLI flag > env var > settings.toml > built-in default.
   only the newest rotation. Without that the file is append-only for the life
   of the install, and is gzipped and re-uploaded with every bug report.
 
+## Troubleshooting
+
+### Two forwards for one latchkey directory
+
+The forward is supervisor-managed, and exactly one should be running per
+latchkey directory: each holds an exclusive lock on its own directory for its
+whole life, so a second one for the same directory refuses to start. Forwards
+for *different* directories are expected, so tell them apart by the
+`--latchkey-directory` in each title:
+
+```sh
+ps -eo pid,args | grep '[m]ngr latchkey forward'
+kill <stray-pid>
+```
+
+`SIGTERM` runs the supervisor's teardown, which stops its `mngr observe` child,
+its reverse tunnels and the shared gateway subprocess, so killing the
+supervisor leaves nothing behind to clean up by hand.
+
+### A remote host's gateway keeps failing to wire
+
+Every discovery cycle (30s by default) re-runs each remote host's SSH wiring
+steps -- the desktop-to-VPS tunnel, the desktop-gateway reverse tunnel, and VPS
+gateway provisioning -- until they succeed, so a transient SSH failure (a
+connection reset, a dead transport, a handshake blip, an authentication
+timeout) heals by itself and is only logged at `INFO` the first time and
+`DEBUG` on later cycles. A host that keeps failing that way for
+`TRANSIENT_FAILURE_REPORT_THRESHOLD` (10) consecutive cycles while reporting as
+running is logged once at `ERROR` with a traceback (which is what reaches
+Sentry), then retried quietly until it succeeds, at which point a new outage
+would report afresh. The host stopping (or reporting `UNAUTHENTICATED`) also
+ends the streak, so failures before and after a restart are two separate
+outages. Failures that retrying cannot fix -- trust material missing
+on this computer, a rejected key, a malformed file -- are logged at `ERROR`
+immediately.
+
+A remote host that is restored onto new coordinates by anyone other than this
+computer (an operator migration, a start from another device, a watchdog
+re-drive) keeps its host id while its VM, address and ports all change. The
+supervisor follows it within one discovery cycle: the container endpoint
+discovery reports each cycle is compared against the one the host's gateway
+route was resolved for, and a change drops the cached route, refreshes the
+provider's host listing, removes the desktop-to-VPS tunnel to the old endpoint,
+and re-runs the (idempotent) VPS gateway provisioning, since the recreated VM's
+tmpfs holds no gateway secrets. A desktop-to-VPS tunnel failure also stops the
+cached route being reused, so a move the comparison did not see still
+re-resolves on the next cycle instead of streaking against a dead endpoint; the
+route stays cached as the comparison's baseline, since a migration usually
+announces itself as exactly this failure before discovery reports the new
+coordinates. A failure of this computer's own end of the tunnel (trust material
+missing on disk, a socket it could not bind) says nothing about the host and
+keeps the route in use.
+
 ## Error reporting (Sentry)
 
 `mngr latchkey forward` can report errors to Sentry. It is **off by default** and
@@ -156,6 +212,150 @@ projects. When the minds desktop client spawns the supervisor it sets all of
 these automatically -- resolving the DSN / environment / bucket from its own
 Sentry settings and maintaining the consent file from the user's error-reporting
 settings.
+
+## Desktop egress
+
+Some destinations block the datacenter IP ranges a remote workspace's VPS sits
+in, so a request has to leave from the user's own machine to be accepted at all.
+Workspaces ask for that by *prefixing* the target URL, because latchkey's
+gateway routes on the request path alone -- a header cannot divert a request
+that already looks like `/gateway/<url>`.
+
+`prepare_agent_latchkey` publishes the prefix to use as `MINDS_VIA_DESKTOP_URL_PREFIX`
+in every workspace's env:
+
+| Workspace | Value | Why |
+|---|---|---|
+| VPS gateway | `https://latchkey-self.invalid/via-desktop` | `latchkey curl` recognizes the reserved `latchkey-self.invalid` host and rewrites such URLs onto the gateway's own origin, so the wrapped URL arrives as `/via-desktop/<target>` and the forwarding extension hands it to the desktop |
+| desktop gateway | `""` (empty) | the gateway already runs on the user's machine, so a plain request is already desktop egress and a prefix would only add a hop |
+
+In-workspace tooling therefore concatenates the value without branching on
+topology, and gets the right behavior in both. It is always set (empty rather
+than absent) so tooling can tell "minds configured no prefix" apart from "this
+workspace predates the feature".
+
+The name is `MINDS_*` rather than `LATCHKEY_*` even though the value is a
+latchkey URL. A workspace's env names each var after the tool that *reads* it
+(`LATCHKEY_GATEWAY` for latchkey, `MNGR_HOST_DIR` for the inner mngr), and
+latchkey never reads this one -- it only receives the concatenated result as a
+URL argument. With no single reader to name it after, it takes the name of the
+authority that decides the value: minds, which alone knows the topology.
+
+```sh
+latchkey curl "$MINDS_VIA_DESKTOP_URL_PREFIX/https://api.example.com/v1/thing"
+```
+
+This grants nothing: the agent baseline opens the *route*, and what may be
+reached through it is decided by the ordinary per-service, per-account rules,
+which the desktop evaluates against the real target URL after unwrapping. A
+service the user has granted is reachable both ways with one grant, and a
+service they have not granted is reachable neither way -- so desktop egress
+never appears as its own consent prompt.
+
+## Machine stores
+
+Credentials belong to the machine that uses them: the user's computer owns one
+credential store (shared by every local host), and each remote host's VPS owns
+its own. So that a remote host's credentials can be *read* with the ordinary
+offline latchkey commands -- and so a browser sign-in has somewhere to land
+before it is handed over -- every remote host gets a **machine store**: its
+existing per-host directory, made into a usable `LATCHKEY_DIRECTORY`. It is a
+scratch pad, refilled from the machine (`MachineCredentials.refresh`) whenever
+what it says is about to be shown or acted on, never trusted between times:
+
+```
+<latchkey_directory>/mngr_latchkey/hosts/<host_id>/
+    credentials.json.enc          this machine's credentials      (owned)
+    data-format-version           the mirror's own format stamp   (owned)
+    latchkey_permissions.json     the machine's policy, cached    (owned)
+    machine_encryption_key        the machine's own key           (owned)
+    machine_gateway_password      the machine's own password      (owned)
+    permissions.json           -> latchkey_permissions.json
+    config.json                -> the desktop's config.json
+    browser_state.json.enc     -> the desktop's browser state
+    encryption_key             -> the desktop's encryption key
+    last-daily-count           -> the desktop's usage-ping stamp
+```
+
+The last of those is shared for a plainer reason than the rest: it rate-limits
+latchkey's once-a-day usage ping, which is about the user, so an unshared stamp
+would make an ordinary offline read against each machine store ping once a day
+per remote host.
+
+`imbue.mngr_latchkey.remote._mirror` owns that layout. Two properties are worth
+knowing:
+
+- **A mirror is held under the desktop's key**, whatever key the mirrored
+  machine uses for its own store. Upstream encrypts the browser session with
+  the same per-directory key as the credential store, so this is what lets every
+  machine store share one browser session (which keeps signing a second machine
+  in to a service down to a consent click rather than a full re-login).
+  Transfers re-encrypt at the boundary instead: what is shipped to a machine is
+  encrypted with *its* key (`Latchkey.export_credentials_subset`'s
+  `destination_key`, handed to the CLI on stdin so it never reaches `argv`).
+
+- **Each machine's key is recorded in its machine store -- as a mirror, not the
+  truth.** A machine holds its own key only in RAM (provisioning writes it to a
+  tmpfs file, deliberately never to the disk beside the encrypted store), and
+  that RAM copy is authoritative while it exists: any of the user's computers
+  may have provisioned the machine, so each desktop's provisioning pass *adopts*
+  the key the machine is already running under rather than deciding one, and
+  keeps the durable copy so a rebooted machine (whose tmpfs is wiped) can be
+  handed its key back. Only a machine that is not running a key, with none
+  recorded here, gets one decided: a fresh key when it holds no credential
+  store; the desktop's key when its store verifiably opens under it (a machine
+  provisioned by a build that predates per-machine keys, whose agents may carry
+  a permissions-override JWT the gateway validates with a key derived from it);
+  and otherwise -- a store written under a key held only by a computer that is
+  gone -- the store is abandoned and a fresh key minted, because signing in
+  again is possible and waiting for a computer that may never return is not.
+
+- **A machine's gateway listen password is recorded the same way, and is
+  adopted for a blunter reason.** It is the password the workspaces on that
+  machine present (`LATCHKEY_GATEWAY_PASSWORD`), and their host env file is
+  written once, at `mngr create`, with nothing to rewrite it afterwards. So the
+  value the creating computer chose is fixed for the machine's whole life: a
+  second computer that wrote its own here would answer every request those
+  workspaces make with a 401. Provisioning therefore adopts what the machine is
+  running under, falls back to the record here for a machine whose tmpfs a
+  reboot wiped, and only seeds its own value (`Latchkey.derive_gateway_password`,
+  which is also what it bakes into the workspaces it creates) into a machine
+  neither is true of. The password the *desktop* gateway listens on is a
+  separate secret, and the one place the two used to be the same is described
+  under [Remote desktop-gateway proxy
+  extension](#remote-desktop-gateway-proxy-extension).
+
+- **A machine store is not a plugin root.** `Latchkey.plugin_data_dir` would
+  resolve to a nested `mngr_latchkey/` underneath it, and `initialize()` would
+  rewrite the shared `config.json` through its link, so only the
+  credential/service-introspection subset of `Latchkey` may be pointed at one.
+
+`imbue.mngr_latchkey.remote.credentials` is how a machine is reached.
+`MachineCredentials` is built for the duration of one exchange -- the caller
+opens the machine's outer host, does what it came to do, and lets both go --
+and every method costs a single remote command: `connect_service`,
+`disconnect_account`, `set_permissions` and `connect_service_with_permissions`
+push, and `refresh` reads the machine's credentials *and* its policy back in
+one go. Nothing is queued: an exchange either succeeds before its caller
+returns or raises `RemoteGatewayError`, so an embedder (the minds desktop app)
+can block a user's click on it and report what the machine said.
+
+`refresh` also settles which side wins, and for both halves the answer is the
+machine. The credentials are obviously its own -- only it can rotate the tokens
+it holds. The policy is its own for a less obvious reason: the user may have
+more than one computer, and any of them can push a grant. A desktop that
+treated its own copy as the truth would quietly revert what another computer
+granted, so what the machine holds is adopted here instead. The one write
+`refresh` makes toward the machine is the seed: a machine with no policy at all
+gets this desktop's copy, which is how a freshly provisioned gateway stops
+permitting everything.
+
+What keeps that safe is that the copy here is never edited *without* being
+pushed. Every writer of `latchkey_permissions.json` -- a UI toggle, a grant, an
+agent registration, a recovery repair -- pushes the result to the machine in the
+same breath, and a push that fails is reported (to the user when there is one to
+report to, to the log otherwise) rather than left behind as a local edit that a
+later refresh would silently discard.
 
 ## Permissions config
 
@@ -228,30 +428,22 @@ Minds' own gateway-self scopes (`latchkey-self`, `minds-api-proxy-*`) stay
 account-agnostic: latchkey attaches no account metadata to requests an
 extension serves, so an account-gated schema would never match them.
 
-## Data-format migrations
+## Data-format changes
 
-The plugin records the version of its on-disk data format in a
-`data-format-version` file at the root of `<latchkey_directory>/mngr_latchkey/`.
-When the shape of that state changes incompatibly, the change is expressed as a
-reversible migration (`up`/`down`) under the `imbue.mngr_latchkey.migrations`
-package rather than as ad-hoc repair code in the readers. Every
-`Latchkey.initialize()` reconciles the recorded version against the version the
-installed code targets, applying the intervening migrations in the appropriate
-direction (`up` after an upgrade, `down` after a downgrade) and re-stamping the
-file. This is cheap in the steady state (one small file read when already
-current), and a fresh install is simply stamped straight to the current version.
+The plugin has no data-format migration mechanism. A permissions file is
+whatever the machine that owns it holds, and the shape it is written in is the
+one the installed code produces: `LatchkeyPermissionsConfig` is `extra="ignore"`,
+so a file carrying keys this build does not model still loads, and those keys
+disappear the next time the file is saved.
 
-Besides the plugin's own data directory, every migration step is handed the
-latchkey directory and binary, because rewriting the plugin's state sometimes
-requires looking at the *upstream* latchkey state next to it -- the per-account
-permissions migration, for instance, shells out to `latchkey auth list
---offline` to learn which accounts have stored credentials. It does so only once
-it has found a host file to rewrite, so a startup with nothing to migrate never
-pays for it, and a failed listing aborts the migration rather than being read as
-"no accounts anywhere". A per-host permissions file that cannot be read, parsed,
-or rewritten is replaced with the file a freshly-created host would get (the
-agent baseline) rather than failing the whole run: the host keeps working from a
-clean slate and its agents can re-request what they need.
+That self-healing only covers *extra keys*. It does not cover a change that
+moves data between rule keys, and there is nothing left that would rewrite such
+a file. So a permissions shape change is now a breaking change across desktops:
+since a refresh adopts whatever the machine holds (see "Machine stores" above),
+a newer desktop's push is read verbatim by an older one. Any future mechanism
+for this has to put the version *on the wire* alongside the policy, not only in
+a file on disk -- a local-only stamp cannot help a policy that arrives from
+another computer.
 
 ---
 
@@ -262,7 +454,7 @@ and embedders. Most callers only need the CLI above.
 
 ## Gateway HTTP extensions
 
-`mngr latchkey forward` drops three `.mjs` extensions into
+`mngr latchkey forward` drops three desktop-only `.mjs` extensions into
 `<latchkey-directory>/extensions/`. All expose plain HTTP endpoints
 on the gateway's listen port and authenticate the caller via two
 headers:
@@ -377,6 +569,74 @@ check (against the synthetic `latchkey-self.invalid` URL). Restricting
 which paths an agent can reach through the proxy is therefore a job
 for the agent's `latchkey_permissions.json`.
 
+### Remote desktop-gateway proxy extension
+
+Remote workspaces expose the VPS-resident gateway at the same
+`http://127.0.0.1:1989` URL local workspaces use. Third-party requests terminate
+there so the VPS can inject the credentials its own store holds. The VPS gateway
+loads one dedicated `desktop_gateway_proxy.mjs` extension for the endpoint
+families whose state remains on the user's computer: `/permissions`,
+`/permission-requests`, and `/minds-api-proxy` (including all subpaths). It
+forwards those requests to the desktop gateway over a desktop-to-VPS reverse
+tunnel, authenticating that hop with the desktop's own gateway password and a
+dedicated desktop-target permissions JWT -- both of which *replace* whatever the
+caller sent, since the caller's password authenticates it to the VPS gateway and
+its override would let it choose the policy the desktop evaluates it against.
+Native VPS requests carry no override and are authorized by the machine's own
+`~/.latchkey/permissions.json` (seeded at provisioning, then rewritten by the
+full permission snapshot the desktop pushes on every edit).
+
+Those two desktop-owned secrets are handed to the extension as *paths* into the
+machine's tmpfs secrets directory (`LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE`,
+`LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE`), and it reads
+both afresh on every request it proxies. Both belong to whichever of the user's
+computers is currently on the other end of the tunnel -- the password is that
+gateway's own, and the JWT is signed by that computer's encryption key and names
+a path on its disk -- so both change when the user moves to another computer,
+while the machine (and the workspace it serves) keeps running. Every
+provisioning pass overwrites the files, and the per-request read is what makes
+the new computer's values take effect without restarting the VPS gateway. It
+also means the machine's *own* listen password is a distinct secret that
+provisioning adopts rather than rewrites, so a new computer never locks the
+workspaces out of their own gateway (see [Machine stores](#machine-stores)).
+When neither file is there -- a rebooted machine awaiting its next provisioning
+pass -- the desktop-owned routes answer HTTP 503 saying so, while third-party
+calls, which need neither secret, keep working.
+
+One computer at a time is assumed. Two of the user's computers running at once
+contend for both the desktop-to-VPS tunnel (whose VPS port only one can bind)
+and these files (which the last provisioning pass wins), so the desktop-owned
+routes can end up presenting one computer's secrets to the other's gateway and
+failing with 401 until the computer holding the tunnel provisions again.
+
+The same extension serves `/via-desktop/<absolute-target-url>`, which asks for a
+*third-party* request to leave from the user's machine rather than from the VPS
+-- some destinations block datacenter IP ranges outright. That family is
+forwarded with its prefix swapped for `/gateway/`, so it lands on the desktop
+gateway's own outbound proxy and the desktop needs no extension of its own; the
+target is required to be an absolute `http(s)` URL and is sliced off the raw
+request URL, so it reaches the third party byte-identical to what the caller
+sent. Credentials are injected, and the permission check runs, on the desktop
+against the same host permissions file the proxy already targets, so this route
+reaches nothing a direct request could not. See [Desktop
+egress](#desktop-egress) for how a workspace asks for it.
+
+The workspace therefore always has one gateway URL and one agent-side skill.
+If the user's computer is offline, third-party calls through the VPS gateway
+continue to work, while desktop-owned extension routes fail with a clear HTTP
+502 response. Calls carrying an *expiring* credential -- an OAuth connection or
+Zoom -- keep working only until its access token runs out (typically an hour):
+the VPS gateway is launched with `LATCHKEY_DISABLE_CREDENTIALS_REFRESH=1`, so
+only the desktop renews those, and it does so from a periodic loop that stops
+with the machine. Static tokens are unaffected.
+
+Workspaces created *before* this one-gateway rollout still carry a
+permissions-override JWT in their host env file, naming a desktop-side opaque
+handle path that upstream latchkey resolves before dispatching anything
+(answering HTTP 400 when the named file is absent). Provisioning used to symlink
+that path at the VPS `permissions.json` on every reconcile; those symlinks live
+on the VPS and stay valid, so the shim itself is gone.
+
 ### `permissions` extension
 
 Reads and edits a detent permissions file at a caller-supplied path.
@@ -435,34 +695,72 @@ uv run python libs/mngr_latchkey/scripts/generate_services_json.py \
 Display names and the service ordering are editorial metadata detent does
 not carry; they live as curated constants in that script.
 
+Services hidden from agents (`core.HIDDEN_BUILTIN_SERVICES`, currently just
+`notion`) are left out of the catalog: latchkey never injects their
+credentials, so an entry for one would only offer grants that can never be
+used. The generator skips them, so the catalog and the gateway's
+`settings.hideBuiltinServices` cannot drift apart.
+
 `services.json` also carries minds' own *additional* (custom) services --
 ones detent has no schemas for, currently `claude.ai`. Their definitions are
 hand-maintained in `imbue/mngr_latchkey/additional_services.json` (a
-`display_name`, a `base_api_url`, the single Detent `scope` it exposes with
-an inline scope `schema`, and its grantable `permissions`, each with an
-inline `schema`), and the generator *folds their catalog entries into*
-`services.json`. That way every reader of the catalog -- `ServicesCatalog`
-and both gateway extensions -- works from one file in one shape and never
-has to know which of the two sources a service came from.
+`display_name`, a `registration`, the single Detent `scope` it exposes with an
+inline scope `schema`, and its grantable `permissions`, each with an inline
+`schema`), and the generator *folds their catalog entries into* `services.json`.
+That way every reader of the catalog -- `ServicesCatalog` and both gateway
+extensions -- works from one file in one shape and never has to know which of
+the two sources a service came from.
+
+`registration` is written in **latchkey's own shape**: it is the object that
+lands verbatim under `registeredServices.<name>` in latchkey's `config.json`,
+so a service is described here exactly as `latchkey services register` would
+persist it. Nothing on the Python side models or validates its contents --
+latchkey owns that schema and checks it when it loads the config -- so adding
+a service, or picking up a field a later latchkey adds, is a data-only change.
+
+For `claude-ai` that is a `baseApiUrl` plus a `loginUrl` and a `loginFlow`,
+which give it a `latchkey auth browser` sign-in (latchkey ships these generic
+flows so a service outside its builtin catalog can still be signed into).
+`claude-ai` uses `cookie-capture`, which finishes once the named cookies have
+been set and stores them as a `Cookie` header -- for claude.ai, the single
+`sessionKey` cookie, scoped by `cookieUrl` to claude.ai itself because sign-in
+may start on another host. A service registered with only a `baseApiUrl` can
+be authenticated by hand with `latchkey auth set` instead.
 
 Because a custom scope is not a detent builtin, its schemas have to reach the
-gateway's permission check. Rather than inlining them into every host file,
-`core.Latchkey.initialize()` materializes them **once** into a shared
-`minds_shared_schemas.json` (a schemas-only detent config, see
-`SHARED_SCHEMAS_FILENAME`), and every per-host permissions file references it
-via detent's `include` directive (added by the agent baseline and, for
-pre-existing files, a data-format migration). The include is a *bare relative*
-name so it resolves next to the referencing file on both the desktop (the
-opaque-handle directory) and a VPS (`~/.latchkey`, where `remote_gateway`
-ships the shared file alongside the permissions file). Granting a custom scope
-is then a plain rule write -- no per-host schema inlining.
+gateway's permission check. They are **inlined into every permissions file minds
+writes**: the agent baseline (`baseline_permissions.ADDITIONAL_SERVICE_SCHEMAS`)
+carries them, and `agent_setup.reconcile_baseline_permissions` refreshes them on
+files that already exist, so the bundled definition always wins over a stale
+copy. Granting a custom scope is then a plain rule write against a file that
+already defines the scope.
+
+Inlining rather than sharing one file via detent's `include` is deliberate.
+Detent resolves an `include` relative to the directory of the file that
+references it, and a host's permissions file is reachable through several
+directories -- its canonical `hosts/<host_id>/` path, the opaque handle in
+`permissions/` that a desktop workspace's JWT names, and
+`~/.latchkey/permissions.json` on a VPS. A shared file would have to be copied
+next to each of them, and an include that fails to resolve fails the *whole*
+permission check for that host, not just the rule that needed it. A
+self-contained file has nothing to resolve.
 
 `imbue.mngr_latchkey.additional_services` is the single Python chokepoint for
-the file. It exposes the registration list (each service is registered with the
-`latchkey` CLI at gateway bring-up), the merged schemas used to materialize the
-shared file, and the catalog projection the generator folds into
+the file. It exposes the registration entries, the merged detent schemas the
+baseline inlines, and the catalog projection the generator folds into
 `services.json`. No gateway extension reads it -- they only read
 `services.json`.
+
+The registration entries are minds' half of latchkey's own `config.json`:
+`core.merge_minds_latchkey_config` read-merges them into the file's
+`registeredServices` block (alongside `settings.hideBuiltinServices`) rather
+than shelling out to `latchkey services register`, which cannot update a
+registration that already exists. That merge runs for **every** gateway that
+serves minds agents -- the desktop one at `initialize()` and each gateway spawn,
+and a VPS one during remote provisioning. It has to: the registration is what
+lets a gateway resolve a request to a custom service at all, so a VPS holding
+the synchronized credentials but not the registration would silently never
+inject them.
 
 A typical end-to-end shell flow:
 
@@ -521,6 +819,7 @@ remains importable for embedders such as the minds desktop client.
 ```python
 from imbue.mngr_latchkey.core import Latchkey
 from imbue.mngr_latchkey.agent_setup import (
+    LatchkeyGatewayLocation,
     prepare_agent_latchkey,
     finalize_host_permissions,
 )
@@ -537,10 +836,15 @@ latchkey = Latchkey(
 latchkey.initialize()
 
 # (a) Pre-create env vars + opaque permissions handle for a new host.
-setup = prepare_agent_latchkey(latchkey, is_tunneled=True)
-# setup.env: LATCHKEY_GATEWAY[_SECONDARY,_PASSWORD,_PERMISSIONS_OVERRIDE,_DISABLE_COUNTING]
-#   LATCHKEY_GATEWAY_SECONDARY (tunneled mode only) is the agent's URL for the
-#   per-VPS gateway: http://127.0.0.1:<INNER_PORT>
+setup = prepare_agent_latchkey(
+    latchkey,
+    is_tunneled=True,
+    gateway_location=LatchkeyGatewayLocation.VPS,
+)
+# setup.env: LATCHKEY_GATEWAY[_PASSWORD,_DISABLE_COUNTING]
+# Desktop-gateway setups also include LATCHKEY_GATEWAY_PERMISSIONS_OVERRIDE.
+# LATCHKEY_GATEWAY is always http://127.0.0.1:1989 for tunneled workspaces.
+# Discovery realizes the desktop or VPS location selected before creation.
 # setup.opaque_permissions_path: pass to finalize_host_permissions later
 
 # ... mngr create returns the canonical host id ...
@@ -565,3 +869,39 @@ The `latchkey_directory` is used both as the upstream `LATCHKEY_DIRECTORY`
 for spawned `latchkey` subprocesses and as the root of this package's own
 metadata subdirectory (`<latchkey_directory>/mngr_latchkey/`, accessible
 via `Latchkey.plugin_data_dir`).
+
+### Storing user-supplied credentials
+
+Services with no browser sign-in report an example of the command that
+stores their credentials, each value the caller must supply written as an
+angle-bracketed placeholder (`LatchkeyServiceInfo.set_credentials_example`,
+e.g. `latchkey auth set-nocurl aws <access-key-id> <secret-access-key>`).
+`imbue.mngr_latchkey.credential_commands` turns such an example into a
+fillable form and back into a runnable command, so an embedder can collect
+the values in its own UI instead of sending the user to a terminal:
+
+```python
+from imbue.mngr_latchkey.credential_commands import (
+    build_credential_command_argv,
+    parse_credential_command_example,
+)
+
+# Raises CredentialCommandError when the example is not a latchkey command,
+# or has no placeholders (nothing to ask the user for).
+parsed = parse_credential_command_example(service_info.set_credentials_example)
+# parsed.parameters: one (name, label) pair per placeholder, to render as inputs
+
+argv = build_credential_command_argv(
+    parsed,
+    {"access-key-id": "...", "secret-access-key": "..."},
+    account,  # "" for latchkey's unnamed default account
+)
+is_success, detail = latchkey.auth_set_credentials("aws", argv)
+```
+
+The argv carries the user's secrets, so it is passed to the subprocess as a
+list (never a shell string) and is never logged. `--account` is a *global*
+latchkey option and is therefore placed before the subcommand rather than
+after the example's own arguments. `auth set` stores whatever it is handed,
+so callers should re-read `services_info` afterwards to find out whether
+the credentials are actually usable.

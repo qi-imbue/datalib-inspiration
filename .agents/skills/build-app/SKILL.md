@@ -2,18 +2,46 @@
 name: build-app
 description: "Use when you want to create a new app for the user -- a page, dashboard, or tool they can open as a tab. Runs an interactive flow: confirm the look and feel on a cheap throwaway mock first, then build the real app to a usable state, then harden it in the background. Covers scaffolding a new Flask app (canonical path) and the escape hatch for wrapping a pre-existing third-party server."
 metadata:
+  author: imbue
   crystallized: true
 ---
 
 # How to build an app
 
 An "app" here is something the user can click on as a tab in
-the desktop client and see render at `/service/<name>/`, proxied
-through the system_interface.
+the desktop client and see render at its own browser origin --
+locally `http://<name>.<workspace-host>/` (e.g.
+`http://news.host-ab12.localhost:8421/`). The forwarder routes that
+origin straight to the port you register; nothing proxies or rewrites
+your app's traffic.
 
 There is one canonical path (scaffold a new Flask lib) and one
 escape hatch (wrap a pre-existing third-party server). Modify/remove
 flows go through the `update-app` skill.
+
+## First: fire off the plan recorder
+
+Before anything else, run this once, briefing it the way you would brief a
+sub-agent picking this up: what the user wants, plus anything already settled.
+Give it context, not a plan -- working out the approach is its whole job, and a
+plan in the brief just anchors it to yours.
+
+```bash
+system/scripts/imbue_plan_extra/write_plan.sh build-app <<'IMBUE_PLAN_BRIEF'
+<your brief, as many lines as it needs>
+IMBUE_PLAN_BRIEF
+```
+
+Run it exactly as written: the script and its heredoc, nothing added -- no pipe,
+no `&&` or `;`, and no other redirect. Keep the `<<'IMBUE_PLAN_BRIEF'` quoted, so
+backticks and `$(...)` in the brief stay literal instead of running. A pipe to
+`head` or `tail` is blocked by a pre-tool hook, and anything appended hides the
+line it prints.
+
+It returns immediately and records a plan for offline analysis that nothing here
+reads back. It is not part of building the app: no `tk` step, no mention to the
+user, no waiting, no acting on the line it prints, ignore any failure. Then
+carry on as if you had not run it.
 
 ## This is the web specialization of the interactive-delivery shape
 
@@ -75,27 +103,38 @@ wait for approval.
   below.
 
 If you would otherwise scaffold a Flask lib whose only job is to
-shell out to a third-party tool, do not do that -- the system_interface
-already proxies `/service/<name>/...` to whatever URL you register.
+shell out to a third-party tool, do not do that -- the forwarder
+already routes the service's origin to whatever URL you register.
 Adding a Python proxy in front of the third-party server adds a hop,
 costs an extra process, and complicates WebSocket and streaming
 behavior. Use the escape hatch instead.
 
 Do not extend `system/apps/system_interface/` to add a new view. That app runs
 the top-level workspace UI; new apps go in their own scaffolded lib
-under `system/apps/<your-package>/` so they get an isolated tab and prefix.
+under `system/apps/<your-package>/` so they get an isolated tab and origin.
 
 ## Pre-flight (both paths)
 
-- **Pick a kebab-case app name.** Becomes the URL segment
-  `/service/<name>/`. Short and descriptive (`news`, `docs-viewer`)
-  beats clever. Avoid names already used in `system/supervisord.conf`
-  (`system_interface`, `browser`, etc. are reserved by the scaffolder).
+- **Pick a kebab-case app name.** Becomes the service's hostname
+  label: the tab renders at `http://<name>.<workspace-host>/`, so the
+  name must be DNS-safe -- lowercase letters/digits with single
+  hyphens, and it must not start with `host-` or `agent-` (those
+  prefixes are reserved for workspace hostname coordinates). Short and
+  descriptive (`news`, `docs-viewer`) beats clever. Avoid names
+  already used by an existing program (`system_interface`, `browser`, etc.
+  are reserved by the scaffolder, which also refuses a name any
+  `system/supervisord.conf.d/*.conf` already declares).
+- **Draw the app's icon** -- an `.svg` glyph specific to what *this*
+  app does, in the house style (see the CLI reference below);
+  `forward_port.py` refuses a brand-new registration without one. The
+  scaffold copies it beside the app's manifest (`app.toml`), which names
+  it.
 - **Pick a free port.** `ss -tln` lists what's bound. The scaffolder
   picks the lowest free port at or above 8080 by parsing
-  `system/supervisord.conf` and `data/.state/apps.toml`; if you're choosing
-  manually, avoid `8000` (system_interface) and `8081` (the browser
-  service).
+  `system/supervisord.conf`, every `system/supervisord.conf.d/*.conf`, and
+  `data/.state/apps.toml`; if you're choosing
+  manually, avoid `8000` (system_interface), `8010` (the chat app) and
+  `8081` (the browser service).
 - **Bind to `127.0.0.1`** (not `0.0.0.0`). The forwarder reaches your
   app from inside the same container; binding to all interfaces is
   noise. The scaffolder does this. For the wrap-existing path, many
@@ -110,72 +149,118 @@ under `system/apps/<your-package>/` so they get an isolated tab and prefix.
 uv run .agents/skills/build-app/scripts/scaffold_flask_lib.py \
     --name <service-name> \
     --description "<one-liner>" \
+    --icon-file <path-to-svg> \
+    [--display-name "<what users see>"] \
     [--port <int>] \
     [--extra-dep <pkg>] [--extra-dep <pkg>] ...
 ```
 
 Required:
-- `--name`: kebab-case (lowercase letters/digits with single hyphens).
+- `--name`: kebab-case (lowercase letters/digits with single hyphens;
+  must not start with `host-` or `agent-`) -- it becomes the service's
+  hostname label.
 - `--description`: becomes the lib `pyproject.toml` description.
+- `--icon-file`: the icon you drew in pre-flight (`.svg` only); copied
+  to `system/apps/<package>/icon.svg`, named by the manifest, and
+  registered on every start.
 
 Optional:
+- `--display-name`: what users see for the app (the manifest's
+  `display_name`, at most 64 characters). Defaults to the description,
+  so pass it when the description is long.
 - `--port`: explicit port; auto-picked if omitted.
 - `--extra-dep`: repeatable. Add libraries beyond `flask`/`flask-sock`
   (e.g. `--extra-dep "jinja2>=3.1" --extra-dep "anthropic>=0.40"`).
-- `--skip-uv-sync`: skip the final `uv sync --all-packages` (for fast
-  iteration / dry runs).
+- `--skip-uv-sync`: skip the final manifest check, tool install and
+  `uv sync --all-packages` (for fast iteration / dry runs).
 
 The scaffolder fails non-zero with a clear stderr message if the lib
 already exists, the name is reserved or invalid, the requested port
-is taken, or `uv sync` fails.
+is taken, or the manifest check, the tool install or `uv sync` fails.
 
 What gets generated:
 
+- `system/apps/<package>/app.toml` -- the app's manifest: its registered
+  `name`, `display_name`, `icon`, `instances = false` (one tab),
+  `priority = "user"` (shed before any built-in under memory pressure),
+  and `program` (its supervisord program). `forward_port.py --manifest`
+  reads it on every start; the scaffold checks it with `uv run app-manifest
+  validate-manifest system/apps/<package>/app.toml` (run that yourself after
+  editing it).
 - `system/apps/<package>/pyproject.toml` -- declares
-  `[project.scripts] <name> = "<package>.runner:main"`.
+  `[project.scripts] <name> = "<package>.runner:main"`, the entry point
+  the app's own tool environment exposes.
 - `system/apps/<package>/src/<package>/__init__.py` -- empty.
 - `system/apps/<package>/src/<package>/runner.py` -- sync Flask starter.
   Builds a `Flask` app and serves it with
-  `werkzeug.serving.run_simple(..., threaded=True)`. It serves at `/`;
-  the system_interface proxy handles the `/service/<name>/` prefixing,
-  so no `root_path`/`ROOT_PATH` is needed. It also defines a `DATA_DIR`
+  `werkzeug.serving.run_simple(..., threaded=True)`. It serves at `/`,
+  and the app owns its own browser origin, so no path prefix or
+  `root_path`/`ROOT_PATH` is needed. It also defines a `DATA_DIR`
   constant (defaults to `data/.apps/<name>/`, overridable via the
   `<PACKAGE_UPPER>_DATA_DIR` env var) -- route all persistent state
   through it (see File-path conventions below) -- and a `PORT` constant
   (defaults to this service's assigned port, overridable via the
   `<PACKAGE_UPPER>_PORT` env var) bound in `run_simple`. Both overrides
   are what let a future edit boot a throwaway instance on a spare port
-  against a data copy (see `update-app`).
+  against a data copy (see `update-app`). The scaffolded index page also
+  carries the **location beacon** one-liner -- a script that posts
+  `{type: "shell:location", path: location.pathname + location.search}`
+  to `window.parent` on page load. Keep that line on every page the app
+  serves: it is what lets the workspace shell reopen the app's tab at
+  the place it was showing (the shell validates the sender's origin and
+  relays the path to the app's own instances API, which stores it on the
+  instance's record). An app that drops it simply always reopens at its
+  origin.
 - `system/apps/<package>/test_<package>_ratchets.py` -- standard ratchets at
   zero.
 - `system/apps/<package>/README.md` -- one-line description.
 
-What gets updated:
+What gets updated and installed -- no shared file is authored, which is what
+lets two agents scaffold two apps at once (`uv.lock` is the exception: `uv sync`
+regenerates it, but it is derived, so it stays out of a creation's footprint):
 
-- Root `pyproject.toml` -- adds `<service-name>` to
-  `[project].dependencies` and `<service-name> = { workspace = true }` to
-  `[tool.uv.sources]` (the `system/apps/*` member glob picks the package up
-  without a members edit).
-- `system/supervisord.conf` -- appends a program block:
+- Root `pyproject.toml` -- untouched. The `system/apps/*` member glob picks the
+  package up and `uv sync --all-packages` installs it, so a scaffolded app
+  needs no root entry at all.
+- `system/supervisord.conf.d/<name>.conf` -- writes the app's own program block:
 
   ```ini
   [program:<name>]
-  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --url http://localhost:<port> --name <name> && uv run <name>"
+  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --manifest system/apps/<package>/app.toml --url http://localhost:<port> && <name>"
   directory=/home/user/workspace
   autostart=true
   autorestart=true
   # plus rotated stdout/stderr logfiles under /var/log/supervisor/<name>-*.log
   ```
 
-  The Flask app serves at `/` and needs no prefix env var: the
-  system_interface proxy handles `/service/<name>/` prefixing (it
-  rewrites absolute paths in served HTML and installs a scoped service
-  worker that prepends the prefix to the page's own fetches). The
+  The command ends in the app's own name, not `uv run <name>`; supervisord
+  resolves that name on PATH. The copy it finds is the console script
+  `uv sync --all-packages` writes into the workspace venv -- `uv tool install
+  -e` puts the tool's own entry point under your HOME, which supervisord's
+  children do not have on PATH. So always sync with `--all-packages`: a
+  root-closure-scoped `uv sync` prunes the member (a scaffolded app is not a
+  root dependency), deletes that script, and the next restart is a spawn error
+  with nothing to recover it.
+
+  The Flask app serves at `/` and needs no prefix env var: your app
+  owns its origin, so root-absolute URLs (`href="/api"`), WebSockets
+  (`new WebSocket("/ws")`), cookies (`Set-Cookie: Path=/`), and
+  service workers all work exactly as written -- nothing rewrites
+  anything. The
   `bash -c "..."` wrapper is required because supervisord runs commands
   directly (no shell) and this one chains `forward_port.py` with `&&`. The
   `oom_tag_service.py user` prefix tags this user-created app so it is
   shed before any built-in service under memory pressure (see
   `system/services/oom_priority/README.md`).
+- The app's own uv tool environment: the scaffold runs
+  `uv tool install -e system/apps/<package>`, which is what puts the
+  `<name>` entry point the program line runs on PATH. Every Python app
+  runs from its own tool rather than the root venv (the root venv is for
+  background services, agents, skills, and scripts), so a dependency you
+  add later needs `uv tool install -e system/apps/<package> --reinstall`
+  (see `update-app`). The root `pyproject.toml` is not edited: the
+  `system/apps/*` member glob already covers the package, and the final
+  `uv sync --all-packages` keeps the root lockfile current for it.
 
 supervisord does not watch the config, so tell it to pick up the new
 program, then confirm it is running:
@@ -206,7 +291,7 @@ This is skeleton phase 5 (the cheap throwaway mock). Keep it disposable:
   render *that real data* in the mock so the user judges the UI against real
   content. Otherwise use representative placeholder data that covers the shapes
   the real view will show (including an empty state and a busy/overflow state).
-- `layout.py open` to surface it (see Step 4 for the per-layout command), then loop:
+- `layout.py open` to surface it (see Step 4 for the command and its `--view` flag), then loop:
   present -> take feedback -> update the mock so the change is *visible* ->
   re-present. Do not accept feedback and move on having only asserted you'll apply
   it.
@@ -313,12 +398,12 @@ Two cases, two patterns:
 ## Step 3: Verify
 
 Both paths use the same verification recipe. See
-[references/verify.md](references/verify.md) -- curl against
-`http://127.0.0.1:8000/service/<name>/` then a Playwright assertion
-on a unique-to-your-app marker.
+[references/verify.md](references/verify.md) -- curl against the
+registered backend URL `http://127.0.0.1:<port>/` then a Playwright
+assertion on a unique-to-your-app marker.
 
-If verification surfaces something unexpected (502, "duplicated
-dockview tab bar", redirect loop, broken WebSockets), see
+If verification surfaces something unexpected (connection refused,
+a tab stuck on the loading page, broken WebSockets), see
 [references/cross-flow-gotchas.md](references/cross-flow-gotchas.md)
 -- it's symptom-indexed.
 
@@ -330,17 +415,19 @@ new tab. Without this step the user would have to discover it via the
 (pure JSON APIs, webhook receivers, etc.).
 
 ```bash
-for L in desktop mobile; do python3 system/scripts/layout.py open --layout "$L" <name>; done
+python3 system/scripts/layout.py open <name>
 ```
 
-Mutating `layout.py` ops require `--layout` (the named layouts are
-`desktop` and `mobile`) and only apply on connected clients that have
-that layout active, so the loop tries both: the call for the layout
-the user is on succeeds, and the other fails fast and harmlessly.
-`layout.py` POSTs to a loopback-only workspace_server endpoint that
-broadcasts a `layout_op` message over its WebSocket. The frontend
-focuses the panel if a tab for `<name>` is already open, otherwise
-splits a new iframe alongside the primary chat (60% web / 40% chat).
+With no `--view`, the op edits the view the target client is looking
+at, which is where the user expects the new tab. (Pass `--view <name>`
+-- a project's name, or `Everything` -- to surface it in a different
+view instead; the op edits that view's arrangement and switches the
+client to it.)
+`layout.py` POSTs to a loopback-only shell endpoint that applies the op
+to that client's saved layout (no browser needs to be connected) and
+broadcasts `layout_updated`, so every window of the client docks the
+new tab beside the requesting chat, or brings the tab for `<name>` to
+the front when it is already open.
 The script briefly waits for the service to appear in
 `data/.state/apps.toml` so it's safe to run immediately after the
 `forward_port.py` call.
@@ -358,15 +445,14 @@ For anything beyond `open` / `refresh` -- splitting, moving, focusing,
 renaming, maximizing, replacing an iframe's URL, inspecting the live
 tree -- see the `manage-layout` skill. `layout.py list` is also useful
 when the user is asking about what tabs are available (it prints every
-user-facing registered service plus every mngr-level agent, with
-open/running flags; the workspace chrome's own `system_interface` entry
-is hidden).
+app with its instances: address, title, status, and which clients have
+each docked).
 
 ## Step 5: Finalize in the background (after the user confirms the working site)
 
 The foreground work stops at a usable, surfaced site. The thorough pass --
-extending Playwright coverage, the full test suite and ratchets, `/autofix`, and
-the code-guardian gates -- runs in a **background harden worker**, never in the
+extending Playwright coverage, the full test suite and ratchets, review gates
+ -- runs in a **background harden worker**, never in the
 main agent. This is skeleton phase 7: the harden pass
 (`.agents/shared/worker/references/harden-creation.md`), here the **crystallize**
 operation with the **app** type -- the scaffolded app is already on
@@ -410,18 +496,31 @@ calling the work done.
 
 ## Escape hatch: wrap an existing server
 
-For pre-existing third-party tools, do not scaffold a lib. Add a
-`[program:<name>]` block to `system/supervisord.conf` that runs
-`forward_port.py` and then your existing start command. supervisord runs
-commands directly (no shell), so wrap any command that chains with `&&`
-in `bash -c "..."`, and prefix the whole thing with
+For pre-existing third-party tools, do not scaffold a lib. Save your
+icon as `system/apps/<name>/icon.svg` and write the app's manifest beside
+it as `system/apps/<name>/app.toml` (like the `files` app):
+
+```toml
+name = "<name>"
+display_name = "<What users see>"
+icon = "icon.svg"
+instances = false
+priority = "user"
+program = "<name>"
+```
+
+Then add a `[program:<name>]` block as its own
+`system/supervisord.conf.d/<name>.conf` that runs `forward_port.py --manifest`
+and then your existing start command. supervisord runs commands directly (no
+shell), so wrap any command that chains with `&&` in `bash -c "..."`, and
+prefix the whole thing with
 `python3 system/services/oom_priority/bin/oom_tag_service.py user` so this user-created app is
 shed before any built-in service under memory pressure (see
 `system/services/oom_priority/README.md`):
 
 ```ini
 [program:<name>]
-command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --url http://localhost:<port> --name <name> && <existing_start_command>"
+command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --manifest system/apps/<name>/app.toml --url http://localhost:<port> && <existing_start_command>"
 directory=/home/user/workspace
 autostart=true
 autorestart=true
@@ -433,7 +532,7 @@ Two valid shapes:
 
   ```ini
   [program:docs-viewer]
-  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --url http://localhost:8090 --name docs-viewer && jupyter notebook --port 8090 --ip 127.0.0.1 --no-browser"
+  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --manifest system/apps/docs-viewer/app.toml --url http://localhost:8090 && jupyter notebook --port 8090 --ip 127.0.0.1 --no-browser"
   directory=/home/user/workspace
   autostart=true
   autorestart=true
@@ -445,7 +544,7 @@ Two valid shapes:
   # system/scripts/run_<name>.sh
   #!/usr/bin/env bash
   set -euo pipefail
-  python3 system/scripts/forward_port.py --url http://localhost:<port> --name <name>
+  python3 system/scripts/forward_port.py --manifest system/apps/<name>/app.toml --url http://localhost:<port>
   exec <existing_start_command>
   ```
 
@@ -457,8 +556,8 @@ Two valid shapes:
   autorestart=true
   ```
 
-After editing `system/supervisord.conf`, run `supervisorctl reread &&
-supervisorctl update` to start the new program.
+After writing `system/supervisord.conf.d/<name>.conf`, run `supervisorctl
+reread && supervisorctl update` to start the new program.
 
 The `forward_port.py` call MUST come first in the command -- the port
 must be registered before the app starts listening, otherwise the
@@ -475,24 +574,81 @@ Used by both paths (the scaffolder generates the call; the escape
 hatch has you write it directly).
 
 ```
-python3 system/scripts/forward_port.py --name NAME --url URL
+python3 system/scripts/forward_port.py --manifest system/apps/<package>/app.toml --url URL
+python3 system/scripts/forward_port.py --name NAME --url URL --icon-file PATH
 python3 system/scripts/forward_port.py --name NAME --remove
 ```
 
+The script is standard-library only and runs under a plain `python3`, so
+registration never depends on the root venv.
+
 Flags:
 
-- `--name`: app name (must match the URL segment a user
-  clicks: `/service/<name>/`).
+- `--manifest`: the app's `app.toml`. Its `name` (validated like
+  `--name` below), the icon file it names (validated like `--icon-file`),
+  and its static fields (`display_name`, `instances`, `instances_url`,
+  `critical`, `priority`, `program`, `internal`, `default_shortcut`,
+  `actions`) are copied onto the registry row on every call, so a changed
+  manifest updates the row on the next start. This is the form every app
+  with a directory uses. `--name` may accompany it and must then equal the
+  manifest's name; `--icon-file`, `--program`, `--internal` and `--no-icon`
+  are for registrations with no app directory (previews, isolated test
+  servers) and cannot be combined with it.
+- `--name`: app name. It becomes the service's hostname label (the
+  tab renders at `http://<name>.<workspace-host>/`), so it is
+  validated: lowercase letters/digits/underscores with single hyphens,
+  and it must not be `localhost` or start with `host-` or `agent-`
+  (reserved for workspace hostname coordinates). Registration fails
+  loudly on an invalid name.
 - `--url`: full URL where the app is reachable from inside the
   container (e.g. `http://localhost:8090`).
+- `--icon-file`: path to the app's `.svg` icon (SVG only -- no
+  rasters), drawn instead of the generic letter monogram. **Required
+  when creating a new entry** (unless `--internal` or `--no-icon`);
+  omitting it on re-registration keeps the stored icon. The file's
+  *contents* are stored: a single safe `<svg>` element (no script,
+  style, event handlers, or external references; at most 16384
+  characters). A bad file fails a new registration loudly, but only
+  warns on re-registration (the stored icon is kept), so a corrupted
+  icon cannot crash-loop a running app.
+
+  **Draw the icon in the workspace's house style**: monochrome line
+  art on a transparent background, exactly like the built-in glyphs.
+  The frame to author in is
+
+  ```svg
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="..."/>
+  </svg>
+  ```
+
+  -- strokes only, no `fill` on the shapes, no hardcoded colors.
+  `currentColor` is what lets the workspace ink the glyph to match the
+  text beside it, and a transparent background is what keeps it from
+  reading as a sticker in a row of line icons. Only use color if the
+  user explicitly asks for a colored icon.
+- `--no-icon`: skip the icon requirement for a brand-new entry. Uses
+  the generic letter monogram. Use this only when the user explicitly
+  declines an icon, or for short-lived preview tabs.
+- `--program`: name of the supervisord program that runs the app --
+  the program-name-equals-service-name convention both paths follow, so
+  pass the app's own name. Its presence on the registry entry is what
+  lets the workspace offer Stop/Start for the app (supervisord RPC);
+  omitting it clears any previously-stored value, so every registration
+  call is authoritative. Never pass it for unsupervised instances
+  (previews, `serve_isolated_instance.py` test servers) -- those own
+  their own teardown and must not offer a Stop that supervisord cannot
+  honor.
 - `--remove`: remove the named entry from
   `data/.state/apps.toml`. Use this when tearing down a service.
 
-## The global (Cloudflare) URL
+## The shared (public) URL
 
-If the workspace has Cloudflare tunneling configured, the service is also
-reachable at a public URL -- with caveats about where that hostname lives and
-why it isn't in `data/.state/apps.toml`. See
+If the workspace is shared, every registered service is also reachable at
+its own public origin -- the same prefix rule on the share hostname
+(`https://<name>.<workspace-share-host>/`) -- with caveats about where that
+hostname lives and why it isn't in `data/.state/apps.toml`. See
 [references/public-url.md](references/public-url.md).
 
 ## Cleanup

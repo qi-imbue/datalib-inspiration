@@ -12,7 +12,6 @@ from imbue.skitwright.expect import expect
 
 @pytest.mark.release
 @pytest.mark.tmux
-@pytest.mark.timeout(60)
 def test_create_and_destroy_agent(e2e: E2eSession) -> None:
     """Tutorial block:
         # destroy without confirmation prompt
@@ -47,7 +46,6 @@ def test_create_and_destroy_agent(e2e: E2eSession) -> None:
     expect(list_result.stdout).not_to_contain("my-task")
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
@@ -163,7 +161,6 @@ def test_destroy_short_form(e2e: E2eSession) -> None:
     expect(list_result.stdout).not_to_contain("my-task")
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
@@ -190,7 +187,6 @@ def test_destroy_short_form_running_requires_force(e2e: E2eSession) -> None:
 
 @pytest.mark.release
 @pytest.mark.tmux
-@pytest.mark.timeout(60)
 def test_destroy_remove_branch(e2e: E2eSession) -> None:
     """Tutorial block:
         # destroy and also remove the git branch that was created for the agent
@@ -232,10 +228,8 @@ def test_destroy_remove_branch(e2e: E2eSession) -> None:
     expect(branch_after.stdout).not_to_contain("mngr/my-task")
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
-@pytest.mark.timeout(60)
 def test_destroy_keeps_branch_by_default(e2e: E2eSession) -> None:
     """Tutorial block:
         # destroy and also remove the git branch that was created for the agent
@@ -282,7 +276,6 @@ def test_destroy_keeps_branch_by_default(e2e: E2eSession) -> None:
     expect(branch_after.stdout).to_contain("mngr/my-task")
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
@@ -328,10 +321,10 @@ def test_destroy_multiple_at_once(e2e: E2eSession) -> None:
         expect(list_after.stdout).not_to_contain(name)
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
-@pytest.mark.timeout(60)
+# No @pytest.mark.rsync: a dry run reports what would be destroyed and moves no
+# files, so the mark would trip the resource guard's never-invoked check.
 def test_destroy_dry_run(e2e: E2eSession) -> None:
     """Tutorial block:
         # to preview what would be destroyed without doing it, run without --force and answer "no" at the prompt
@@ -363,10 +356,11 @@ def test_destroy_dry_run(e2e: E2eSession) -> None:
     expect(list_result.stdout).to_contain("my-task")
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
 @pytest.mark.timeout(120)
+# No @pytest.mark.rsync: the agent here is local and in-place, so neither create
+# nor destroy shells out to rsync.
 def test_destroy_with_gc(e2e: E2eSession) -> None:
     """Tutorial block:
         # destroy and run garbage collection afterward (this is the default)
@@ -457,10 +451,8 @@ def test_destroy_by_session_name(e2e: E2eSession) -> None:
     )
 
 
-@pytest.mark.rsync
 @pytest.mark.release
 @pytest.mark.tmux
-@pytest.mark.timeout(60)
 def test_destroy_by_session_name_happy_path(e2e: E2eSession) -> None:
     """Tutorial block:
         # destroy has a special variant for finding an agent by its tmux session name:

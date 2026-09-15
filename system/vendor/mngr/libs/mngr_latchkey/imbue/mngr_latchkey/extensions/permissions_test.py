@@ -233,6 +233,19 @@ def test_available_for_unknown_service_returns_404(node_extension: str) -> None:
     assert status == 404
 
 
+def test_available_accepts_a_custom_service_name(node_extension: str) -> None:
+    """A ``custom_``-prefixed name is a legal service name, not a malformed one.
+
+    Custom services are exactly the ones an agent cannot know the scopes of in
+    advance, so this endpoint has to be able to describe them. 404 (no such
+    service in this catalog) rather than 400 (that is not a service name) is
+    what proves the underscore is accepted.
+    """
+    status, _ = _get_json(f"{node_extension}/permissions/available/custom_api_example_com")
+
+    assert status == 404
+
+
 def _post_json(url: str, body: object) -> tuple[int, object]:
     data = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
@@ -261,13 +274,13 @@ def test_available_includes_additional_claude_ai_service(node_extension: str) ->
 
 
 def test_post_rule_for_additional_service_writes_rule_only(tmp_path: Path) -> None:
-    """Granting a custom-service scope writes only the rule; its schema comes from the include.
+    """Granting a custom-service scope writes only the rule; its schema is already in the file.
 
-    A custom (additional) service's scope schema lives in the shared
-    ``minds_shared_schemas.json`` file that every host permissions file
-    references via detent's ``include``, so the write path no longer inlines
-    schemas into the host file -- the grant is a plain rule, exactly like a
-    builtin scope.
+    Every permissions file minds writes carries the additional (custom)
+    services' scope schemas inline from the agent baseline, so the write path
+    does not inline anything of its own -- the grant is a plain rule, exactly
+    like a builtin scope. (This target file is written from scratch by the
+    extension, so it has no schemas at all.)
     """
     target = tmp_path / "hosts" / "host-deadbeefdeadbeefdeadbeefdeadbeef" / "latchkey_permissions.json"
     env = {"PATH": "/usr/bin:/bin", "LATCHKEY_EXTENSION_PERMISSIONS_ROOT": str(tmp_path)}

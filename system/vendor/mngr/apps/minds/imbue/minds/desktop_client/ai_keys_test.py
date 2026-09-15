@@ -8,7 +8,7 @@ from flask.testing import FlaskClient
 from pydantic import Field
 
 from imbue.imbue_common.model_update import to_update
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client.ai_keys import AiKeyMintError
 from imbue.minds.desktop_client.ai_keys import build_credential_blob
 from imbue.minds.desktop_client.ai_keys import mint_workspace_credential_blob
@@ -26,6 +26,7 @@ from imbue.minds.desktop_client.imbue_cloud_cli import ImbueCloudCliError
 from imbue.minds.desktop_client.imbue_cloud_cli import LiteLLMKeyMaterial
 from imbue.minds.desktop_client.session_store import MultiAccountSessionStore
 from imbue.minds.desktop_client.sync_scheduler import WorkspaceSyncScheduler
+from imbue.minds.desktop_client.testing import device_id_for_test
 from imbue.minds.desktop_client.workspace_record_store import RECORD_STATE_ACTIVE
 from imbue.minds.desktop_client.workspace_record_store import ReplicaRecord
 from imbue.minds.desktop_client.workspace_record_store import WorkspaceRecordStore
@@ -43,9 +44,9 @@ class _FixedEmailSessionStore(MultiAccountSessionStore):
 def _make_record_store(tmp_path: Path) -> WorkspaceRecordStore:
     # cli=None keeps every mutation local (no push subprocess).
     return WorkspaceRecordStore(
-        paths=WorkspacePaths(data_dir=tmp_path),
+        paths=InstallationPaths(data_dir=tmp_path),
         cli=None,
-        device_id="device-test",
+        device_id=device_id_for_test("ai-keys"),
         device_label="test-device",
     )
 
@@ -118,16 +119,16 @@ def test_mint_workspace_credential_blob_fixes_workspace_identity_on_the_key(tmp_
     cli = RecordingImbueCloudCli(connector_url=FAKE_CONNECTOR_URL)
 
     blob = mint_workspace_credential_blob(
-        workspace_host_id="host-abc", account_email="alice@example.com", imbue_cloud_cli=cli
+        workspace_id="agent-abc", account_email="alice@example.com", imbue_cloud_cli=cli
     )
 
     assert len(cli.create_calls) == 1
     call = cli.create_calls[0]
     assert call["account"] == "alice@example.com"
-    assert call["alias"] == "workspace-host-abc"
+    assert call["alias"] == "workspace-agent-abc"
     assert call["max_budget"] == 100.0
     assert call["budget_duration"] == "1d"
-    assert call["metadata"] == {"workspace_host_id": "host-abc", "source": "ai-keys-page"}
+    assert call["metadata"] == {"workspace_id": "agent-abc", "source": "ai-keys-page"}
     assert "ANTHROPIC_API_KEY=sk-fake-litellm-key" in blob
     assert "ANTHROPIC_BASE_URL=https://litellm.example.com/" in blob
 
@@ -140,9 +141,7 @@ def test_mint_requests_single_invocation_rotation(tmp_path: Path) -> None:
     # quadrupled the wall time under load).
     cli = RecordingImbueCloudCli(connector_url=FAKE_CONNECTOR_URL)
 
-    mint_workspace_credential_blob(
-        workspace_host_id="host-abc", account_email="alice@example.com", imbue_cloud_cli=cli
-    )
+    mint_workspace_credential_blob(workspace_id="agent-abc", account_email="alice@example.com", imbue_cloud_cli=cli)
 
     assert len(cli.create_calls) == 1
     assert cli.create_calls[0]["is_rotate_on_exists"] is True
@@ -153,7 +152,7 @@ def test_mint_wraps_cli_failures_in_aikeyminterror(tmp_path: Path) -> None:
 
     with pytest.raises(AiKeyMintError, match="Failed to create the key"):
         mint_workspace_credential_blob(
-            workspace_host_id="host-abc", account_email="alice@example.com", imbue_cloud_cli=cli
+            workspace_id="agent-abc", account_email="alice@example.com", imbue_cloud_cli=cli
         )
 
 
@@ -224,42 +223,14 @@ def _build_associated_workspace_client(tmp_path: Path, imbue_cloud_cli: ImbueClo
     )
 
 
-def test_ai_keys_routes_require_authentication(tmp_path: Path) -> None:
+def test_mint_without_a_session_returns_403(tmp_path: Path) -> None:
+    """The legacy mint route rejects unauthenticated requests before reading the body."""
     client = _build_ai_keys_client(tmp_path, is_authenticated=False)
 
-    assert client.get("/settings/ai-keys?workspace=host-abc").status_code == 403
-    assert client.post("/settings/ai-keys/mint", json={"workspace": "host-abc"}).status_code == 403
+    response = client.post("/settings/ai-keys/mint", json={"workspace": "host-abc"})
 
-
-def test_ai_keys_page_without_workspace_explains_how_to_get_there(tmp_path: Path) -> None:
-    client = _build_ai_keys_client(tmp_path)
-
-    response = client.get("/settings/ai-keys")
-
-    assert response.status_code == 200
-    assert "opened from a machine" in response.text
-    assert 'id="mint-key"' not in response.text
-
-
-def test_ai_keys_page_errors_for_unassociated_workspace(tmp_path: Path) -> None:
-    client = _build_ai_keys_client(tmp_path)
-
-    response = client.get("/settings/ai-keys?workspace=host-unknown")
-
-    assert response.status_code == 200
-    assert "no associated Imbue account" in response.text
-    assert 'id="mint-key"' not in response.text
-
-
-def test_ai_keys_page_shows_workspace_and_billed_account(tmp_path: Path) -> None:
-    client = _build_associated_workspace_client(tmp_path, RecordingImbueCloudCli(connector_url=FAKE_CONNECTOR_URL))
-
-    response = client.get("/settings/ai-keys?workspace=host-abc")
-
-    assert response.status_code == 200
-    assert "my-ws" in response.text
-    assert "alice@example.com" in response.text
-    assert 'id="mint-key"' in response.text
+    assert response.status_code == 403
+    assert response.get_json()["error"] == "Not authenticated"
 
 
 def test_mint_requires_workspace_field(tmp_path: Path) -> None:
@@ -299,7 +270,7 @@ def test_mint_returns_credential_blob_for_associated_workspace(tmp_path: Path) -
     assert "ANTHROPIC_API_KEY=sk-fake-litellm-key" in credentials
     assert "ANTHROPIC_BASE_URL=https://litellm.example.com/" in credentials
     assert len(cli.create_calls) == 1
-    assert cli.create_calls[0]["alias"] == "workspace-host-abc"
+    assert cli.create_calls[0]["alias"] == "workspace-agent-1"
 
 
 def test_mint_maps_cli_failure_to_502(tmp_path: Path) -> None:

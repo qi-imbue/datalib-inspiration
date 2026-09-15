@@ -3,6 +3,7 @@
 import importlib.resources
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ import pytest
 import imbue.mngr.resources as mngr_resources
 from imbue.mngr.providers.ssh_host_setup import RequiredHostPackage
 from imbue.mngr.providers.ssh_host_setup import SSHD_PROVISIONED_MARKER_PATH
+from imbue.mngr.providers.ssh_host_setup import SSHD_START_OPTIONS
 from imbue.mngr.providers.ssh_host_setup import WARNING_PREFIX
 from imbue.mngr.providers.ssh_host_setup import _build_package_check_snippet
 from imbue.mngr.providers.ssh_host_setup import build_add_authorized_keys_command
@@ -502,7 +504,7 @@ def test_self_healing_entrypoint_skips_sshd_without_provisioned_marker(tmp_path:
     probe = (
         prefix.replace(SSHD_PROVISIONED_MARKER_PATH, str(marker_path))
         .replace("mkdir -p /run/sshd; ", "")
-        .replace("/usr/sbin/sshd -o MaxSessions=100", f"touch {sshd_started}")
+        .replace(f"/usr/sbin/sshd {SSHD_START_OPTIONS}", f"touch {sshd_started}")
     )
     # No marker present -> sshd branch is skipped (the `[ -f ] && {{...}}` is a no-op).
     subprocess.run(["sh", "-c", probe], check=False)
@@ -532,6 +534,20 @@ def test_configure_ssh_command_writes_provisioned_marker() -> None:
     assert not SSHD_PROVISIONED_MARKER_PATH.rsplit("/", 1)[-1].startswith("ssh_host_")
 
 
+def test_sshd_start_options_refuse_password_and_keyboard_interactive_authentication() -> None:
+    """Every mngr-launched sshd authenticates by key or certificate only.
+
+    Debian's stock sshd_config leaves both password and keyboard-interactive
+    authentication on, so the launch flags must switch them off explicitly.
+    """
+    options = shlex.split(SSHD_START_OPTIONS)
+    assert "PasswordAuthentication=no" in options
+    assert "KbdInteractiveAuthentication=no" in options
+    assert options[::2] == ["-o"] * (len(options) // 2)
+    assert build_start_sshd_command().endswith(f"/usr/sbin/sshd -D {SSHD_START_OPTIONS} )")
+    assert f"/usr/sbin/sshd {SSHD_START_OPTIONS}" in build_self_healing_host_entrypoint_command()
+
+
 def test_start_sshd_command_is_guarded_and_valid_shell() -> None:
     """The explicit sshd start must be valid shell and guarded against a running sshd."""
     cmd = build_start_sshd_command()
@@ -551,7 +567,7 @@ def test_start_sshd_command_is_a_noop_when_sshd_is_already_running(tmp_path: Pat
     cmd = (
         build_start_sshd_command()
         .replace("mkdir -p /run/sshd && ", "")
-        .replace("/usr/sbin/sshd -D -o MaxSessions=100", f"touch {marker}")
+        .replace(f"/usr/sbin/sshd -D {SSHD_START_OPTIONS}", f"touch {marker}")
     )
     # Force the not-running check to report "already running" (false): start is skipped.
     running_cmd = cmd.replace("! grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1", "false")

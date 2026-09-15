@@ -64,10 +64,12 @@ class ApiValidationErrorResponse(FrozenModel):
 
 
 class OperationHandleResponse(FrozenModel):
-    """A handle for a long-running create/destroy/restart operation, to poll."""
+    """A handle for a long-running create/destroy/recovery operation, to poll."""
 
     operation_id: str = Field(description="Poll at /api/v1/workspaces/operations/<kind>/<operation_id>")
-    kind: str = Field(description="Operation kind: create, destroy, or restart")
+    kind: str = Field(
+        description="Operation kind: create, destroy, or restart (the host recovery, whichever kind it runs)"
+    )
 
 
 class CreateOperationStatusResponse(FrozenModel):
@@ -110,13 +112,24 @@ class CreateAttemptDiscardStatusResponse(FrozenModel):
 
 
 class RestartOperationStatusResponse(FrozenModel):
-    """Status of a restart operation (polled at /operations/restart/<id>)."""
+    """Status of a host-recovery operation (polled at /operations/restart/<id>).
 
-    operation_id: str = Field(description="The workspace agent id being restarted")
+    Named for the route, which agents inside workspaces call. The operation it
+    reports on covers both recoveries: a ``start_only`` start, and a restart.
+    """
+
+    operation_id: str = Field(description="The workspace agent id being recovered")
     kind: str = Field(description="Always 'restart'")
-    status: str = Field(description="Raw restart status")
-    is_done: bool = Field(description="Whether the restart has finished")
-    error: str | None = Field(default=None, description="Failure message, when the restart failed")
+    status: str = Field(description="Raw operation status")
+    is_done: bool = Field(description="Whether the operation finished successfully (status DONE)")
+    error: str | None = Field(default=None, description="Failure message, when the operation failed")
+    warning: str | None = Field(
+        default=None,
+        description=(
+            "A DONE operation's non-fatal caveat, or the reason a DECLINED one was refused before it mutated "
+            "anything (an operator holds the machine); None otherwise"
+        ),
+    )
 
 
 class BackupOperationStatusResponse(FrozenModel):
@@ -279,6 +292,14 @@ class CreateWorkspaceRequest(ApiRequestModel):
         default=None, description="Restic backup provider (default CONFIGURE_LATER)"
     )
     backup_api_key_env: str | None = Field(default=None, description="KEY=VALUE block for an API_KEY backup provider")
+    enable_web_access: bool | None = Field(
+        default=None,
+        description=(
+            "Bring sharing up post-create so the workspace is reachable from the hosted web "
+            "client (default off). Requires an account: every row -- imbue_cloud and local "
+            "docker/lima alike -- runs the desktop share flow with the owner granted."
+        ),
+    )
 
 
 class PatchWorkspaceRequest(ApiRequestModel):
@@ -295,32 +316,55 @@ class PatchWorkspaceRequest(ApiRequestModel):
 
 
 class RestartWorkspaceRequest(ApiRequestModel):
-    """Body for restarting a workspace's host."""
+    """Body for recovering a workspace's host.
+
+    Named for the route. Without ``start_only`` this really does restart the
+    host (stop, then start); with it, only the start runs.
+    """
 
     # ``scope`` is structurally a required string; the route validates that its
     # value is 'host' (a value-semantic check kept in the handler, since the
     # lowercase wire value can't be a standard UpperCaseStrEnum). The former
     # 'services' scope (in-place system-services restart) was removed; it is
     # rejected with a 400.
-    scope: str = Field(description="Must be 'host' (bounce the whole host); no other scope is supported")
+    scope: str = Field(description="Must be 'host' (act on the whole host); no other scope is supported")
     start_only: bool | None = Field(
         default=None,
         description=(
             "Skip the stop step and run only the idempotent ``mngr start`` -- safe to dispatch "
-            "with no knowledge of the host's state (a live host makes it a no-op)"
+            "with no knowledge of the host's state (a live host makes it a no-op). Omitted or "
+            "false restarts the host instead, which is the only recovery that stops it"
         ),
     )
 
 
-class EnableSharingRequest(ApiRequestModel):
-    """Body for enabling/updating Cloudflare sharing of a workspace service."""
+class SharingGrantList(FrozenModel):
+    """One sharing scope's allow-list: exact emails plus whole email domains."""
 
-    emails: tuple[str, ...] = Field(
-        min_length=1,
-        description=(
-            "Emails allowed by the Cloudflare Access policy; at least one is required. "
-            "An empty list is rejected because it would expose the service publicly."
-        ),
+    emails: tuple[str, ...] = Field(default=(), description="Exact email addresses granted access")
+    email_domains: tuple[str, ...] = Field(default=(), description="Whole email domains granted access")
+
+
+class SharingGrantsDocument(FrozenModel):
+    """A machine's full grants document: workspace-level plus per-service scopes."""
+
+    workspace: SharingGrantList = Field(default=SharingGrantList(), description="Workspace-level grants")
+    services: dict[str, SharingGrantList] = Field(
+        default_factory=dict, description="Per-service grants, keyed by registered service name"
+    )
+
+
+class MachineSharingRequest(ApiRequestModel):
+    """Body for enabling/updating a machine's sharing grants document.
+
+    ``workspace`` grants admit every service; ``services`` entries admit only
+    that one service's origin. At least one grantee is required overall (an
+    empty document would share with nobody and is rejected by the handler).
+    """
+
+    workspace: SharingGrantList = Field(default=SharingGrantList(), description="Workspace-level grants")
+    services: dict[str, SharingGrantList] = Field(
+        default_factory=dict, description="Per-service grants, keyed by registered service name"
     )
 
 
@@ -563,20 +607,62 @@ class WorkspaceBackupCheckResponse(FrozenModel):
 
 
 class SharingReadinessResponse(FrozenModel):
-    """Whether a shared service's hostname is live yet at the Cloudflare edge."""
+    """Whether a shared machine's hostname is live yet end to end, plus per-step provisioning signals."""
 
-    ready: bool = Field(description="Whether the shared URL is reachable yet")
+    ready: bool = Field(description="Whether the shared hostname answers over the relay yet")
+    cert_not_after: str | None = Field(
+        default=None,
+        description="Expiry of the newest issued certificate; None until one has been issued",
+    )
+    last_tunnel_login_at: str | None = Field(
+        default=None,
+        description=(
+            "The share's last relay tunnel Login stamp; None until the tunnel has ever connected. "
+            "Clients detect the tunnel step by this value changing during a provisioning wait "
+            "(it persists across re-shares, so its mere presence is not enough)."
+        ),
+    )
+    service_labels: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Public origin label per share target, as currently known from the workspace's service "
+            "registrations (the share link of a target is https://<label>.<workspace_domain>/). A target "
+            "absent here has no link yet; clients must show a pending state, never a bare-domain URL."
+        ),
+    )
 
 
-class SharingToggleResponse(FrozenModel):
-    """Result of enabling/disabling sharing for a workspace service."""
+class MachineSharingResponse(FrozenModel):
+    """A machine's sharing document: status plus the grants read from the workspace."""
 
-    agent_id: str = Field(description="The workspace agent id")
-    service_name: str = Field(description="The service whose sharing was changed")
-    enabled: bool = Field(description="Whether sharing is now enabled")
+    host_id: str = Field(description="The machine's host coordinate (host-<hex>)")
+    enabled: bool = Field(description="Whether the machine is currently shared")
+    workspace_domain: str | None = Field(default=None, description="The share's public domain")
     url: str | None = Field(
         default=None,
-        description="The service's public share URL (enable only); lets the editor skip a follow-up status read",
+        description=(
+            "The share's base URL (https://<workspace_domain>/). The bare domain itself does not route: a "
+            "target's link is https://<service_labels[target]>.<workspace_domain>/"
+        ),
+    )
+    region: str | None = Field(default=None, description="Relay region code")
+    last_tunnel_login_at: str | None = Field(default=None, description="Last relay tunnel connect stamp")
+    cert_not_after: str | None = Field(default=None, description="Expiry of the share's TLS certificate")
+    service_labels: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Public origin label per share target, as currently known from the workspace's service "
+            "registrations. A target absent here has no link yet (its registration has not reached this "
+            "client); clients must show a pending state for it, never a bare-domain URL."
+        ),
+    )
+    grants: SharingGrantsDocument | None = Field(
+        default=SharingGrantsDocument(),
+        description=(
+            "The grants document currently in force; null when the machine is "
+            "shared but the grants read did not land (clients must treat null "
+            "as unknown, never as an empty policy)"
+        ),
     )
 
 

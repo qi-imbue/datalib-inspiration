@@ -15,16 +15,24 @@ from pydantic import Field
 
 from imbue.concurrency_group.concurrency_group import ConcurrencyGroup
 from imbue.imbue_common.frozen_model import FrozenModel
-from imbue.minds.config.data_types import WorkspacePaths
+from imbue.minds.config.data_types import InstallationPaths
 from imbue.minds.desktop_client import restic_cli
 from imbue.minds.desktop_client.backup_env_store import parse_restic_env
 from imbue.minds.desktop_client.backup_env_store import read_canonical_env
 from imbue.minds.errors import BackupProvisioningError
 from imbue.mngr.primitives import AgentId
 
-# Hard cap on each restic invocation made for status, so a slow/unreachable
-# repository can't stall the route serving the backups list.
-_STATUS_RESTIC_TIMEOUT_SECONDS: Final[float] = 12.0
+# Hard cap on each restic invocation made for a *status* probe -- the landing
+# badges and the backup-service check, which the user did not ask for and which
+# must not stall the surface they are attached to.
+STATUS_RESTIC_TIMEOUT_SECONDS: Final[float] = 12.0
+# Hard cap for a listing the user explicitly asked for and is watching a spinner
+# on (the backup history page). A cold `restic snapshots` has to fetch the whole
+# snapshot index, so it scales with the number of snapshots: 25-40s measured
+# against R2 for a repository holding 987 snapshots, against ~2s warm. The
+# status budget fails such a listing outright, and the history page has no
+# cheaper answer to fall back on the way a badge does.
+HISTORY_RESTIC_TIMEOUT_SECONDS: Final[float] = 90.0
 
 
 class CanonicalRepositoryAccess(FrozenModel):
@@ -35,7 +43,7 @@ class CanonicalRepositoryAccess(FrozenModel):
     password: str | None = Field(description="The RESTIC_PASSWORD, when one is set")
 
 
-def load_canonical_repository_access(paths: WorkspacePaths, agent_id: AgentId) -> CanonicalRepositoryAccess:
+def load_canonical_repository_access(paths: InstallationPaths, agent_id: AgentId) -> CanonicalRepositoryAccess:
     """Parse the workspace's canonical restic.env into repository coordinates.
 
     Raises ``BackupProvisioningError`` when no backups are configured (no
@@ -55,11 +63,11 @@ def load_canonical_repository_access(paths: WorkspacePaths, agent_id: AgentId) -
 
 
 def list_workspace_snapshots(
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     agent_id: AgentId,
     *,
     parent_cg: ConcurrencyGroup | None = None,
-    timeout_seconds: float = _STATUS_RESTIC_TIMEOUT_SECONDS,
+    timeout_seconds: float = STATUS_RESTIC_TIMEOUT_SECONDS,
 ) -> tuple[restic_cli.ResticSnapshot, ...]:
     """List a workspace's restic snapshots from its canonical restic.env.
 
@@ -79,13 +87,13 @@ def list_workspace_snapshots(
 
 
 def list_workspace_snapshot_directory(
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     agent_id: AgentId,
     *,
     snapshot_id: str,
     directory: str,
     parent_cg: ConcurrencyGroup | None = None,
-    timeout_seconds: float = _STATUS_RESTIC_TIMEOUT_SECONDS,
+    timeout_seconds: float = STATUS_RESTIC_TIMEOUT_SECONDS,
 ) -> tuple[str, ...]:
     """List the entries directly under ``directory`` in one snapshot, from the canonical restic.env."""
     access = load_canonical_repository_access(paths, agent_id)
@@ -101,12 +109,12 @@ def list_workspace_snapshot_directory(
 
 
 def is_workspace_backing_up(
-    paths: WorkspacePaths,
+    paths: InstallationPaths,
     agent_id: AgentId,
     *,
     now: datetime,
     parent_cg: ConcurrencyGroup | None = None,
-    restic_timeout_seconds: float = _STATUS_RESTIC_TIMEOUT_SECONDS,
+    restic_timeout_seconds: float = STATUS_RESTIC_TIMEOUT_SECONDS,
 ) -> bool:
     """Whether a restic backup is currently running for this workspace (non-stale lock).
 

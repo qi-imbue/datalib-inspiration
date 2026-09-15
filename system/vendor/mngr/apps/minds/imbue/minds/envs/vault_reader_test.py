@@ -8,7 +8,10 @@ import pytest
 from imbue.minds.envs.primitives import VaultReadError
 from imbue.minds.envs.primitives import VaultSecretNotFoundError
 from imbue.minds.envs.vault_reader import VaultPath
+from imbue.minds.envs.vault_reader import admin_key_from_supertokens_secret
+from imbue.minds.envs.vault_reader import read_ssh_ca_public_key
 from imbue.minds.envs.vault_reader import read_vault_kv
+from imbue.minds.envs.vault_reader import sign_ssh_public_key
 
 
 def _write_fake_vault(tmp_path: Path, body: str) -> Path:
@@ -19,15 +22,24 @@ def _write_fake_vault(tmp_path: Path, body: str) -> Path:
     return script
 
 
-def _make_split_vault_binary(tmp_path: Path, value_by_key: dict[str, str]) -> Path:
+def _make_split_vault_binary(
+    tmp_path: Path, value_by_key: dict[str, str], *, deleted_keys: tuple[str, ...] = ()
+) -> Path:
     """Fake ``vault`` for the split layout: ``kv list`` returns the keys, ``kv get`` returns each leaf's ``value``.
 
     Models the real two-call read path: a single ``kv list`` of the service
     directory followed by one ``kv get`` per child leaf, each holding a single
-    ``value`` field.
+    ``value`` field. Keys in ``deleted_keys`` are soft-deleted: they still show
+    up in the ``kv list`` output, but their ``kv get`` payload has ``data.data``
+    null with only a metadata block (as the real CLI returns after ``vault kv
+    delete``).
     """
     list_path = tmp_path / "_list.json"
-    list_path.write_text(json.dumps(sorted(value_by_key)))
+    list_path.write_text(json.dumps(sorted([*value_by_key, *deleted_keys])))
+    deleted_payload_path = tmp_path / "_deleted.json"
+    deleted_payload_path.write_text(
+        json.dumps({"data": {"data": None, "metadata": {"deletion_time": "2026-08-15T19:00:00Z", "destroyed": False}}})
+    )
     lines = [
         'sub="$2"',
         'path="${@: -1}"',
@@ -39,6 +51,10 @@ def _make_split_vault_binary(tmp_path: Path, value_by_key: dict[str, str]) -> Pa
         leaf_path = tmp_path / f"_get_{key}.json"
         leaf_path.write_text(json.dumps({"data": {"data": {"value": value}}}))
         lines.append(f'  if [ "$key" = {shlex.quote(key)} ]; then cat {shlex.quote(str(leaf_path))}; exit 0; fi')
+    for key in deleted_keys:
+        lines.append(
+            f'  if [ "$key" = {shlex.quote(key)} ]; then cat {shlex.quote(str(deleted_payload_path))}; exit 0; fi'
+        )
     lines.append('  echo "No value found" >&2; exit 2')
     lines.append("fi")
     lines.append('echo "unexpected vault invocation" >&2; exit 9')
@@ -150,3 +166,112 @@ def test_read_vault_kv_malformed_leaf_data_shape(tmp_path: Path) -> None:
     )
     with pytest.raises(VaultReadError, match="no data.data dict"):
         read_vault_kv(VaultPath("secrets/minds/dev/cloudflare"), vault_binary=str(fake))
+
+
+def test_read_vault_kv_skips_soft_deleted_leaves_and_keeps_the_live_ones(tmp_path: Path) -> None:
+    """A soft-deleted leaf (still in LIST, no data on GET) is skipped, not fatal.
+
+    This is the failure that gutted the staging ``sharing`` secret on
+    2026-08-15: one lingering ``vault kv delete`` tombstone made the whole
+    directory read raise, and the deploy shipped a placeholder secret.
+    """
+    fake = _make_split_vault_binary(
+        tmp_path,
+        {"FRPS_AUTH_SECRET": "s3cret", "SHARE_CONTENT_DOMAIN": "minds-staging.com"},
+        deleted_keys=("SHARE_DEFAULT_REGION",),
+    )
+
+    result = read_vault_kv(VaultPath("secrets/minds/dev/sharing"), vault_binary=str(fake))
+
+    assert result == {"FRPS_AUTH_SECRET": "s3cret", "SHARE_CONTENT_DOMAIN": "minds-staging.com"}
+
+
+def test_read_vault_kv_still_rejects_dataless_leaf_without_metadata(tmp_path: Path) -> None:
+    """A leaf with no data AND no metadata block is corruption, not a soft delete."""
+    fake = _make_branching_vault_binary(
+        tmp_path, list_stdout='["CLOUDFLARE_API_TOKEN"]', get_stdout='{"data": {"data": null}}'
+    )
+    with pytest.raises(VaultReadError, match="no data.data dict"):
+        read_vault_kv(VaultPath("secrets/minds/dev/cloudflare"), vault_binary=str(fake))
+
+
+def test_admin_key_from_secret_prefers_new_field_over_deprecated() -> None:
+    secret = {"MINDS_ADMIN_KEY": "new-key", "MINDS_PAID_ADMIN_KEY": "legacy-key"}
+    assert admin_key_from_supertokens_secret(secret, "secret/minds/dev") == "new-key"
+
+
+def test_admin_key_from_secret_falls_back_to_deprecated_field() -> None:
+    secret = {"MINDS_ADMIN_KEY": "", "MINDS_PAID_ADMIN_KEY": "legacy-key"}
+    assert admin_key_from_supertokens_secret(secret, "secret/minds/dev") == "legacy-key"
+
+
+def test_admin_key_from_secret_raises_when_neither_field_set() -> None:
+    with pytest.raises(VaultReadError, match="missing 'MINDS_ADMIN_KEY'"):
+        admin_key_from_supertokens_secret({"MINDS_PAID_ADMIN_KEY": ""}, "secret/minds/dev")
+
+
+def _make_ssh_vault_binary(tmp_path: Path, *, write_stdout: str, write_exit: int = 0, read_stdout: str = "") -> Path:
+    """Fake ``vault`` answering ``write <mount>/sign/<role>`` and ``read <mount>/config/ca``; records the write argv."""
+    write_out = tmp_path / "_write_out.json"
+    write_out.write_text(write_stdout)
+    read_out = tmp_path / "_read_out.json"
+    read_out.write_text(read_stdout)
+    argv_log = tmp_path / "_argv.txt"
+    body = "\n".join(
+        [
+            'sub="$1"',
+            f'if [ "$sub" = "write" ]; then printf "%s\\n" "$@" > {shlex.quote(str(argv_log))}; '
+            f"cat {shlex.quote(str(write_out))}; exit {write_exit}; fi",
+            f'if [ "$sub" = "read" ]; then cat {shlex.quote(str(read_out))}; exit 0; fi',
+            'echo "unexpected vault invocation" >&2; exit 9',
+        ]
+    )
+    return _write_fake_vault(tmp_path, body + "\n")
+
+
+def test_sign_ssh_public_key_requests_the_role_principals_and_returns_the_certificate(tmp_path: Path) -> None:
+    fake = _make_ssh_vault_binary(
+        tmp_path, write_stdout=json.dumps({"data": {"signed_key": "ssh-ed25519-cert-v01@openssh.com AAAAcert\n"}})
+    )
+    public_key_path = tmp_path / "id.pub"
+    public_key_path.write_text("ssh-ed25519 AAAAoperator\n")
+    certificate = sign_ssh_public_key(
+        mount="minds-dev-ssh",
+        role="operator",
+        public_key_path=public_key_path,
+        ttl="12h",
+        principals=("mngr-operator", "mngr-service"),
+        vault_binary=str(fake),
+    )
+    assert certificate == "ssh-ed25519-cert-v01@openssh.com AAAAcert"
+    argv = (tmp_path / "_argv.txt").read_text().splitlines()
+    assert argv[:3] == ["write", "-format=json", "minds-dev-ssh/sign/operator"]
+    assert f"public_key=@{public_key_path}" in argv
+    assert "ttl=12h" in argv
+    assert "valid_principals=mngr-operator,mngr-service" in argv
+
+
+def test_sign_ssh_public_key_surfaces_a_refused_sign(tmp_path: Path) -> None:
+    fake = _make_ssh_vault_binary(tmp_path, write_stdout="", write_exit=2)
+    public_key_path = tmp_path / "id.pub"
+    public_key_path.write_text("ssh-ed25519 AAAAoperator\n")
+    with pytest.raises(VaultReadError, match="minds-dev-ssh/sign/operator"):
+        sign_ssh_public_key(
+            mount="minds-dev-ssh",
+            role="operator",
+            public_key_path=public_key_path,
+            ttl="12h",
+            principals=("mngr-operator",),
+            vault_binary=str(fake),
+        )
+
+
+def test_read_ssh_ca_public_key_returns_the_configured_ca(tmp_path: Path) -> None:
+    fake = _make_ssh_vault_binary(
+        tmp_path, write_stdout="", read_stdout=json.dumps({"data": {"public_key": "ssh-ed25519 AAAAca minds-dev\n"}})
+    )
+    assert read_ssh_ca_public_key("minds-dev-ssh", vault_binary=str(fake)) == "ssh-ed25519 AAAAca minds-dev"
+    (tmp_path / "empty").mkdir()
+    empty = _make_ssh_vault_binary(tmp_path / "empty", write_stdout="", read_stdout=json.dumps({"data": {}}))
+    with pytest.raises(VaultReadError, match="no data.public_key"):
+        read_ssh_ca_public_key("minds-dev-ssh", vault_binary=str(empty))
