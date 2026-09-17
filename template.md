@@ -53,8 +53,8 @@ store directly, as a local tool, when answering a question. The concrete
 commands, config format, and query surfaces are datalib's own and change
 between versions, so they are deliberately not restated here or in the skill.
 They live in datalib's agent guide, pinned to the release the binaries come
-from (datalib v0.33.0):
-https://github.com/imbue-ai/datalib/blob/v0.33.0/docs/agent_user.md
+from (datalib v0.34.1):
+https://github.com/imbue-ai/datalib/blob/v0.34.1/docs/agent_user.md
 
 The **Datalib tab** is how the user uses it. datalib's own web UI -- the
 Manage screen, which shows every configured source and its sync state, and
@@ -71,7 +71,7 @@ there, datalib-http sets its session cookie and redirects to `/`. The token is
 `data/.skills/datalib/system/api-token`, kept stable across restarts, and it
 is also what the agent sends as a bearer token to reach the API.
 
-The **binaries** (a fully-static musl build of datalib v0.33.0: `datalib-http`
+The **binaries** (a fully-static musl build of datalib v0.34.1: `datalib-http`
 for the tab, `datalib-dag` and the rest for the skill) are installed by the
 env.d unit on the env-converge one-shot, into `~/.local/share/datalib/<version>/`
 with links in `~/.local/bin`. On a first boot that takes a few minutes; the
@@ -161,7 +161,7 @@ out consistent with the rest of that mind's environment rather than frozen to
 whatever this publisher happened to have.
 
 - `system/scripts/env.d/2000-datalib-binaries.sh`: the datalib binaries,
-  pinned to v0.33.0 (a fully-static musl build fetched from datalib's GitHub
+  pinned to v0.34.1 (a fully-static musl build fetched from datalib's GitHub
   release, with its published checksum verified). Both the Datalib tab and the
   skill run them. No apt packages, npm globals, uv tools, or cargo crates
   beyond the stock workspace: `datalib-app` is a workspace member installed
