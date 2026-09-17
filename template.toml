@@ -68,7 +68,7 @@ resolution = "Set the user's real sources (which Slack channels or all of them; 
 
 [[requirements.adaptation]]
 summary = "Cloudflare-walled sources (claude.ai and ChatGPT over their web APIs) need a recent Minds app"
-resolution = "Nothing to wire up; if a sync of one of these returns challenge pages instead of data, use an on-disk export (claude_export) for it and tell the user why"
+resolution = "Nothing to wire up; if a sync of one of these returns challenge pages instead of data, use an on-disk export (the `claude` source's `export` method) for it and tell the user why"
 
 [[requirements.adaptation]]
 summary = "The store is rebuildable, and big enough to think about: it persists on the mind's volume and rides the encrypted host backup, but is large and fully reconstructible by re-syncing"

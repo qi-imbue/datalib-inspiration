@@ -26,7 +26,7 @@ DATA_ROOT="$HOME/workspace/data/.skills/datalib"   # the data root holding the s
 DATALIB_CONFIG="$DATA_ROOT/config.toml"
 mkdir -p "$DATA_ROOT"
 
-# The binaries are pinned to datalib v0.33.0 and installed on the env-converge
+# The binaries are pinned to datalib v0.34.1 and installed on the env-converge
 # one-shot at boot. If they are not there yet (a first boot still converging,
 # or a workspace that adopted this template and has not rebooted), run the
 # unit by hand -- it is idempotent and a no-op once installed:
@@ -91,11 +91,11 @@ datalib work** -- how to write the pipeline config, run a sync, query the
 mirrored data, and use the HTTP API all live there, and they change with the
 version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.33.0/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.34.1/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.33.0/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.34.1/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source
@@ -109,12 +109,17 @@ permission request for that service's scope (e.g. `slack-api`, `github-api`,
 
 ## Supported sources (inside Minds)
 
-Reliable through the Minds latchkey gateway: **Slack** (`slack_api`), **GitHub**
-(`github_api`), **Notion** (`notion_api`), and **email** (`email` -- a Google
-Takeout `.mbox` on disk, or a JMAP server).
+A source is a `[[groups]]` entry with a `type`, and its ingest step names
+the method as a params table: `[steps.params.api]` for a service, or
+`[steps.params.export]` / `[steps.params.mbox]` for files on disk. (The
+older `slack_api` / `claude_export` spellings are refused since v0.31.0;
+`datalib-migrate-config` rewrites them.) Reliable through the Minds
+latchkey gateway: **Slack** (`type = "slack"`), **GitHub** (`github`),
+**Notion** (`notion`), and **email** (`email` -- a Google Takeout `.mbox`
+on disk, Gmail over Google's API, or a JMAP server).
 
-Cloudflare-walled web sources -- `claude_api` (claude.ai) and `chatgpt_api` --
-also work. Requests that ask for it are routed through datalib's
+Cloudflare-walled web sources -- `claude` over claude.ai's `api` method,
+and `chatgpt` -- also work. Requests that ask for it are routed through datalib's
 Chrome-impersonating curl by the Minds latchkey gateway, which clears the TLS
 fingerprint check that used to challenge them. On a mind running remotely, the
 same requests also go back out through the gateway on the user's own computer
@@ -128,7 +133,8 @@ Both halves need a recent Minds app: the gateway's bundled curl has to be
 datalib v0.24.0 or later, and the desktop-egress route needs a Minds that
 publishes that variable. If a sync of one of these sources returns Cloudflare
 challenge pages instead of data, that is the likely cause -- fall back to an
-on-disk export (`claude_export`) for that data and tell the user why.
+on-disk export (the `claude` source's `export` method) for that data and
+tell the user why.
 
 ## Notes
 
