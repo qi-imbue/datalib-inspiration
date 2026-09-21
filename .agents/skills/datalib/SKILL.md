@@ -1,7 +1,7 @@
 ---
 name: datalib
 description: Retrieve, search, and store the user's own personal data and history -- their chat conversations (Claude, ChatGPT), Slack, email, GitHub / GitLab, Notion, contacts, and messages. Use whenever the user asks about their past conversations, messages, mail, or other personal data, or asks you to import / mirror more of it. Prefer this over re-downloading or scraping the original services.
-compatibility: The datalib binaries are installed at boot by system/scripts/env.d/2000-datalib-binaries.sh. Needs node.js, curl, and latchkey (all present in a default-workspace-template mind).
+compatibility: The datalib binaries are installed at boot by system/scripts/env.d/2000-datalib-binaries.sh. Needs curl and the latchkey gateway (present in a default-workspace-template mind); datalib brings its own Node runtime.
 ---
 
 # datalib
@@ -26,7 +26,7 @@ DATA_ROOT="$HOME/workspace/data/.skills/datalib"   # the data root holding the s
 DATALIB_CONFIG="$DATA_ROOT/config.toml"
 mkdir -p "$DATA_ROOT"
 
-# The binaries are pinned to datalib v0.34.1 and installed on the env-converge
+# The binaries are pinned to datalib v0.35.2 and installed on the env-converge
 # one-shot at boot. If they are not there yet (a first boot still converging,
 # or a workspace that adopted this template and has not rebooted), run the
 # unit by hand -- it is idempotent and a no-op once installed:
@@ -91,11 +91,11 @@ datalib work** -- how to write the pipeline config, run a sync, query the
 mirrored data, and use the HTTP API all live there, and they change with the
 version pinned above:
 
-https://github.com/imbue-ai/datalib/blob/v0.34.1/docs/agent_user.md
+https://github.com/imbue-ai/datalib/blob/v0.35.2/docs/agent_user.md
 
 That link is pinned to the same tag the binaries are installed from, so it
 matches the tools you have. Its relative links resolve against
-`https://github.com/imbue-ai/datalib/blob/v0.34.1/docs/`. Don't rely on
+`https://github.com/imbue-ai/datalib/blob/v0.35.2/docs/`. Don't rely on
 remembered command lines or config shapes -- go read it.
 
 ## Authorizing a source

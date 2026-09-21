@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Keep this pin in step with the datalib skill (.agents/skills/datalib/SKILL.md),
 # README.md and template.md.
-readonly PINNED_VERSION="v0.34.1"
+readonly PINNED_VERSION="v0.35.2"
 
 readonly INSTALL_ROOT="${DATALIB_INSTALL_ROOT:-$HOME/.local/share/datalib}"
 readonly BIN_DIR="${DATALIB_BIN_DIR:-$HOME/.local/bin}"
@@ -63,4 +63,15 @@ fi
 }
 _link_binaries
 _log "installed datalib $PINNED_VERSION; binaries linked into $BIN_DIR"
+
+# The tarball carries the binaries only. The Node runtime a sync shells out
+# to (latchkey and qmd, at the versions datalib was built with) is a separate
+# asset of the same release, fetched sha256-checked into ~/.cache/datalib/runtime
+# on the first sync. Pull it now so that sync doesn't start with a ~100 MB
+# download; a miss here is not fatal because the first sync fetches it too.
+if "$RELEASE_DIR/datalib-step" pull-runtime >/dev/null 2>&1; then
+    _log "runtime fetched into ~/.cache/datalib/runtime"
+else
+    _log "runtime pre-fetch failed; the first sync fetches it instead"
+fi
 _log "unit satisfied"
