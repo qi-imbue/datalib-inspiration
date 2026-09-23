@@ -128,14 +128,14 @@ Only for the sources you actually want mirrored:
 
 ## How it's put together
 
-Three pieces, all pinned to the same datalib release (v0.35.2):
+Three pieces, all pinned to the same datalib release (v0.36.1):
 
 - **The skill**, `.agents/skills/datalib/`, is the agent's side. A pipeline
   config lists the sources to mirror, and the store is written under
   `data/.skills/datalib`, where the agent searches it on demand -- a local tool
   it runs when answering a question. The skill deliberately doesn't restate
   datalib's commands or config format; it points the agent at
-  [datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.35.2/docs/agent_user.md),
+  [datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.36.1/docs/agent_user.md),
   pinned to the same version, so the two can't drift.
 - **The Datalib tab**, `system/apps/datalib/`, is the user's side: datalib's
   web UI (`datalib-http`) run as the supervised `datalib` app
