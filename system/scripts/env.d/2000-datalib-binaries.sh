@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Keep this pin in step with the datalib skill (.agents/skills/datalib/SKILL.md),
 # README.md and template.md.
-readonly PINNED_VERSION="v0.39.0"
+readonly PINNED_VERSION="v0.40.0"
 
 readonly INSTALL_ROOT="${DATALIB_INSTALL_ROOT:-$HOME/.local/share/datalib}"
 readonly BIN_DIR="${DATALIB_BIN_DIR:-$HOME/.local/bin}"
