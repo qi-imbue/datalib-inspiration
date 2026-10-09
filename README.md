@@ -1,23 +1,23 @@
 # datalib -- your personal data, searchable
 
-This repo is a published Minds **template**: a bootable snapshot of a Minds
-agent ("mind") that mirrors your own data into a private local store, lets you
+This repo is a published Imbue Studio **template**: a bootable snapshot of an
+agent that mirrors your own data into a private local store, lets you
 browse and manage that store in a tab, and answers questions from it. You can
-create a new mind directly from this repo, or hand the repo URL to a mind you
-already have.
+create a new workspace directly from this repo, or hand the repo URL to an agent
+you already have.
 
 ## What it does
 
-datalib gives a mind a local copy of the data you already have scattered across
+datalib gives an agent a local copy of the data you already have scattered across
 the services you use -- Slack messages, email, GitHub activity, Notion pages,
-and chat exports -- mirrored into a single store on the mind's own disk. Once
-it's mirrored, you can ask the mind about your own history in plain language:
+and chat exports -- mirrored into a single store on the workspace's own disk. Once
+it's mirrored, you can ask the agent about your own history in plain language:
 
 > what did I tell Sam about the launch?
 > find the invoice email from March
 
-The mind answers from the local store instead of going back out to each service.
-Nothing leaves the mind: data is fetched with your own credentials (through the
+The agent answers from the local store instead of going back out to each service.
+Nothing leaves the workspace: data is fetched with your own credentials (through the
 `latchkey` gateway, which injects them at request time -- they're never written
 into any config) and stored locally.
 
@@ -28,12 +28,12 @@ work on the same store, so a source you add in the tab is one the agent can
 search, and a sync the agent runs is one you can watch.
 
 This is opt-in on purpose. Concentrating this much personal data in one place is
-useful precisely because it's comprehensive, which is also why a mind only gets
+useful precisely because it's comprehensive, which is also why an agent only gets
 it when you choose it.
 
 ## Getting started
 
-Everything happens in the Minds app -- there's nothing to clone or install by
+Everything happens in the Imbue Studio app -- there's nothing to clone or install by
 hand. You need this repo's URL:
 
 ```
@@ -41,9 +41,10 @@ https://github.com/qi-imbue/datalib-inspiration.git
 ```
 
 **In a new workspace.** When you create a workspace, give that URL as the
-template it's built from. The workspace boots already holding the snapshot, and
-its agent opens by introducing datalib and asking which of your accounts to
-start with -- you don't have to ask it for anything.
+template it's built from. The workspace boots already holding the snapshot.
+The agent does not bring datalib up on its own, so ask it in the chat to set up
+datalib (for example, "set up the template this workspace came from"). It then
+introduces datalib and asks which of your accounts to start with.
 
 **In a workspace you already have.** Paste the URL into the chat and ask the
 agent to use the template. It brings the snapshot in and picks up the same
@@ -99,7 +100,7 @@ Two caveats worth knowing, since both look like the skill failing when it isn't:
 Only for the sources you actually want mirrored:
 
 - **Slack, GitHub, Notion** -- your approval of a permission request that the
-  mind initiates during setup. The approval flow opens in the Minds app; no
+  agent initiates during setup. The approval flow opens in the Imbue Studio app; no
   tokens or API keys to find or paste.
 - **Email** -- three ways in. A Google Takeout `.mbox` file needs no permission
   at all; you just tell the agent where the file is. A Gmail or Google Workspace
@@ -109,20 +110,20 @@ Only for the sources you actually want mirrored:
 
 ## Good to know
 
-- **Claude.ai and ChatGPT history over the web API needs a recent Minds app.**
-  Those sources sit behind Cloudflare. A current Minds routes their requests
-  through datalib's browser-impersonating curl, and a remotely-hosted mind sends
+- **Claude.ai and ChatGPT history over the web API needs a recent Imbue Studio app.**
+  Those sources sit behind Cloudflare. A current Imbue Studio routes their requests
+  through datalib's browser-impersonating curl, and a remotely-hosted agent sends
   them back out through your own computer so they carry a residential IP -- both
   of which they need to get through. On an older app one or both is missing and
   the sync comes back with challenge pages; use an on-disk export instead.
 - **The store is rebuildable.** It lives with the rest of your workspace's data
-  on the mind's persistent volume, survives restarts, and rides the encrypted
+  on the workspace's persistent volume, survives restarts, and rides the encrypted
   backup. It's also large, so if you'd rather not pay for backing up something
-  reconstructible, you can ask the mind to leave it out -- losing it costs you a
+  reconstructible, you can ask the agent to leave it out -- losing it costs you a
   re-sync, not the data itself.
 - **The first sync is slow.** It downloads everything and builds a search index.
   Later runs only pull what changed, and are stoppable and resumable.
-- **The tab appears a few minutes into a brand-new mind.** The datalib binaries
+- **The tab appears a few minutes into a brand-new workspace.** The datalib binaries
   are downloaded on first boot; until they've arrived, the Datalib app waits
   and then starts on its own.
 
@@ -150,7 +151,7 @@ Three pieces, all pinned to the same datalib release (v0.41.0):
 
 `template.md` is the manifest: the authoritative document an agent reads to
 understand, present, and adapt this template, including the parts deliberately
-left open for the adopting mind to fill in; `template.toml` beside it is the
+left open for the adopting agent to fill in; `template.toml` beside it is the
 machine-readable half (recipe, requirements, environment). Read those if you're
 an agent; this README is the human-facing tour.
 
@@ -161,14 +162,14 @@ Underneath datalib, this repo is an ordinary
 tree -- a persistent Claude agent that delegates work to sub-agents and manages
 its own background services. The pieces most worth knowing:
 
-- `CLAUDE.md` -- agent instructions
+- `AGENTS.md` -- agent instructions (`CLAUDE.md` imports it)
 - `system/config/parent.toml` -- upstream repo, for pulling template updates
 - `.agents/skills/` -- the agent's skills, including `datalib` itself
 - `system/apps/` -- the workspace's apps, one folder each, including `datalib`
 - `system/supervisord.conf.d/` -- background service definitions, one file per
   program
-- `system/vendor/mngr/` -- a vendored, mutable copy of `mngr`; changes here do
-  affect the `mngr` command
+- `pyproject.toml` -- pins `mngr` to a specific commit of its own repo; `mngr`
+  is no longer vendored into this tree
 - `system/vendor/tk/` -- the vendored [tk](https://github.com/wedow/ticket)
   ticket tracker, backing the agent's task management
 

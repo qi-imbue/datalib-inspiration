@@ -1,7 +1,7 @@
 ---
 name: datalib
 description: Retrieve, search, and store the user's own personal data and history -- their chat conversations (Claude, ChatGPT), Slack, email, GitHub / GitLab, Notion, contacts, and messages. Use whenever the user asks about their past conversations, messages, mail, or other personal data, or asks you to import / mirror more of it. Prefer this over re-downloading or scraping the original services.
-compatibility: The datalib binaries are installed at boot by system/scripts/env.d/2000-datalib-binaries.sh. Needs curl and the latchkey gateway (present in a default-workspace-template mind); datalib brings its own Node runtime.
+compatibility: The datalib binaries are installed at boot by system/scripts/env.d/2000-datalib-binaries.sh. Needs curl and the latchkey gateway (present in a default-workspace-template agent); datalib brings its own Node runtime.
 ---
 
 # datalib
@@ -43,7 +43,7 @@ command -v datalib-dag >/dev/null 2>&1 || bash "$HOME/workspace/system/scripts/e
    never start a second `datalib-http` on this root, though -- the running one
    holds the root's `system/` lock, and its API is yours to use (below).
 3. **Credentials go through latchkey.** The web-API sources authenticate via
-   `latchkey`, already wired to the user through the Minds app. If a sync
+   `latchkey`, already wired to the user through the Imbue Studio app. If a sync
    reports missing credentials or "not permitted", use the `latchkey` skill to
    request permission for that service, then re-run the sync (see "Authorizing
    a source").
@@ -62,7 +62,7 @@ command -v datalib-dag >/dev/null 2>&1 || bash "$HOME/workspace/system/scripts/e
 
    The tab signs itself in (the app hands datalib its API token), so there is
    no link to paste. If the tab is empty or the app is missing from the
-   launcher, `supervisorctl status datalib` says why -- on a fresh mind it
+   launcher, `supervisorctl status datalib` says why -- on a fresh workspace it
    waits for the binaries above to arrive, then starts on its own.
 6. **The API is reachable with the bearer token.** The same server answers
    `http://127.0.0.1:8731` from inside the workspace, and every route needs
@@ -107,30 +107,30 @@ error, request access using the **`latchkey` skill**: POST a `predefined`
 permission request for that service's scope (e.g. `slack-api`, `github-api`,
 `notion-api`), wait for the user's approval, then re-run `datalib-dag`.
 
-## Supported sources (inside Minds)
+## Supported sources (inside Imbue Studio)
 
 A source is a `[[groups]]` entry with a `type`, and its ingest step names
 the method as a params table: `[steps.params.api]` for a service, or
 `[steps.params.export]` / `[steps.params.mbox]` for files on disk. (The
 older `slack_api` / `claude_export` spellings are refused since v0.31.0;
-`datalib-migrate-config` rewrites them.) Reliable through the Minds
+`datalib-migrate-config` rewrites them.) Reliable through the Imbue Studio
 latchkey gateway: **Slack** (`type = "slack"`), **GitHub** (`github`),
 **Notion** (`notion`), and **email** (`email` -- a Google Takeout `.mbox`
 on disk, Gmail over Google's API, or a JMAP server).
 
 Cloudflare-walled web sources -- `claude` over claude.ai's `api` method,
 and `chatgpt` -- also work. Requests that ask for it are routed through datalib's
-Chrome-impersonating curl by the Minds latchkey gateway, which clears the TLS
-fingerprint check that used to challenge them. On a mind running remotely, the
+Chrome-impersonating curl by the Imbue Studio latchkey gateway, which clears the TLS
+fingerprint check that used to challenge them. On an agent running remotely, the
 same requests also go back out through the gateway on the user's own computer
-(via `MINDS_VIA_DESKTOP_URL_PREFIX`, which Minds sets), so they leave from a
+(via `MINDS_VIA_DESKTOP_URL_PREFIX`, which Imbue Studio sets), so they leave from a
 residential connection rather than the VPS's datacenter IP -- these sites block
 those address ranges outright, which no amount of fingerprint fixing helps.
 Nothing here is configurable; it happens for exactly the providers that get
 impersonation.
 
-Both halves need a recent Minds app: the gateway's bundled curl has to be
-datalib v0.24.0 or later, and the desktop-egress route needs a Minds that
+Both halves need a recent Imbue Studio app: the gateway's bundled curl has to be
+datalib v0.24.0 or later, and the desktop-egress route needs an Imbue Studio that
 publishes that variable. If a sync of one of these sources returns Cloudflare
 challenge pages instead of data, that is the likely cause -- fall back to an
 on-disk export (the `claude` source's `export` method) for that data and

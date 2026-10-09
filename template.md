@@ -1,6 +1,6 @@
 ---
 title: datalib -- your personal data, searchable
-description: Mirror your own data (Slack, email, GitHub, Notion, chat history) into a private local store, and let the mind search and answer questions from it.
+description: Mirror your own data (Slack, email, GitHub, Notion, chat history) into a private local store, and let the agent search and answer questions from it.
 thumbnail: template.svg
 version: v2
 format: v2
@@ -11,26 +11,26 @@ format: v2
 This file is the manifest for the **datalib -- your personal data,
 searchable** template (slug: `datalib`). It is the one document a future agent
 reads to understand, present, and adapt this template. If you are an agent in a
-mind that was created from this template, this file is your script: read all
+workspace that was created from this template, this file is your script: read all
 of it, then follow "How to adapt it" below.
 
 ## What it is
 
-datalib gives a mind a private, always-local copy of the user's own data --
+datalib gives an agent a private, always-local copy of the user's own data --
 their Slack messages, email, GitHub activity, Notion pages, and chat history --
-mirrored out of those services into a single store on the mind's disk. Once
-mirrored, the mind can search it and answer questions from it ("what did I tell
+mirrored out of those services into a single store on the workspace's disk. Once
+mirrored, the agent can search it and answer questions from it ("what did I tell
 Sam about the launch?", "find the invoice email from March") without going back
 out to each service, and the user can browse and manage the same store
-themselves in the Datalib tab. Nothing leaves the mind: the data is fetched
+themselves in the Datalib tab. Nothing leaves the workspace: the data is fetched
 with the user's own credentials (via latchkey) and stored locally. It is opt-in
 on purpose -- concentrating this much personal data is powerful and sensitive,
-so a mind only gets it when the user chooses this template.
+so an agent only gets it when the user chooses this template.
 
 ## How it works
 
 The snapshot includes these paths (each is a repo-root-relative path copied from
-the original mind onto a clean default-workspace-template base):
+the original agent onto a clean default-workspace-template base):
 
 - `.agents/skills/datalib/` (the datalib skill -- the agent's side of the
   capability)
@@ -45,7 +45,7 @@ the original mind onto a clean default-workspace-template base):
 
 The **skill** is how the agent uses datalib. A pipeline config at
 `data/.skills/datalib/config.toml` lists which sources to mirror; each source is
-fetched through `latchkey` (so the user's credentials are injected by the Minds
+fetched through `latchkey` (so the user's credentials are injected by the Imbue Studio
 gateway, never stored in the config) and written to a local store under that
 data root (`data/.skills/datalib`, the workspace's own gitignored data tree on
 the persistent volume), where the skill searches it. The agent queries that
@@ -82,7 +82,7 @@ credentials, `qmd` for the semantic index, at the versions datalib was built
 with) is a second asset of the same release, which the unit pulls into
 `~/.cache/datalib/runtime` (about 100 MB, once per release) right after the
 install and which the first sync fetches itself if that pull missed. datalib
-does not use the mind's own `node`.
+does not use the workspace's own `node`.
 
 ## Recipe
 
@@ -99,7 +99,7 @@ That file is authoritative for all of it; this one holds the prose.
 
 ## Requirements
 
-Everything the adopting mind must deal with before this template is really
+Everything the adopting agent must deal with before this template is really
 theirs. Two kinds of entry, handled at different times:
 
 - **Activation** -- what must be SET UP before anything runs, in the
@@ -138,32 +138,32 @@ Adaptation:
   Gmail account over Google's API, or a JMAP server -- and which GitHub/Notion
   scopes. The Datalib tab's wizard is the user's way to do this; the agent can
   also write the config directly.
-- **Cloudflare-walled sources need a recent Minds.** The `claude` source over
+- **Cloudflare-walled sources need a recent Imbue Studio.** The `claude` source over
   claude.ai's API (its `api` method) and the `chatgpt` source work inside
-  Minds as of datalib v0.24.0: the latchkey
+  Imbue Studio as of datalib v0.24.0: the latchkey
   gateway routes marked requests through datalib's Chrome-impersonating curl,
   clearing the TLS fingerprint check that used to challenge them. As of v0.27.0
-  a remotely-hosted mind additionally sends those requests back out through the
+  a remotely-hosted agent additionally sends those requests back out through the
   gateway on the user's own computer (`MINDS_VIA_DESKTOP_URL_PREFIX`, published
-  by Minds), so they carry a residential IP instead of the VPS's -- these sites
-  block datacenter ranges outright. On an older Minds app one or both halves
+  by Imbue Studio), so they carry a residential IP instead of the VPS's -- these sites
+  block datacenter ranges outright. On an older Imbue Studio app one or both halves
   are missing and these sources still get challenged -- if a sync returns
   challenge pages instead of data, point the source at an on-disk export
   instead (the `claude` source's `export` method). Not something the adapter
   wires up either way.
 - **The store is rebuildable, and big enough to think about.** The data root
-  (`data/.skills/datalib`) persists across restarts on the mind's own volume and
+  (`data/.skills/datalib`) persists across restarts on the workspace's own volume and
   is covered by the encrypted host backup like the rest of `data/`. It is also
   large (doltlite stores plus a qmd index) and fully reconstructible by
-  re-syncing, so an adapting mind may prefer to exclude it from backups -- the
+  re-syncing, so an adapting agent may prefer to exclude it from backups -- the
   skill says how. Treat it as rebuildable-by-resync, not as precious storage.
 
 ## Environment
 
 What this template needs INSTALLED, beyond what the template already has.
-Declared in `template.toml`'s `[environment]` table; an adopting mind
+Declared in `template.toml`'s `[environment]` table; an adopting agent
 converges it at ITS OWN pinned apt snapshot timestamp, so package versions come
-out consistent with the rest of that mind's environment rather than frozen to
+out consistent with the rest of that workspace's environment rather than frozen to
 whatever this publisher happened to have.
 
 - `system/scripts/env.d/2000-datalib-binaries.sh`: the datalib binaries,
@@ -176,7 +176,7 @@ whatever this publisher happened to have.
 ## How to adapt it
 
 Instructions for the NEXT agent -- the one adapting this template into a
-new mind. This is the `use-template` skill's template path; in short:
+new workspace. This is the `use-template` skill's template path; in short:
 
 1. Read this entire file first, especially "Requirements" above. It holds two
    kinds of entry and they are handled at different times: the machine-readable
@@ -188,7 +188,7 @@ new mind. This is the `use-template` skill's template path; in short:
 3. Ask whether they want to use their own accounts (e.g. their own Slack). If
    YES: ACTIVATE FIRST -- initiate every `requires_permission` line NOW via a
    latchkey permission request (see the `latchkey` skill; the request opens the
-   approval/login flow in the minds app), write the config with the chosen
+   approval/login flow in the Imbue Studio app), write the config with the chosen
    sources (or walk the user through the wizard in the Datalib tab), run the
    sync, and get the store showing THE USER'S OWN DATA. Done for a data-backed
    app means the user can search and see their own data -- NOT that a service
@@ -228,5 +228,5 @@ by the skill on first use.
 
 ## Adaptation history
 
-Each mind that adapts this template appends one dated entry below. Earlier
+Each agent that adapts this template appends one dated entry below. Earlier
 entries are never rewritten.
