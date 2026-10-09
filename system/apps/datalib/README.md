@@ -1,55 +1,65 @@
 # datalib
 
-The Datalib tab: datalib's own web UI -- the Manage screen and the Add/Edit
+The Datalib app: datalib's own web UI -- the Manage screen and the Add/Edit
 source wizard served by `datalib-http` -- over the store the `datalib` skill
 writes, so a source added through the wizard is what the agent searches and a
 sync the agent runs is what the UI shows. Supervised as the `datalib` program,
-declared in `system/supervisord.conf.d/datalib.conf`, which runs the
-`datalib-app` entry point of this package (installed as its own uv tool by
-`system/scripts/build_workspace.sh`, like every Python app with a manifest).
+declared in `system/supervisord.conf.d/datalib.conf`, whose program line runs
+`launch_datalib_http.py` under a plain `python3`.
+
+The app is a manifest, an icon, and that launcher; like the file viewer it is
+not a Python package, and it is excluded from the uv workspace in the root
+`pyproject.toml`. The launcher uses only the standard library, so the app does
+not depend on the root venv being intact.
 
 The server is `datalib-http` from the datalib release pinned in
 `system/scripts/env.d/2000-datalib-binaries.sh` (the same pin as the skill,
 `README.md`, and `template.md`), which that env.d unit installs into
 `~/.local/share/datalib/<version>/` and links into `~/.local/bin` on the
-env-converge one-shot. `datalib-app` (`src/datalib_app/main.py`) is the
-`app_instances` sidecar launcher around it: it serves the instances API on
-`127.0.0.1:8732` (the manifest's `instances_url`), registers `app.toml` and the
-datalib-http port 8731 through `system/scripts/forward_port.py`, and runs
-`~/.local/bin/datalib-http --no-open data/.skills/datalib` as its child with
-`DATALIB_BIND=127.0.0.1:8731`, forwarding `SIGTERM` and `SIGINT` to it and
-exiting with its status. Until the env.d unit has installed the binary (minutes
-into a first boot), the app exits without registering anything and supervisord
-retries it with its backoff, so the tab never appears with nothing behind it.
+env-converge one-shot. The launcher does three things, in order:
+
+1. Reads the API token (see below).
+2. Registers the app and the datalib-http port 8731 through
+   `system/scripts/forward_port.py`.
+3. Replaces itself with `~/.local/bin/datalib-http --no-open
+   data/.skills/datalib`, with `DATALIB_BIND=127.0.0.1:8731` and the token in
+   `DATALIB_TOKEN`. From then on supervisord supervises datalib-http directly.
+
+Until the env.d unit has installed the binary (minutes into a first boot), the
+launcher exits without registering anything and supervisord retries it with its
+backoff, so the app never appears with nothing behind it.
 
 ## The token
 
 `datalib-http` requires its per-process API token on every route: loopback
 does not keep a web page out, and `PUT /api/config` runs shell commands. A
 browser gets in by loading `/?token=<token>` once, which sets a session cookie
-and redirects to `/`. A tab in the workspace opens at whatever URL the app's
-instances API lists, so that is where the token travels: the one instance this
-app lists (`key = "ui"`, title `Datalib`, `explicit`, never renamed, no
-location tracking) has the URL `/?token=<token>`. The shell fetches that list
-over loopback; browsers never reach the instances API.
+and redirects to `/`.
 
-The token itself is `data/.skills/datalib/system/api-token`: the app reads it
-at start and hands it to `datalib-http` through `DATALIB_TOKEN`, so it stays
+A window opens at a launch path's `path` with the launch path's `presets` as
+the query string. `app.toml` declares one launch path, `ui`, at `/`. The
+launcher writes a copy of `app.toml` to `data/.state/datalib-app/` with
+`presets = { token = "<token>" }` appended to that launch path, and registers
+the copy, so a window opens at `/?token=<token>`. `app.toml` must keep its
+`[[launch_paths]]` table last for the append to land in it; the launcher
+checks this and refuses to start otherwise.
+
+The token itself is `data/.skills/datalib/system/api-token`: the launcher reads
+it at start and hands it to `datalib-http` through `DATALIB_TOKEN`, so it stays
 the same across restarts (a browser already holding the cookie stays signed
 in) and the skill can read the same file for its bearer token. When the file
-is missing or unusable the app mints one, and `datalib-http` writes it there.
+is missing or unusable the launcher mints one, and `datalib-http` writes it
+there.
 
-## Instances
+## Staying up with no window
 
-`open` (the manifest's only action, also its `default_shortcut`) returns the
-one record; a second open returns the same record and the shell focuses the
-tab already showing it. Delete is accepted and changes nothing (closing the
-tab needs no bookkeeping; stopping datalib is the app-level Stop). Rename and
-location reports are refused.
+`app.toml` sets `stop_when_no_windows = false`: a sync started from the Manage
+screen runs inside `datalib-http` and has to finish after the window closes.
 
 ## Tests
 
-`uv run pytest system/apps/datalib` from the repo root. `main_test.py`,
-`source_test.py`, and `token_test.py` pin the wiring; `test_datalib_app.py`
-runs `datalib-app` as a process around a fake `datalib-http` (`testing.py`)
-and drives the instances routes.
+`uv run pytest system/apps/datalib` from the repo root.
+`launch_datalib_http_test.py` pins the token handling and the registered
+manifest copy; `test_datalib_app.py` runs the launcher as a process, through
+the real `forward_port.py` and around a fake `datalib-http`
+(`datalib_launcher_testing.py`).

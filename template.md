@@ -22,7 +22,7 @@ mirrored out of those services into a single store on the workspace's disk. Once
 mirrored, the agent can search it and answer questions from it ("what did I tell
 Sam about the launch?", "find the invoice email from March") without going back
 out to each service, and the user can browse and manage the same store
-themselves in the Datalib tab. Nothing leaves the workspace: the data is fetched
+themselves in the Datalib app. Nothing leaves the workspace: the data is fetched
 with the user's own credentials (via latchkey) and stored locally. It is opt-in
 on purpose -- concentrating this much personal data is powerful and sensitive,
 so an agent only gets it when the user chooses this template.
@@ -34,14 +34,15 @@ the original agent onto a clean default-workspace-template base):
 
 - `.agents/skills/datalib/` (the datalib skill -- the agent's side of the
   capability)
-- `system/apps/datalib/` (the Datalib tab: the app manifest, its icon, and the
-  `datalib-app` launcher that runs datalib's web UI)
+- `system/apps/datalib/` (the Datalib app: the app manifest, its icon, and the
+  `launch_datalib_http.py` launcher that runs datalib's web UI)
 - `system/supervisord.conf.d/datalib.conf` (the `datalib` program that
   supervises it)
 - `system/scripts/env.d/2000-datalib-binaries.sh` (the env.d unit that
   installs the datalib binaries)
-- `uv.lock` (the workspace lockfile, which now lists the `datalib-app`
-  package; the base template's own lock is otherwise unchanged)
+- `pyproject.toml` (one entry: `system/apps/datalib` is excluded from the
+  Python workspace, because the app is a manifest and a standard-library
+  launcher, not a package)
 
 The **skill** is how the agent uses datalib. A pipeline config at
 `data/.skills/datalib/config.toml` lists which sources to mirror; each source is
@@ -56,27 +57,28 @@ They live in datalib's agent guide, pinned to the release the binaries come
 from (datalib v0.41.0):
 https://github.com/imbue-ai/datalib/blob/v0.41.0/docs/agent_user.md
 
-The **Datalib tab** is how the user uses it. datalib's own web UI -- the
+The **Datalib app** is how the user uses it. datalib's own web UI -- the
 Manage screen, which shows every configured source and its sync state, and
 the Add/Edit source wizard -- is served by `datalib-http` over the same data
 root, so a source the user adds in the wizard is what the agent searches and a
 sync the agent runs is what the user sees. It runs as the supervised `datalib`
-program: `datalib-app` (system/apps/datalib) registers the app through
-`forward_port.py` and runs `~/.local/bin/datalib-http --no-open
-data/.skills/datalib` as its child, bound to `127.0.0.1:8731`, and the
+program: `system/apps/datalib/launch_datalib_http.py` registers the app through
+`forward_port.py` and then becomes `~/.local/bin/datalib-http --no-open
+data/.skills/datalib`, bound to `127.0.0.1:8731`, and the
 workspace shows it as the `datalib` app at its own origin. datalib-http
-requires its API token on every route, and a tab has no way to type one, so
-the app's instances API lists the one page at `/?token=<token>`: the tab opens
-there, datalib-http sets its session cookie and redirects to `/`. The token is
+requires its API token on every route, and a window has no way to type one, so
+the launcher registers the app's one launch path with the token as a preset:
+a window opens at `/?token=<token>`, datalib-http sets its session cookie and
+redirects to `/`. The token is
 `data/.skills/datalib/system/api-token`, kept stable across restarts, and it
 is also what the agent sends as a bearer token to reach the API.
 
 The **binaries** (a fully-static musl build of datalib v0.41.0: `datalib-http`
-for the tab, `datalib-dag` and the rest for the skill) are installed by the
+for the window, `datalib-dag` and the rest for the skill) are installed by the
 env.d unit on the env-converge one-shot, into `~/.local/share/datalib/<version>/`
 with links in `~/.local/bin`. On a first boot that takes a few minutes; the
 `datalib` program waits for it by exiting and letting supervisord retry, so the
-tab only appears once there is a server behind it. The tarball holds the
+app only appears once there is a server behind it. The tarball holds the
 binaries alone: the Node runtime a sync shells out to (`latchkey` for
 credentials, `qmd` for the semantic index, at the versions datalib was built
 with) is a second asset of the same release, which the unit pulls into
@@ -136,7 +138,7 @@ Adaptation:
   the user's real sources: which Slack channels (or `all_channels = true`),
   which of the three email modes to use -- a Google Takeout `.mbox` on disk, a
   Gmail account over Google's API, or a JMAP server -- and which GitHub/Notion
-  scopes. The Datalib tab's wizard is the user's way to do this; the agent can
+  scopes. The Datalib app's wizard is the user's way to do this; the agent can
   also write the config directly.
 - **Cloudflare-walled sources need a recent Imbue Studio.** The `claude` source over
   claude.ai's API (its `api` method) and the `chatgpt` source work inside
@@ -168,10 +170,10 @@ whatever this publisher happened to have.
 
 - `system/scripts/env.d/2000-datalib-binaries.sh`: the datalib binaries,
   pinned to v0.41.0 (a fully-static musl build fetched from datalib's GitHub
-  release, with its published checksum verified). Both the Datalib tab and the
+  release, with its published checksum verified). Both the Datalib app and the
   skill run them. No apt packages, npm globals, uv tools, or cargo crates
-  beyond the stock workspace: `datalib-app` is a workspace member installed
-  the way every built-in app is.
+  beyond the stock workspace: the app's launcher uses only the Python
+  standard library.
 
 ## How to adapt it
 
@@ -189,11 +191,11 @@ new workspace. This is the `use-template` skill's template path; in short:
    YES: ACTIVATE FIRST -- initiate every `requires_permission` line NOW via a
    latchkey permission request (see the `latchkey` skill; the request opens the
    approval/login flow in the Imbue Studio app), write the config with the chosen
-   sources (or walk the user through the wizard in the Datalib tab), run the
+   sources (or walk the user through the wizard in the Datalib app), run the
    sync, and get the store showing THE USER'S OWN DATA. Done for a data-backed
    app means the user can search and see their own data -- NOT that a service
    starts or an endpoint returns 200. Then tell them it is live, open the
-   Datalib tab for them (`python3 system/scripts/layout.py open datalib`), and
+   Datalib app for them (`python3 system/scripts/layout.py open datalib`), and
    invite them to try a search.
 4. Only AFTER that (or immediately, if they chose different sources -- the swap
    is then the first adaptation) ask: "How do you want to adapt it?"
@@ -216,7 +218,7 @@ store at `data/.skills/datalib` and every pin bumped in step with datalib's
 releases (v0.17.0 through v0.29.0). A late v1 also ran datalib's web UI as the
 `data` service, reachable only by pasting a token link.
 
-### v2 (2026-09-15) -- the Datalib tab, and the v2 template format
+### v2 (2026-09-15) -- the Datalib app, and the v2 template format
 
 Migrated from the v1 `inspiration-datalib.md` manifest to `template.md` +
 `template.toml` + `template.svg` on the current default-workspace-template
@@ -225,6 +227,16 @@ runs as the `datalib` app tab, opened at its own origin with the token handed
 over by the app's instances API, so it needs no pasted link. The binaries are
 pinned to datalib v0.31.1 and installed by an env.d unit at boot rather than
 by the skill on first use.
+
+### v3 (2026-10-09) -- rebuilt on the current base, without the instances layer
+
+Rebuilt on the current default-workspace-template base, whose history was
+rewritten and which removed the app instances layer the Datalib app was built
+on. The app is now a manifest and a standard-library launcher
+(`launch_datalib_http.py`) that hands the window its token through a
+launch-path preset, so it is no longer a Python package and `uv.lock` is the
+base template's own. The welcome skill is gone (the base no longer opens a new
+chat with it), and the binaries are pinned to datalib v0.41.0.
 
 ## Adaptation history
 

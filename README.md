@@ -2,7 +2,7 @@
 
 This repo is a published Imbue Studio **template**: a bootable snapshot of an
 agent that mirrors your own data into a private local store, lets you
-browse and manage that store in a tab, and answers questions from it. You can
+browse and manage that store in a window, and answers questions from it. You can
 create a new workspace directly from this repo, or hand the repo URL to an agent
 you already have.
 
@@ -21,10 +21,10 @@ Nothing leaves the workspace: data is fetched with your own credentials (through
 `latchkey` gateway, which injects them at request time -- they're never written
 into any config) and stored locally.
 
-Alongside the agent, you get the **Datalib tab**: datalib's own web UI, where
+Alongside the agent, you get the **Datalib app**: datalib's own web UI, where
 you can see every source you've set up and how its last sync went, add or edit
-a source through a wizard, and start a sync yourself. The tab and the agent
-work on the same store, so a source you add in the tab is one the agent can
+a source through a wizard, and start a sync yourself. The window and the agent
+work on the same store, so a source you add in the window is one the agent can
 search, and a sync the agent runs is one you can watch.
 
 This is opt-in on purpose. Concentrating this much personal data in one place is
@@ -52,7 +52,7 @@ setup conversation.
 
 Either way the agent drives the rest interactively: it asks which sources you
 want, requests your approval for each service it needs, sets up the config
-(or walks you through the wizard in the Datalib tab), runs the first sync, and
+(or walks you through the wizard in the Datalib app), runs the first sync, and
 tells you when your data is searchable. You are done when you can search your
 own data -- not when a service starts.
 
@@ -75,7 +75,7 @@ The same goes for growing the mirror: "also pull in my Notion" or "refresh my
 Slack" routes to the skill on its own, and it will ask for any approval it still
 needs.
 
-**The Datalib tab.** Open it from the workspace's launcher like the terminal
+**The Datalib app.** Open it from the workspace's launcher like the terminal
 or the browser, or ask the agent to open it for you. Its Manage screen lists
 your sources and their sync state; "Add source" starts the wizard. It signs
 itself in -- there is no token to paste.
@@ -91,7 +91,7 @@ Two caveats worth knowing, since both look like the skill failing when it isn't:
 
 - **It only knows what's been mirrored.** A source you never synced is simply
   absent, and an empty result means "not mirrored yet", not "doesn't exist". If
-  an answer looks thin, ask what's actually synced (or look at the tab).
+  an answer looks thin, ask what's actually synced (or look at the window).
 - **It goes stale between syncs.** The store is a point-in-time copy, so recent
   activity won't be there until you ask for a refresh.
 
@@ -123,7 +123,7 @@ Only for the sources you actually want mirrored:
   re-sync, not the data itself.
 - **The first sync is slow.** It downloads everything and builds a search index.
   Later runs only pull what changed, and are stoppable and resumable.
-- **The tab appears a few minutes into a brand-new workspace.** The datalib binaries
+- **The window appears a few minutes into a brand-new workspace.** The datalib binaries
   are downloaded on first boot; until they've arrived, the Datalib app waits
   and then starts on its own.
 
@@ -138,11 +138,11 @@ Three pieces, all pinned to the same datalib release (v0.41.0):
   datalib's commands or config format; it points the agent at
   [datalib's own agent guide](https://github.com/imbue-ai/datalib/blob/v0.41.0/docs/agent_user.md),
   pinned to the same version, so the two can't drift.
-- **The Datalib tab**, `system/apps/datalib/`, is the user's side: datalib's
+- **The Datalib app**, `system/apps/datalib/`, is the user's side: datalib's
   web UI (`datalib-http`) run as the supervised `datalib` app
   (`system/supervisord.conf.d/datalib.conf`) over the same store. datalib
-  requires an API token on every request; the app hands it to the tab when the
-  tab opens, and keeps it stable across restarts so the agent can use it too.
+  requires an API token on every request; the app puts it on the address a
+  window opens at, and keeps it stable across restarts so the agent can use it too.
   The app's README explains the mechanics.
 - **The binaries** arrive through `system/scripts/env.d/2000-datalib-binaries.sh`,
   an env.d unit the workspace runs at boot: it fetches datalib's static musl

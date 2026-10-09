@@ -1,20 +1,43 @@
-"""Test doubles for the Datalib app: a fake ``datalib-http`` installed as an executable."""
+"""Test helpers for the Datalib app: the launcher as an importable module, and a fake ``datalib-http``.
 
+The launcher is a flat script, not a package, so it is loaded from its file under a name of its
+own (the same way ``system/scripts/script_modules_testing.py`` loads the scripts beside it).
+"""
+
+import importlib.util
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
+
+LAUNCHER_PATH: Final[Path] = Path(__file__).parent / "launch_datalib_http.py"
 
 # Where the fake datalib-http records the argv and environment it was started with.
 ENV_FAKE_DATALIB_HTTP_DIR: Final[str] = "FAKE_DATALIB_HTTP_DIR"
 
 _EXECUTABLE_MODE: Final[int] = 0o755
 
-# The fake records its argv and the two variables the real server reads, then waits to be signalled.
+FAKE_DATALIB_HTTP_EXIT_STATUS: Final[int] = 7
+
+# The fake records its argv and the two variables the real server reads, then exits with a status
+# of its own, which a launcher that became this process reports as its own.
 _FAKE_DATALIB_HTTP_SCRIPT: Final[str] = f"""#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$@" > "${ENV_FAKE_DATALIB_HTTP_DIR}/argv"
 printf 'DATALIB_BIND=%s\\nDATALIB_TOKEN=%s\\n' "${{DATALIB_BIND:-}}" "${{DATALIB_TOKEN:-}}" > "${ENV_FAKE_DATALIB_HTTP_DIR}/environment"
-exec sleep 100000
+exit {FAKE_DATALIB_HTTP_EXIT_STATUS}
 """
+
+
+def _load_launcher() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "launch_datalib_http_for_tests", LAUNCHER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+launcher = _load_launcher()
 
 
 def install_fake_datalib_http(directory: Path) -> tuple[Path, Path]:

@@ -21,7 +21,7 @@ include = [
     "system/apps/datalib",
     "system/supervisord.conf.d/datalib.conf",
     "system/scripts/env.d/2000-datalib-binaries.sh",
-    "uv.lock",
+    "pyproject.toml",
 ]
 data_include = []
 exclude = [

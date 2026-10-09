@@ -39,7 +39,7 @@ command -v datalib-dag >/dev/null 2>&1 || bash "$HOME/workspace/system/scripts/e
    "no such data".
 2. **Sync to import or refresh data.** Syncs are incremental and resumable; the
    first sync of a source is slow, later runs only pull deltas. `datalib-dag`
-   runs alongside the Datalib tab's server on the same root without conflict;
+   runs alongside the Datalib app's server on the same root without conflict;
    never start a second `datalib-http` on this root, though -- the running one
    holds the root's `system/` lock, and its API is yours to use (below).
 3. **Credentials go through latchkey.** The web-API sources authenticate via
@@ -50,19 +50,19 @@ command -v datalib-dag >/dev/null 2>&1 || bash "$HOME/workspace/system/scripts/e
 4. **Never commit the store.** Everything under `data/` is gitignored by the
    workspace, which is why the store lives there. Don't try to force it into
    git, and don't copy it anywhere that is tracked.
-5. **The Datalib tab is the user's way in; open it for them.** datalib's own
+5. **The Datalib app is the user's way in; open it for them.** datalib's own
    web UI -- the Manage screen (every configured source and its sync state)
    and the Add/Edit source wizard -- runs as the supervised `datalib` app over
    this same store, so a source the user adds there is one you can search, and
    a sync you run is one they can watch. Open it beside your chat with:
 
    ```bash
-   python3 system/scripts/layout.py open datalib
+   uv run --no-sync workspace-layout open datalib
    ```
 
-   The tab signs itself in (the app hands datalib its API token), so there is
-   no link to paste. If the tab is empty or the app is missing from the
-   launcher, `supervisorctl status datalib` says why -- on a fresh workspace it
+   The window signs itself in (it opens with datalib's API token on its
+   address), so there is no link to paste. If the window is empty or the app is
+   missing from the launcher, `supervisorctl status datalib` says why -- on a fresh workspace it
    waits for the binaries above to arrive, then starts on its own.
 6. **The API is reachable with the bearer token.** The same server answers
    `http://127.0.0.1:8731` from inside the workspace, and every route needs

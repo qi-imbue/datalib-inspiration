@@ -1,273 +1,133 @@
-"""Integration: ``datalib-app`` as a real process around a fake datalib-http."""
+"""Integration: the launcher as a real process, registering through the real forward_port.py and
+becoming a fake datalib-http."""
 
 import os
-import signal
 import subprocess
 import sys
-from collections.abc import Mapping
+import tomllib
 from pathlib import Path
 from typing import Final
-from uuid import uuid4
 
-import httpx
-import pytest
-from app_instances.testing import (
-    LOOPBACK_HOST,
-    SidecarEnvironment,
-    free_port,
-    is_port_accepting,
-    wait_until,
-)
-from app_manifest.primitives import AppName, InstancesUrl
-from app_manifest.registry import read_registry
-from datalib_app.testing import (
+from datalib_launcher_testing import (
     ENV_FAKE_DATALIB_HTTP_DIR,
+    FAKE_DATALIB_HTTP_EXIT_STATUS,
+    LAUNCHER_PATH,
     install_fake_datalib_http,
+    launcher,
     read_fake_datalib_http_argv,
     read_fake_datalib_http_environment,
 )
-from imbue.imbue_common.frozen_model import FrozenModel
-from pydantic import Field
 
-_STARTUP_TIMEOUT_SECONDS: Final[float] = 20.0
-_EXIT_TIMEOUT_SECONDS: Final[float] = 10.0
-_REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
-
-_MINIMAL_ICON: Final[str] = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 3h18v18H3z"/></svg>'
-)
+# system/apps/datalib/test_datalib_app.py -> the repository root.
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[3]
+_PORT: Final[int] = 18731
+_PUBLISHED_TOKEN: Final[str] = "published-token.0123_abc~"
+# forward_port.py's override for where the registry lives.
+_ENV_APPS_FILE: Final[str] = "MINDS_APPS_FILE"
+_RUN_TIMEOUT_SECONDS: Final[float] = 60.0
 
 
-class _DatalibAppUnderTest(FrozenModel):
-    """One datalib-app process's command line, its ports and files, and where its stderr lands."""
-
-    app_name: AppName = Field(description="The unique name the app registers")
-    http_port: int = Field(description="The port the fake datalib-http is told to bind")
-    instances_port: int = Field(description="The port the instances API is served on")
-    instances_url: InstancesUrl = Field(description="Where the instances API is served")
-    data_root: Path = Field(description="The data root the app is told to serve")
-    record_dir: Path = Field(
-        description="Where the fake datalib-http records its argv and environment"
-    )
-    log_path: Path = Field(description="Where the app's stderr is captured")
-    command: tuple[str, ...] = Field(description="The full command line")
-    environment: Mapping[str, str] = Field(
-        description="The environment the process runs with"
-    )
-
-
-def _write_manifest(
-    directory: Path, app_name: AppName, instances_url: InstancesUrl
-) -> Path:
-    """The real manifest's shape under a unique name, so parallel tests never share a registry row."""
-    (directory / "icon.svg").write_text(_MINIMAL_ICON)
-    manifest_path = directory / "app.toml"
-    manifest_path.write_text(
-        f'name = "{app_name}"\n'
-        'display_name = "Datalib"\n'
-        'icon = "icon.svg"\n'
-        "instances = true\n"
-        f'instances_url = "{instances_url}"\n'
-        "\n"
-        "[default_shortcut]\n"
-        'action = "open"\n'
-        'mode = "focus"\n'
-        "\n"
-        "[[actions]]\n"
-        'id = "open"\n'
-        'label = "Open Datalib"\n'
-    )
-    return manifest_path
-
-
-def _prepare(
-    environment: SidecarEnvironment,
-    published_token: str | None,
-    is_binary_installed: bool = True,
-) -> _DatalibAppUnderTest:
-    app_name = AppName(f"datalib-{uuid4().hex[:8]}")
-    http_port = free_port()
-    instances_port = free_port()
-    instances_url = InstancesUrl(f"http://{LOOPBACK_HOST}:{instances_port}")
-    manifest_path = _write_manifest(environment.scratch_dir, app_name, instances_url)
-    executable, record_dir = install_fake_datalib_http(
-        environment.scratch_dir / "fake-datalib-http"
-    )
-    if not is_binary_installed:
-        executable = environment.scratch_dir / "not-installed" / "datalib-http"
-    data_root = environment.scratch_dir / "data-root"
-    if published_token is not None:
-        (data_root / "system").mkdir(parents=True)
-        (data_root / "system" / "api-token").write_text(published_token)
-    return _DatalibAppUnderTest(
-        app_name=app_name,
-        http_port=http_port,
-        instances_port=instances_port,
-        instances_url=instances_url,
-        data_root=data_root,
-        record_dir=record_dir,
-        log_path=environment.scratch_dir / "datalib-app.log",
-        command=(
+def _run_launcher(
+    tmp_path: Path, datalib_http_path: Path, record_dir: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
             sys.executable,
-            "-m",
-            "datalib_app.main",
+            str(LAUNCHER_PATH),
             "--manifest",
-            str(manifest_path),
-            "--app-url",
-            f"http://localhost:{http_port}",
-            "--instances-url",
-            instances_url,
+            str(_REPO_ROOT / launcher.MANIFEST_PATH),
+            "--port",
+            str(_PORT),
             "--data-root",
-            str(data_root),
+            str(tmp_path / "data-root"),
             "--datalib-http",
-            str(executable),
-        ),
-        environment={**os.environ, ENV_FAKE_DATALIB_HTTP_DIR: str(record_dir)},
+            str(datalib_http_path),
+            "--state-directory",
+            str(tmp_path / "state"),
+            "--forward-port",
+            str(_REPO_ROOT / launcher.FORWARD_PORT_PATH),
+        ],
+        env={
+            **os.environ,
+            _ENV_APPS_FILE: str(tmp_path / "apps.toml"),
+            ENV_FAKE_DATALIB_HTTP_DIR: str(record_dir),
+        },
+        capture_output=True,
+        text=True,
+        timeout=_RUN_TIMEOUT_SECONDS,
+        check=False,
     )
 
 
-def _read_log(app: _DatalibAppUnderTest) -> str:
-    return app.log_path.read_text() if app.log_path.exists() else ""
+def _registered_rows(tmp_path: Path) -> list[dict[str, object]]:
+    registry_path = tmp_path / "apps.toml"
+    if not registry_path.exists():
+        return []
+    return tomllib.loads(registry_path.read_text()).get("apps", [])
 
 
-def _spawn(app: _DatalibAppUnderTest) -> subprocess.Popen[bytes]:
-    # A session of its own puts the app and the fake server in one process group, so a failed
-    # test can kill both rather than orphan the fake.
-    with app.log_path.open("wb") as log_file:
-        return subprocess.Popen(
-            app.command,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            env=app.environment,
-            start_new_session=True,
-        )
-
-
-def _kill_if_running(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-
-
-def _listed(app: _DatalibAppUnderTest) -> list[dict[str, object]]:
-    listed = httpx.get(
-        f"{app.instances_url}/_instances", timeout=_REQUEST_TIMEOUT_SECONDS
-    )
-    assert listed.status_code == 200, listed.text
-    return listed.json()["instances"]
-
-
-@pytest.mark.timeout(60)
-def test_datalib_app_registers_runs_datalib_http_with_the_published_token_and_lists_its_page(
-    datalib_environment: SidecarEnvironment,
+def test_the_launcher_registers_the_token_on_the_launch_path_and_becomes_datalib_http(
+    tmp_path: Path,
 ) -> None:
-    app = _prepare(datalib_environment, published_token="published-token-0001\n")
-    process = _spawn(app)
-    try:
-        assert wait_until(
-            lambda: datalib_environment.registry_path.exists(),
-            _STARTUP_TIMEOUT_SECONDS,
-        ), _read_log(app)
-        assert is_port_accepting(app.instances_port), _read_log(app)
+    executable, record_dir = install_fake_datalib_http(tmp_path / "fake")
+    token_path = launcher.token_file_path(tmp_path / "data-root")
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text(_PUBLISHED_TOKEN)
 
-        rows = read_registry(datalib_environment.registry_path)
-        assert [(row.name, row.url, row.instances_url) for row in rows] == [
-            (app.app_name, f"http://localhost:{app.http_port}", app.instances_url)
-        ]
+    result = _run_launcher(tmp_path, executable, record_dir)
 
-        # datalib-http runs as the sidecar's child, told where to bind and which token to require.
-        assert wait_until(
-            lambda: read_fake_datalib_http_environment(app.record_dir) is not None,
-            _STARTUP_TIMEOUT_SECONDS,
-        ), _read_log(app)
-        assert read_fake_datalib_http_argv(app.record_dir) == [
-            "--no-open",
-            str(app.data_root),
-        ]
-        assert read_fake_datalib_http_environment(app.record_dir) == {
-            "DATALIB_BIND": f"127.0.0.1:{app.http_port}",
-            "DATALIB_TOKEN": "published-token-0001",
+    # The launcher became datalib-http, so its exit status is the server's.
+    assert result.returncode == FAKE_DATALIB_HTTP_EXIT_STATUS, result.stderr
+    assert read_fake_datalib_http_argv(record_dir) == [
+        "--no-open",
+        str(tmp_path / "data-root"),
+    ]
+    assert read_fake_datalib_http_environment(record_dir) == {
+        "DATALIB_BIND": f"127.0.0.1:{_PORT}",
+        "DATALIB_TOKEN": _PUBLISHED_TOKEN,
+    }
+    (row,) = _registered_rows(tmp_path)
+    assert row["name"] == "datalib"
+    assert row["url"] == f"http://localhost:{_PORT}"
+    assert row["stop_when_no_windows"] is False
+    assert row["default_shortcut"] == {"launch": "ui", "mode": "focus"}
+    # The window opens at the launch path with its presets as the query: /?token=<token>.
+    assert row["launch_paths"] == [
+        {
+            "id": "ui",
+            "label": "Datalib",
+            "path": "/",
+            "presets": {"token": _PUBLISHED_TOKEN},
         }
-
-        # The one page carries that same token, and opening it again is the same page.
-        assert _listed(app) == [
-            {
-                "key": "ui",
-                "url": "/?token=published-token-0001",
-                "title": "Datalib",
-                "status": "idle",
-                "lifetime": "explicit",
-                "last_active": None,
-                "renameable": False,
-                "stoppable": False,
-            }
-        ]
-        opened = httpx.post(
-            f"{app.instances_url}/_instances",
-            json={"action": "open", "params": {}},
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-        assert opened.status_code == 201, opened.text
-        assert opened.json()["instance"]["key"] == "ui"
-        assert len(_listed(app)) == 1
-
-        # Not renameable, no location, and a delete is accepted without removing the page.
-        renamed = httpx.post(
-            f"{app.instances_url}/_instances/ui/rename",
-            json={"title": "Mine"},
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-        assert renamed.status_code == 400
-        relocated = httpx.post(
-            f"{app.instances_url}/_instances/ui/location",
-            json={"path": "/manage"},
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-        assert relocated.status_code == 400
-        deleted = httpx.delete(
-            f"{app.instances_url}/_instances/ui", timeout=_REQUEST_TIMEOUT_SECONDS
-        )
-        assert deleted.status_code == 204
-        assert len(_listed(app)) == 1
-
-        process.send_signal(signal.SIGTERM)
-        assert process.wait(timeout=_EXIT_TIMEOUT_SECONDS) == 143, _read_log(app)
-        assert not is_port_accepting(app.instances_port)
-    finally:
-        _kill_if_running(process)
+    ]
 
 
-@pytest.mark.timeout(60)
-def test_datalib_app_mints_a_token_when_none_is_published(
-    datalib_environment: SidecarEnvironment,
+def test_the_launcher_mints_a_token_when_none_is_published(tmp_path: Path) -> None:
+    executable, record_dir = install_fake_datalib_http(tmp_path / "fake")
+
+    result = _run_launcher(tmp_path, executable, record_dir)
+
+    assert result.returncode == FAKE_DATALIB_HTTP_EXIT_STATUS, result.stderr
+    environment = read_fake_datalib_http_environment(record_dir)
+    assert environment is not None
+    minted = environment["DATALIB_TOKEN"]
+    assert len(minted) == 64
+    (row,) = _registered_rows(tmp_path)
+    assert row["launch_paths"] == [
+        {"id": "ui", "label": "Datalib", "path": "/", "presets": {"token": minted}}
+    ]
+
+
+def test_the_launcher_exits_without_registering_when_the_binary_is_missing(
+    tmp_path: Path,
 ) -> None:
-    app = _prepare(datalib_environment, published_token=None)
-    process = _spawn(app)
-    try:
-        assert wait_until(
-            lambda: read_fake_datalib_http_environment(app.record_dir) is not None,
-            _STARTUP_TIMEOUT_SECONDS,
-        ), _read_log(app)
-        environment = read_fake_datalib_http_environment(app.record_dir)
-        assert environment is not None
-        token = environment["DATALIB_TOKEN"]
-        assert len(token) == 64
-        [page] = _listed(app)
-        assert page["url"] == f"/?token={token}"
-    finally:
-        _kill_if_running(process)
+    _, record_dir = install_fake_datalib_http(tmp_path / "fake")
 
+    result = _run_launcher(
+        tmp_path, tmp_path / "not-installed" / "datalib-http", record_dir
+    )
 
-@pytest.mark.timeout(60)
-def test_datalib_app_exits_without_registering_when_the_binary_is_missing(
-    datalib_environment: SidecarEnvironment,
-) -> None:
-    app = _prepare(datalib_environment, published_token=None, is_binary_installed=False)
-    process = _spawn(app)
-    try:
-        assert process.wait(timeout=_EXIT_TIMEOUT_SECONDS) == 1, _read_log(app)
-        assert "is not installed yet" in _read_log(app)
-        assert not datalib_environment.registry_path.exists()
-        assert not is_port_accepting(app.instances_port)
-    finally:
-        _kill_if_running(process)
+    assert result.returncode == launcher.EXIT_NOT_READY
+    assert "is not installed yet" in result.stderr
+    assert _registered_rows(tmp_path) == []
+    assert read_fake_datalib_http_argv(record_dir) is None
